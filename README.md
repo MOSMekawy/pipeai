@@ -1,4 +1,4 @@
-# agent-workflow
+# pipeai
 
 A typed multi-agent workflow pipeline built on top of the [Vercel AI SDK v6](https://sdk.vercel.ai/). It provides two core primitives — **Agent** and **Workflow** — that compose into declarative, streamable AI pipelines with shared context and typed outputs.
 
@@ -17,7 +17,7 @@ The library is ~1000 lines across 4 files. It's designed to be read, understood,
 ## Installation
 
 ```bash
-npm install agent-workflow
+npm install pipeai
 ```
 
 Peer dependencies:
@@ -38,7 +38,7 @@ An `Agent` wraps AI SDK's `generateText` / `streamText` with typed context, inpu
 ### Defining an agent
 
 ```ts
-import { Agent } from "agent-workflow";
+import { Agent } from "pipeai";
 import { openai } from "@ai-sdk/openai";
 
 type Ctx = {
@@ -239,7 +239,7 @@ This is useful when the agent is defined at module scope but the context isn't a
 `defineTool` wraps a tool definition so the agent's runtime context is injected into every `execute` call. The `input` field maps to AI SDK's `parameters`:
 
 ```ts
-import { defineTool } from "agent-workflow";
+import { defineTool } from "pipeai";
 import { tool } from "ai";
 
 type Ctx = { db: Database; userId: string };
@@ -278,7 +278,7 @@ A `Workflow` chains agents and transformation steps into a typed pipeline. Conte
 ### Building a workflow
 
 ```ts
-import { Workflow } from "agent-workflow";
+import { Workflow } from "pipeai";
 
 const pipeline = Workflow.create<Ctx>()
   .step(classifier)
@@ -606,7 +606,7 @@ Auto-extraction priority for `step()` with an agent:
 ## Full Example
 
 ```ts
-import { Agent, Workflow, defineTool } from "agent-workflow";
+import { Agent, Workflow, defineTool } from "pipeai";
 import { Output } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
