@@ -1,0 +1,55 @@
+{
+  "name": "agent-workflow",
+  "version": "0.1.0",
+  "description": "A typed multi-agent workflow pipeline built on top of the Vercel AI SDK",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "rm -rf dist && tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "ai": "^6.0.0",
+    "zod": ">=3.0.0 || >=4.0.0"
+  },
+  "devDependencies": {
+    "ai": "^6.0.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.3",
+    "vitest": "^4.0.18",
+    "zod": "^3.24.0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "workflow",
+    "pipeline",
+    "multi-agent",
+    "vercel-ai-sdk",
+    "orchestrator",
+    "llm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  }
+}

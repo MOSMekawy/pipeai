@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm pack:*)",
+      "Bash(find h:/Repositories/agent-workflow/node_modules/@ai-sdk/provider -name *.d.ts -type f)",
+      "Bash(npx vitest:*)",
+      "WebFetch(domain:mastra.ai)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh api:*)"
+    ]
+  }
+}
