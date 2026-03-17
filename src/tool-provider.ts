@@ -1,13 +1,18 @@
-import { tool, type Tool, type ToolExecutionOptions, type FlexibleSchema } from "ai";
+import { tool, type Tool, type ToolExecutionOptions, type FlexibleSchema, type UIMessageStreamWriter } from "ai";
+import { getActiveWriter } from "./utils";
 
 export const TOOL_PROVIDER_BRAND = Symbol.for("agent-workflow.ToolProvider");
+
+export type ToolExecuteOptions = ToolExecutionOptions & {
+  writer?: UIMessageStreamWriter;
+};
 
 export type ToolProviderConfig<TContext, TInput, TOutput> = {
   description?: string;
   input: FlexibleSchema<TInput>;
   output?: FlexibleSchema<unknown>;
   providerOptions?: unknown;
-  execute: (input: TInput, ctx: Readonly<TContext>, options?: ToolExecutionOptions) => Promise<TOutput>;
+  execute: (input: TInput, ctx: Readonly<TContext>, options: ToolExecuteOptions) => Promise<TOutput>;
 };
 
 export interface IToolProvider<TContext> {
@@ -32,7 +37,7 @@ export class ToolProvider<
     return tool({
       ...toolDef,
       parameters: inputSchema,
-      execute: (input: TInput, options?: ToolExecutionOptions) => execute(input, context, options),
+      execute: (input: TInput, options?: ToolExecutionOptions) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
   }

@@ -117,15 +117,17 @@ const agent = new Agent<Ctx>({
 
 ### AI SDK callbacks
 
-Same callback names as AI SDK v6, extended with `ctx` and `input`. The AI SDK event payload is available as `result`:
+Same callback names as AI SDK v6, extended with `ctx`, `input`, and `writer`. The AI SDK event payload is available as `result`. When the agent runs inside a streaming workflow, `writer` is available for writing metadata or custom stream parts:
 
 ```ts
 const agent = new Agent<Ctx>({
   id: "monitored",
   model: openai("gpt-4o"),
   prompt: (ctx, input) => input,
-  onStepFinish: ({ result, ctx }) => {
+  onStepFinish: ({ result, ctx, writer }) => {
     console.log(`Step done, used ${result.usage.totalTokens} tokens`);
+    // Stream progress metadata to the client
+    writer?.write({ type: "metadata", value: { tokensUsed: result.usage.totalTokens } });
   },
   onFinish: ({ result, ctx }) => {
     console.log(`Total: ${result.totalUsage.totalTokens} tokens`);
@@ -152,9 +154,9 @@ const agent = new Agent<Ctx>({
 | `activeTools` | `Resolvable`              | Subset of tool names to enable.                                   |
 | `toolChoice`  | `Resolvable`              | Tool choice strategy. Static or `(ctx, input) => toolChoice`.     |
 | `stopWhen`    | `Resolvable`              | Condition for stopping the tool loop. Static or `(ctx, input) => condition`. |
-| `onStepFinish`| `({ result, ctx, input })`| Called after each step.                                           |
-| `onFinish`    | `({ result, ctx, input })`| Called when all steps complete.                                   |
-| `onError`     | `({ error, ctx, input })` | Called on error.                                                  |
+| `onStepFinish`| `({ result, ctx, input, writer? })`| Called after each step. `writer` available in streaming workflows. |
+| `onFinish`    | `({ result, ctx, input, writer? })`| Called when all steps complete.                                   |
+| `onError`     | `({ error, ctx, input, writer? })` | Called on error.                                                  |
 | `...`         | AI SDK options            | All other `streamText`/`generateText` options pass through (e.g. `temperature`, `maxTokens`, `maxRetries`, `headers`, `prepareStep`, `onChunk`, etc.). |
 
 ## `asTool()` — Agent as Tool
@@ -212,7 +214,7 @@ codingAgent.asTool(ctx, {
 });
 ```
 
-**Note:** `asTool()` uses `generate()` internally — sub-agent execution is non-streaming. This is an AI SDK tool loop constraint. For streaming multi-agent workflows, use `step()` with `branch()` instead.
+**Automatic streaming:** When `asTool()` is used inside a streaming workflow, sub-agents automatically use `stream()` and merge their output to the parent's stream — the user sees sub-agent responses in real-time. Outside of a streaming context (standalone use or generate mode), `asTool()` falls back to `generate()`. This is handled invisibly — no configuration needed.
 
 ## `asToolProvider()` — Deferred Context
 
@@ -236,11 +238,10 @@ This is useful when the agent is defined at module scope but the context isn't a
 
 ## defineTool — Context-Aware Tools
 
-`defineTool` wraps a tool definition so the agent's runtime context is injected into every `execute` call. The `input` field maps to AI SDK's `parameters`:
+`defineTool` wraps a tool definition so the agent's runtime context is injected into every `execute` call. The `input` field maps to AI SDK's `parameters`. When running inside a streaming workflow, the `writer` is automatically available in the third parameter for streaming metadata or progress updates to the client:
 
 ```ts
 import { defineTool } from "pipeai";
-import { tool } from "ai";
 
 type Ctx = { db: Database; userId: string };
 
@@ -249,8 +250,11 @@ const define = defineTool<Ctx>();
 const searchOrders = define({
   description: "Search user orders",
   input: z.object({ query: z.string() }),
-  execute: async ({ query }, ctx) => {
-    return ctx.db.orders.search(ctx.userId, query);
+  execute: async ({ query }, ctx, { writer }) => {
+    writer?.write({ type: "metadata", value: { status: "searching" } });
+    const results = await ctx.db.orders.search(ctx.userId, query);
+    writer?.write({ type: "metadata", value: { status: "done", count: results.length } });
+    return results;
   },
 });
 
@@ -270,6 +274,8 @@ const agent = new Agent<Ctx>({
   tools: { searchOrders, cancelOrder, calculator: plainTool },
 });
 ```
+
+The `writer` is `undefined` when running in generate mode or standalone — `?.` handles both cases naturally.
 
 ## Workflow
 
@@ -313,6 +319,7 @@ Workflows can be passed as steps into other workflows. The nested workflow's ste
 // A reusable sub-workflow
 const classifyAndRoute = Workflow.create<Ctx>()
   .step(classifier, {
+    // Suppress the classifier's stream — only route the result
     handleStream: async ({ result }) => { await result.text; },
   })
   .branch({
@@ -402,7 +409,10 @@ const pipeline = Workflow.create<Ctx>()
     // Called during workflow.stream() — StreamTextResult (async access)
     mapStreamResult: async ({ result }) => ({
       text: await result.text,
-      files: [],
+      files: (await result.steps)
+        .flatMap(s => s.toolResults)
+        .filter(tr => tr.toolName === "writeFile")
+        .map(tr => tr.args.path),
     }),
   });
 ```
@@ -423,10 +433,11 @@ const pipeline = Workflow.create<Ctx>()
       });
     },
     // Called during workflow.stream()
-    onStreamResult: async ({ result, ctx, input }) => {
+    onStreamResult: async ({ result, ctx }) => {
       await ctx.db.conversations.save(ctx.userId, {
         role: "assistant",
         content: await result.text,
+        toolCalls: await result.toolCalls,
       });
     },
   });
@@ -434,7 +445,7 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Fine-grained stream control
 
-Override how each agent's stream is merged into the workflow stream. By default, every agent's output is merged into the workflow stream via `writer.merge(result.toUIMessageStream())`. Use `handleStream` to change this — for example, to suppress intermediate agents so only the final response streams to the client:
+Override how each agent's stream is merged into the workflow stream. By default, every agent's output is merged via `writer.merge(result.toUIMessageStream())`. Use `handleStream` to take control — the callback receives `{ result, writer, ctx }`:
 
 ```ts
 const pipeline = Workflow.create<Ctx>()
@@ -442,14 +453,16 @@ const pipeline = Workflow.create<Ctx>()
   // the structured classification output, only the final response
   .step(classifier, {
     handleStream: async ({ result }) => {
-      await result.text; // consume the stream without forwarding it
+      await result.text; // consume without forwarding to the client
     },
   })
-  .branch({
-    select: ({ input }) => input.agent,
-    agents: { bug: bugAgent, feature: featureAgent, question: questionAgent },
+  // Custom merging — e.g. add metadata annotations to the stream
+  .step(supportAgent, {
+    handleStream: async ({ result, writer, ctx }) => {
+      writer.write({ type: "metadata", value: { agentId: "support", userId: ctx.userId } });
+      writer.merge(result.toUIMessageStream());
+    },
   });
-  // Only the selected agent's response streams to the client
 ```
 
 ### Array iteration via `foreach()`
@@ -485,7 +498,9 @@ const processItem = Workflow.create<Ctx, string>()
   .step(analyzeAgent)
   .step(enrichAgent);
 
-pipeline.foreach(processItem, { concurrency: 5 });
+const pipeline = Workflow.create<Ctx>()
+  .step("fetch-items", async ({ ctx }) => ctx.db.items.getAll())
+  .foreach(processItem, { concurrency: 5 });
 ```
 
 **Type safety:** `foreach()` uses `ElementOf<TOutput>` to extract the array element type. If the previous step doesn't produce an array, the call is rejected at compile time.
@@ -671,11 +686,9 @@ const questionAgent = new Agent<Ctx>({
 
 // 4. Compose workflow
 const pipeline = Workflow.create<Ctx>()
-  // Classify silently — don't stream the structured JSON to the client
+  // Classify silently — consume the stream without forwarding to client
   .step(classifier, {
-    handleStream: async ({ result }) => {
-      await result.text;
-    },
+    handleStream: async ({ result }) => { await result.text; },
   })
   // Route to the right specialist based on classification
   .branch({

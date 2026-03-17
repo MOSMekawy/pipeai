@@ -19,6 +19,6 @@ export type {
 } from "./workflow";
 
 export { defineTool } from "./tool-provider";
-export type { ToolProviderConfig, IToolProvider } from "./tool-provider";
+export type { ToolProviderConfig, ToolExecuteOptions, IToolProvider } from "./tool-provider";
 
 export type { MaybePromise, Resolvable } from "./utils";

@@ -5,6 +5,7 @@ import {
   Output,
   type GenerateTextResult as AIGenerateTextResult,
   type StreamTextResult as AIStreamTextResult,
+  type UIMessageStreamWriter,
   type ModelMessage,
   type LanguageModel,
   type Tool,
@@ -20,7 +21,7 @@ import {
 type OutputType<T = any> = ReturnType<typeof Output.object<T>>;
 import type { ZodType } from "zod";
 import { isToolProvider, TOOL_PROVIDER_BRAND, type IToolProvider } from "./tool-provider";
-import { extractOutput, resolveValue, type MaybePromise, type Resolvable } from "./utils";
+import { extractOutput, getActiveWriter, resolveValue, type MaybePromise, type Resolvable } from "./utils";
 
 // Tools config accepts both AI SDK tools and context-aware ToolProviders
 type AgentToolSet<TContext> = Record<string, Tool | IToolProvider<TContext>>;
@@ -87,9 +88,10 @@ export interface AgentConfig<
   stopWhen?: Resolvable<TContext, TInput, StopCondition<ToolSet> | Array<StopCondition<ToolSet>>>;
 
   // ── Context-enriched callbacks (replace AI SDK versions) ──
-  onStepFinish?: (params: { result: OnStepFinishEvent; ctx: Readonly<TContext>; input: TInput }) => MaybePromise<void>;
-  onFinish?: (params: { result: OnFinishEvent; ctx: Readonly<TContext>; input: TInput }) => MaybePromise<void>;
-  onError?: (params: { error: unknown; ctx: Readonly<TContext>; input: TInput }) => MaybePromise<void>;
+  // `writer` is available when the agent runs inside a streaming workflow.
+  onStepFinish?: (params: { result: OnStepFinishEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
+  onFinish?: (params: { result: OnFinishEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
+  onError?: (params: { error: unknown; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
 }
 
 // ── Agent ───────────────────────────────────────────────────────────
@@ -155,7 +157,7 @@ export class Agent<
       return await generateText(options as any);
     } catch (error: unknown) {
       if (this.config.onError) {
-        await this.config.onError({ error, ctx, input });
+        await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
       }
       throw error;
     }
@@ -170,7 +172,7 @@ export class Agent<
     return streamText({
       ...options,
       onError: this.config.onError
-        ? ({ error }: { error: unknown }) => this.config.onError!({ error, ctx, input })
+        ? ({ error }: { error: unknown }) => this.config.onError!({ error, ctx, input, writer: getActiveWriter() })
         : undefined,
     } as any);
   }
@@ -205,6 +207,15 @@ export class Agent<
       description: this.description,
       parameters: this.config.input,
       execute: async (toolInput: TInput) => {
+        // When inside a streaming workflow, automatically use stream() and merge to the active writer.
+        // Otherwise fall back to generate().
+        const writer = getActiveWriter();
+        if (writer) {
+          const result = await (this.stream as (ctx: TContext, input: TInput) => Promise<StreamTextResult>)(ctx, toolInput);
+          writer.merge(result.toUIMessageStream());
+          if (options?.mapOutput) return options.mapOutput(result as unknown as GenerateTextResult);
+          return extractOutput(result, this.hasOutput);
+        }
         const result = await (this.generate as (ctx: TContext, input: TInput) => Promise<GenerateTextResult>)(ctx, toolInput);
         if (options?.mapOutput) return options.mapOutput(result);
         return extractOutput(result, this.hasOutput);
@@ -228,10 +239,10 @@ export class Agent<
       ...(resolved.system ? { system: resolved.system } : {}),
       ...(this.config.output ? { output: this.config.output } : {}),
       onStepFinish: this._onStepFinish
-        ? (event: OnStepFinishEvent) => this._onStepFinish!({ result: event, ctx, input })
+        ? (event: OnStepFinishEvent) => this._onStepFinish!({ result: event, ctx, input, writer: getActiveWriter() })
         : undefined,
       onFinish: this._onFinish
-        ? (event: OnFinishEvent) => this._onFinish!({ result: event, ctx, input })
+        ? (event: OnFinishEvent) => this._onFinish!({ result: event, ctx, input, writer: getActiveWriter() })
         : undefined,
     };
   }

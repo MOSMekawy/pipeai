@@ -3,7 +3,7 @@ import {
   type UIMessageStreamWriter,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult } from "./agent";
-import { extractOutput, type MaybePromise } from "./utils";
+import { extractOutput, runWithWriter, type MaybePromise } from "./utils";
 
 // ── Error Types ─────────────────────────────────────────────────────
 
@@ -258,23 +258,27 @@ export class SealedWorkflow<
     const hasStructuredOutput = agent.hasOutput;
 
     if (state.mode === "stream" && state.writer) {
-      const result = await (agent.stream as (ctx: TContext, input: unknown) => Promise<StreamTextResult>)(ctx, state.output);
+      const writer = state.writer;
+      // Run inside writer context so tools (asTool, defineTool) can access the writer automatically
+      await runWithWriter(writer, async () => {
+        const result = await (agent.stream as (ctx: TContext, input: unknown) => Promise<StreamTextResult>)(ctx, state.output);
 
-      if (options?.handleStream) {
-        await options.handleStream({ result, writer: state.writer, ctx });
-      } else {
-        state.writer.merge(result.toUIMessageStream());
-      }
+        if (options?.handleStream) {
+          await options.handleStream({ result, writer, ctx });
+        } else {
+          writer.merge(result.toUIMessageStream());
+        }
 
-      if (options?.onStreamResult) {
-        await options.onStreamResult({ result, ctx, input });
-      }
+        if (options?.onStreamResult) {
+          await options.onStreamResult({ result, ctx, input });
+        }
 
-      if (options?.mapStreamResult) {
-        state.output = await options.mapStreamResult({ result, ctx, input });
-      } else {
-        state.output = await extractOutput(result, hasStructuredOutput);
-      }
+        if (options?.mapStreamResult) {
+          state.output = await options.mapStreamResult({ result, ctx, input });
+        } else {
+          state.output = await extractOutput(result, hasStructuredOutput);
+        }
+      });
     } else {
       const result = await (agent.generate as (ctx: TContext, input: unknown) => Promise<GenerateTextResult>)(ctx, state.output);
 

@@ -1,6 +1,6 @@
 {
   "name": "pipeai",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A typed multi-agent workflow pipeline built on top of the Vercel AI SDK",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -27,15 +27,16 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "ai": "^6.0.0",
+    "ai": "^6.0.116",
     "zod": ">=3.0.0 || >=4.0.0"
   },
   "devDependencies": {
-    "ai": "^6.0.0",
+    "@types/node": "^25.5.0",
+    "ai": "^6.0.116",
     "tsup": "^8.5.1",
     "typescript": "^5.7.3",
     "vitest": "^4.0.18",
-    "zod": "^3.24.0"
+    "zod": "^4.3.6"
   },
   "keywords": [
     "ai",
