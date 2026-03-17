@@ -3,4 +3,4 @@ dist
 *.tsbuildinfo
 .env
 .env.*
-.claude
+.claude/
