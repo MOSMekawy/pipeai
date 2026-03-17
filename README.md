@@ -10,8 +10,8 @@ The library is ~800 lines across 4 files. It's designed to be read, understood, 
 
 | Primitive      | Purpose                                                                                              |
 | -------------- | ---------------------------------------------------------------------------------------------------- |
-| `Agent`        | A pure AI SDK wrapper. Supports `generate()`, `stream()`, and `asTool()` for agent-as-tool composition. |
-| `Workflow`     | A typed pipeline that chains agents with `step()`, `branch()`, `catch()`, and `finally()`.            |
+| `Agent`        | A pure AI SDK wrapper. Supports `generate()`, `stream()`, `asTool()`, and `asToolProvider()`. |
+| `Workflow`     | A typed pipeline that chains agents with `step()`, `branch()`, `foreach()`, `repeat()`, `catch()`, and `finally()`. |
 | `defineTool`   | A context-aware tool factory — injects runtime context into tool `execute` calls.                     |
 
 ## Installation
@@ -150,12 +150,12 @@ const agent = new Agent<Ctx>({
 | `messages`    | `Resolvable`              | Message array. Mutually exclusive with `prompt`.                  |
 | `tools`       | `Resolvable`              | Tool map. Supports `Tool`, `ToolProvider`, and `agent.asTool()`.  |
 | `activeTools` | `Resolvable`              | Subset of tool names to enable.                                   |
-| `toolChoice`  | `ToolChoice`              | Tool choice strategy.                                             |
-| `stopWhen`    | `StopCondition`           | Condition for stopping the tool loop.                             |
-| `prepareStep` | `PrepareStepFunction`     | Prepare each step before execution.                               |
+| `toolChoice`  | `Resolvable`              | Tool choice strategy. Static or `(ctx, input) => toolChoice`.     |
+| `stopWhen`    | `Resolvable`              | Condition for stopping the tool loop. Static or `(ctx, input) => condition`. |
 | `onStepFinish`| `({ result, ctx, input })`| Called after each step.                                           |
 | `onFinish`    | `({ result, ctx, input })`| Called when all steps complete.                                   |
 | `onError`     | `({ error, ctx, input })` | Called on error.                                                  |
+| `...`         | AI SDK options            | All other `streamText`/`generateText` options pass through (e.g. `temperature`, `maxTokens`, `maxRetries`, `headers`, `prepareStep`, `onChunk`, etc.). |
 
 ## `asTool()` — Agent as Tool
 
@@ -213,6 +213,26 @@ codingAgent.asTool(ctx, {
 ```
 
 **Note:** `asTool()` uses `generate()` internally — sub-agent execution is non-streaming. This is an AI SDK tool loop constraint. For streaming multi-agent workflows, use `step()` with `branch()` instead.
+
+## `asToolProvider()` — Deferred Context
+
+`asTool(ctx)` bakes the context in at call time. `asToolProvider()` defers context resolution — the tool is created with the correct context when another agent's tool resolution runs:
+
+```ts
+const orchestrator = new Agent<Ctx>({
+  id: "orchestrator",
+  model: openai("gpt-4o"),
+  system: "Delegate work to the right specialist.",
+  prompt: (ctx, input) => input,
+  tools: {
+    // Context resolved when the orchestrator's tools are resolved
+    coding: codingAgent.asToolProvider(),
+    qa: qaAgent.asToolProvider(),
+  },
+});
+```
+
+This is useful when the agent is defined at module scope but the context isn't available until runtime. `asToolProvider()` returns an `IToolProvider` — the same interface used by `defineTool`.
 
 ## defineTool — Context-Aware Tools
 
@@ -284,6 +304,33 @@ return new Response(stream);
 
 const finalOutput = await output;  // resolves when pipeline completes
 ```
+
+### Nested workflows
+
+Workflows can be passed as steps into other workflows. The nested workflow's steps execute within the parent's runtime state — streams merge naturally, and errors propagate to the parent's `catch()`:
+
+```ts
+// A reusable sub-workflow
+const classifyAndRoute = Workflow.create<Ctx>()
+  .step(classifier, {
+    handleStream: async ({ result }) => { await result.text; },
+  })
+  .branch({
+    select: ({ input }) => input.agent,
+    agents: { bug: bugAgent, feature: featureAgent },
+  });
+
+// Compose into a larger pipeline
+const pipeline = Workflow.create<Ctx>()
+  .step(classifyAndRoute)  // nested workflow as a step
+  .step("save", async ({ input, ctx }) => {
+    await ctx.db.save(input);
+    return input;
+  })
+  .catch("fallback", () => "Something went wrong.");
+```
+
+Nested workflows can be arbitrarily deep — a workflow step can contain another workflow that itself contains nested workflows.
 
 ### Predicate branching via `branch()`
 
@@ -405,6 +452,91 @@ const pipeline = Workflow.create<Ctx>()
   // Only the selected agent's response streams to the client
 ```
 
+### Array iteration via `foreach()`
+
+`foreach()` maps each element of an array output through an agent or workflow. Items run in generate mode to avoid interleaved streams:
+
+```ts
+const summarizer = new Agent<Ctx, string, string>({
+  id: "summarizer",
+  model: openai("gpt-4o-mini"),
+  prompt: (ctx, input) => `Summarize: ${input}`,
+});
+
+const pipeline = Workflow.create<Ctx>()
+  .step("fetch-articles", async ({ ctx }) => {
+    return ctx.db.articles.getRecent(10); // string[]
+  })
+  .foreach(summarizer)  // output: string[]
+  .step("combine", ({ input }) => input.join("\n\n"));
+```
+
+Concurrent processing with batched parallelism:
+
+```ts
+// Process 3 items at a time
+.foreach(summarizer, { concurrency: 3 })
+```
+
+Works with nested workflows too:
+
+```ts
+const processItem = Workflow.create<Ctx, string>()
+  .step(analyzeAgent)
+  .step(enrichAgent);
+
+pipeline.foreach(processItem, { concurrency: 5 });
+```
+
+**Type safety:** `foreach()` uses `ElementOf<TOutput>` to extract the array element type. If the previous step doesn't produce an array, the call is rejected at compile time.
+
+### Conditional loops via `repeat()`
+
+`repeat()` runs an agent or workflow in a loop until a condition is met. The body's output feeds back as input — same type in, same type out:
+
+```ts
+const refiner = new Agent<Ctx, string, string>({
+  id: "refiner",
+  model: openai("gpt-4o"),
+  system: "Improve the given text. Make it clearer and more concise.",
+  prompt: (ctx, input) => input,
+});
+
+const pipeline = Workflow.create<Ctx>()
+  .step("draft", ({ ctx }) => ctx.initialDraft)
+  .repeat(refiner, {
+    until: ({ output, iterations }) => {
+      // Stop when quality is good enough or after 3 iterations
+      return output.length < 500 || iterations >= 3;
+    },
+  });
+```
+
+Use `while` for the opposite condition (repeat while true, stop when false):
+
+```ts
+.repeat(refiner, {
+  while: ({ output }) => output.includes("TODO"),  // keep going while TODOs remain
+  maxIterations: 5,  // safety limit (default: 10)
+})
+```
+
+The `until` and `while` options are mutually exclusive — TypeScript enforces this at compile time.
+
+When `maxIterations` is exceeded, a `WorkflowLoopError` is thrown — catchable by `.catch()`:
+
+```ts
+.repeat(agent, { until: () => false, maxIterations: 3 })
+.catch("loop-safety", ({ error }) => {
+  if (error instanceof WorkflowLoopError) {
+    return "Reached iteration limit, returning best result.";
+  }
+  throw error;
+})
+```
+
+In stream mode, each iteration streams to the client — the user sees the refinement in real-time.
+
 ### Error handling
 
 ```ts
@@ -443,10 +575,13 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | Method                    | Description                                                                 |
 | ------------------------- | --------------------------------------------------------------------------- |
 | `.step(agent, options?)`  | Execute an agent. Options: `mapGenerateResult`, `mapStreamResult`, `onGenerateResult`, `onStreamResult`, `handleStream`. |
+| `.step(workflow)`         | Execute a nested workflow. Its steps run within the parent's runtime state. |
 | `.step(id, fn)`           | Transform the output. `fn` receives `{ ctx, input }` and returns the new output. |
 | `.branch([...cases])`     | Predicate routing. First `when` match wins; case without `when` is default. |
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
-| `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, stepId }` and returns a recovery value. |
+| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` controls parallelism (default: 1). |
+| `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
+| `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. |
 | `.finally(id, fn)`        | Always runs. `fn` receives `{ ctx }`.                                      |
 
 ### Output flow
@@ -464,6 +599,9 @@ Auto-extraction priority for `step()` with an agent:
 | -------------------- | --------------------- | ---------------------- | --------------------------------------- |
 | `asTool()`           | LLM (tool loop)       | Sub-agents don't stream | LLM picks which agent(s) to call, can loop |
 | `branch()`           | Deterministic         | Full streaming         | Previous output or runtime conditions determine the next agent |
+| `step(workflow)`     | Deterministic         | Full streaming         | Compose reusable sub-workflows into larger pipelines |
+| `foreach()`          | Deterministic         | Items don't stream     | Process each element of an array through an agent or workflow |
+| `repeat()`           | Condition function    | Each iteration streams | Iterative refinement until a quality threshold is met |
 
 ## Full Example
 
