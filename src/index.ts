@@ -5,8 +5,8 @@ export type {
   StreamTextResult,
 } from "./agent";
 
-export { Workflow, WorkflowBranchError, WorkflowLoopError } from "./workflow";
-export type { SealedWorkflow } from "./workflow";
+export { Workflow, WorkflowBranchError, WorkflowLoopError, WorkflowSuspended } from "./workflow";
+export type { SealedWorkflow, ResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
   StepOptions,
@@ -16,6 +16,7 @@ export type {
   WorkflowResult,
   WorkflowStreamResult,
   WorkflowStreamOptions,
+  WorkflowSnapshot,
 } from "./workflow";
 
 export { defineTool } from "./tool-provider";

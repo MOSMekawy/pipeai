@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-30
+
 ### Added
+- `gate(id, opts?)` — human-in-the-loop suspension points that throw `WorkflowSuspended` with a JSON-serializable snapshot
+- `loadState(gateId, snapshot)` — type-safe workflow resumption; the gate ID string literal infers the response type from a compile-time `TGates` type map
+- `ResumedWorkflow` class with typed `generate()` and `stream()` that accept the gate response
+- `WorkflowSuspended` error class with a `snapshot` property containing the gate payload and pre-gate output
+- `WorkflowSnapshot` interface for serializing/deserializing suspension state
+- Gate options: `payload` (custom data for the human), `schema` (runtime response validation via any `.parse()` provider), `condition` (conditional suspension), `merge` (combine pre-gate output with response)
+- Compile-time duplicate gate ID detection via conditional type constraint
+- Runtime gate ID mismatch validation between `loadState` call and snapshot
+- Descriptive error when gates are used inside nested workflows, `foreach()`, or `repeat()`
 - Nested workflows — pass a `Workflow` or `SealedWorkflow` as a step via `step(workflow)`
 - `foreach()` for iterating arrays through an agent or workflow, with optional `concurrency`
 - `repeat()` for conditional loops with `{ until }` or `{ while }` (mutually exclusive, enforced at compile time)
@@ -22,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - `RepeatOptions`, `LoopCondition`, `ToolExecuteOptions` exported types
 
 ### Changed
+- `SealedWorkflow` and `Workflow` now carry a 4th type parameter `TGates` for type-safe gate resumption
 - Agent config now passes through all AI SDK `streamText`/`generateText` options (e.g. `temperature`, `maxTokens`, `maxRetries`, `headers`, `prepareStep`, `onChunk`)
 - `toolChoice` and `stopWhen` are now `Resolvable` — accept static values or `(ctx, input) => value`
 - `SealedWorkflow` exported as type only (cannot be constructed externally)
@@ -29,7 +41,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 ## [0.1.1] - 2026-03-17
 
 ### Changed
-- Renamed package from `agent-workflow` to `pipeai`
 - Updated repository URL to `https://github.com/MOSMekawy/pipeai`
 - Enabled manual triggering of the publish workflow (`workflow_dispatch`)
 

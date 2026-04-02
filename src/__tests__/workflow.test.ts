@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
-import { Workflow, WorkflowLoopError } from "../workflow";
+import { Workflow, WorkflowLoopError, WorkflowSuspended, type WorkflowSnapshot } from "../workflow";
 import { createMockModel, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
@@ -821,6 +821,773 @@ describe("Workflow", () => {
         .repeat(agent, { while: () => true, maxIterations: 3 });
 
       await expect(pipeline.generate(testCtx)).rejects.toThrow(WorkflowLoopError);
+    });
+  });
+
+  describe("gate()", () => {
+    it("suspends workflow with WorkflowSuspended", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review");
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(WorkflowSuspended);
+    });
+
+    it("snapshot contains correct data", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review");
+
+      try {
+        await pipeline.generate(testCtx);
+        expect.unreachable("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.version).toBe(1);
+        expect(snapshot.gateId).toBe("review");
+        expect(snapshot.output).toBe("draft");
+        expect(snapshot.resumeFromIndex).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it("custom payload appears in snapshot", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft text"))
+        .gate("approval", {
+          payload: ({ input, ctx }) => ({
+            message: `User ${ctx.userId}: approve "${input}"?`,
+          }),
+        });
+
+      try {
+        await pipeline.generate(testCtx);
+        expect.unreachable("should have thrown");
+      } catch (e) {
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.gatePayload).toEqual({
+          message: 'User user-1: approve "draft text"?',
+        });
+      }
+    });
+
+    it("default payload is the current output", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "value"))
+        .gate("review");
+
+      try {
+        await pipeline.generate(testCtx);
+        expect.unreachable("should have thrown");
+      } catch (e) {
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.gatePayload).toBe("value");
+        expect(snapshot.gatePayload).toBe(snapshot.output);
+      }
+    });
+
+    it("loadState + generate resumes from gate", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review")
+        .step("finalize", ({ input }) => `approved: ${input}`);
+
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output } = await resumed.generate(testCtx, "human says yes");
+      expect(output).toBe("approved: human says yes");
+    });
+
+    it("sequential multi-gate workflow", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review-1")
+        .step("process", ({ input }) => `reviewed: ${input}`)
+        .gate("review-2")
+        .step("publish", ({ input }) => `published: ${input}`);
+
+      // First gate
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.gateId).toBe("review-1");
+      }
+
+      // Resume hits second gate
+      const resumed1 = pipeline.loadState("review-1", snapshot);
+      try {
+        await resumed1.generate(testCtx, "approved-1");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.gateId).toBe("review-2");
+        expect(snapshot.output).toBe("reviewed: approved-1");
+      }
+
+      // Resume past second gate
+      const resumed2 = pipeline.loadState("review-2", snapshot);
+      const { output } = await resumed2.generate(testCtx, "approved-2");
+      expect(output).toBe("published: approved-2");
+    });
+
+    it("gate is skipped during error state", async () => {
+      const failingModel = createMockModel("x");
+      failingModel.doGenerate = async () => {
+        throw new Error("step failed");
+      };
+
+      const pipeline = Workflow.create<TestCtx>()
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .step(new Agent<TestCtx, any, any>({
+          id: "failing",
+          model: failingModel,
+          prompt: () => "go",
+        }))
+        .gate("should-skip")
+        .catch("recover", () => "recovered");
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("recovered");
+    });
+
+    it("catch works after a resumed gate", async () => {
+      const failingModel = createMockModel("x");
+      failingModel.doGenerate = async () => {
+        throw new Error("post-gate failure");
+      };
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review")
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .step(new Agent<TestCtx, any, any>({
+          id: "post-gate",
+          model: failingModel,
+          prompt: () => "go",
+        }))
+        .catch("recover", () => "caught after gate");
+
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output } = await resumed.generate(testCtx, "human input");
+      expect(output).toBe("caught after gate");
+    });
+
+    it("loadState throws on invalid snapshot version", () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .gate("review");
+
+      const badSnapshot = { version: 99, resumeFromIndex: 1, output: "x", gateId: "review", gatePayload: "x" } as unknown as WorkflowSnapshot;
+      expect(() => pipeline.loadState("review", badSnapshot)).toThrow("Unsupported snapshot version");
+    });
+
+    it("loadState throws on out-of-bounds index with unknown gate", () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .gate("review");
+
+      const badSnapshot: WorkflowSnapshot = { version: 1, resumeFromIndex: 99, output: "x", gateId: "nonexistent", gatePayload: "x" };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(() => (pipeline as any).loadState("nonexistent", badSnapshot)).toThrow("not found in workflow");
+    });
+
+    it("loadState throws on gate ID mismatch", () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .gate("review");
+
+      const badSnapshot: WorkflowSnapshot = { version: 1, resumeFromIndex: 1, output: "x", gateId: "wrong-id", gatePayload: "x" };
+      expect(() => pipeline.loadState("review", badSnapshot)).toThrow("gate ID mismatch");
+    });
+
+    it("gate inside nested workflow throws descriptive error", async () => {
+      const sub = Workflow.create<TestCtx>()
+        .step(createTextAgent("inner", "value"))
+        .gate("inner-gate");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(sub);
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(
+        "Gates inside nested workflows are not yet supported"
+      );
+    });
+
+    it("gate inside foreach (via nested workflow) throws descriptive error", async () => {
+      const sub = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("inner", "processed"))
+        .gate("inner-gate");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("items", () => ["a", "b"])
+        .foreach(sub);
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(
+        "Gates inside nested workflows are not yet supported"
+      );
+    });
+
+    it("gate inside repeat (via nested workflow) throws descriptive error", async () => {
+      const sub = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("inner", "refined"))
+        .gate("inner-gate");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("init", () => "draft")
+        .repeat(sub, { until: () => true });
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(
+        "Gates inside nested workflows are not yet supported"
+      );
+    });
+
+    it("snapshot is JSON-serializable and round-trips", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "data"))
+        .gate("review", {
+          payload: ({ input }) => ({ draft: input, nested: [1, 2, 3] }),
+        });
+
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        const roundTripped = JSON.parse(JSON.stringify(snapshot));
+        expect(roundTripped).toEqual(snapshot);
+      }
+    });
+
+    it("pre-gate output is preserved in snapshot", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "important-data"))
+        .gate("review");
+
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.output).toBe("important-data");
+      }
+    });
+
+    it("loadState + stream resumes with live stream", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review")
+        .step(createPassthroughAgent("a2", "streamed-result"));
+
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output, stream } = resumed.stream(testCtx, "human input");
+
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      expect(await output).toBe("streamed-result");
+    });
+
+    it("resume stream hits next gate", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("gate-1")
+        .step(createPassthroughAgent("a2", "intermediate"))
+        .gate("gate-2")
+        .step("final", ({ input }) => `done: ${input}`);
+
+      // Hit first gate
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      // Resume via stream — hits second gate
+      const resumed = pipeline.loadState("gate-1", snapshot);
+      const { output } = resumed.stream(testCtx, "resp-1");
+
+      try {
+        await output;
+        expect.unreachable("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        expect((e as WorkflowSuspended).snapshot.gateId).toBe("gate-2");
+      }
+    });
+
+    it("initial stream suspends cleanly (output rejects, stream closes)", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "streamed-draft"))
+        .gate("review");
+
+      const { output, stream } = pipeline.stream(testCtx);
+
+      // Stream should close cleanly
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      // Output promise should reject with WorkflowSuspended
+      try {
+        await output;
+        expect.unreachable("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        const snapshot = (e as WorkflowSuspended).snapshot;
+        expect(snapshot.gateId).toBe("review");
+        expect(snapshot.output).toBe("streamed-draft");
+      }
+    });
+
+    it("schema validates response on generate", async () => {
+      const { z } = await import("zod");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review", {
+          schema: z.object({ approved: z.boolean(), notes: z.string() }),
+        })
+        .step("finalize", ({ input }) => `${input.approved}: ${input.notes}`);
+
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      // Valid response — passes schema
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output } = await resumed.generate(testCtx, { approved: true, notes: "lgtm" });
+      expect(output).toBe("true: lgtm");
+    });
+
+    it("schema rejects invalid response", async () => {
+      const { z } = await import("zod");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review", {
+          schema: z.object({ approved: z.boolean() }),
+        });
+
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      const resumed = pipeline.loadState("review", snapshot);
+      await expect(
+        resumed.generate(testCtx, { approved: "not-a-boolean" } as never)
+      ).rejects.toThrow();
+    });
+
+    it("resume with fresh context (updated chat history)", async () => {
+      type ChatCtx = { history: string[] };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const agent = new Agent<ChatCtx, any, any>({
+        id: "responder",
+        model: createMockModel("response"),
+        prompt: (ctx) => ctx.history.join("\n"),
+      });
+
+      const pipeline = Workflow.create<ChatCtx>()
+        .step(agent)
+        .gate("review")
+        .step(agent);
+
+      // First run with initial history
+      let snapshot!: WorkflowSnapshot;
+      try {
+        await pipeline.generate({ history: ["msg1"] });
+      } catch (e) {
+        snapshot = (e as WorkflowSuspended).snapshot;
+      }
+
+      // Resume with updated history (new messages added during pause)
+      const freshCtx = { history: ["msg1", "msg2", "approval"] };
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output } = await resumed.generate(freshCtx, "human response");
+      expect(output).toBe("response");
+
+      // Verify agent received the fresh context, not the original
+      const model = (agent as any).config.model;
+      const lastCall = model.doGenerateCalls[model.doGenerateCalls.length - 1];
+      expect(lastCall).toBeDefined();
+    });
+
+    it("full lifecycle: suspend → serialize → deserialize → resume (simulated DB)", async () => {
+      // Simulated database
+      const db: Record<string, string> = {};
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("draft", "Dear customer, your issue is resolved."))
+        .gate("manager-approval", {
+          payload: ({ input, ctx }) => ({
+            userId: ctx.userId,
+            draft: input,
+            action: "approve or reject",
+          }),
+        })
+        .step("send", ({ input }) => `SENT: ${input}`);
+
+      // === Phase 1: Run workflow, it suspends at gate ===
+      try {
+        await pipeline.generate(testCtx);
+        expect.unreachable("should suspend");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        const snapshot = (e as WorkflowSuspended).snapshot;
+
+        // Serialize to "database" (JSON string, like a real DB column)
+        db["workflow:user-1"] = JSON.stringify(snapshot);
+      }
+
+      // === Phase 2: Later (maybe different process), load and resume ===
+      const loaded: WorkflowSnapshot = JSON.parse(db["workflow:user-1"]);
+
+      // Verify the deserialized snapshot is valid
+      expect(loaded.version).toBe(1);
+      expect(loaded.gateId).toBe("manager-approval");
+      expect(loaded.gatePayload).toEqual({
+        userId: "user-1",
+        draft: "Dear customer, your issue is resolved.",
+        action: "approve or reject",
+      });
+
+      // Resume with the deserialized snapshot
+      const resumed = pipeline.loadState("manager-approval", loaded);
+      const { output } = await resumed.generate(testCtx, "Approved by manager");
+      expect(output).toBe("SENT: Approved by manager");
+    });
+
+    it("full lifecycle with streaming: suspend → serialize → resume stream", async () => {
+      const db: Record<string, string> = {};
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "draft"))
+        .gate("review")
+        .step(createPassthroughAgent("a2", "final-streamed"));
+
+      // === Phase 1: Stream, gate suspends, stream closes cleanly ===
+      const { output: outputPromise, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain partial content */ }
+
+      try {
+        await outputPromise;
+        expect.unreachable("should suspend");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowSuspended);
+        db["snap"] = JSON.stringify((e as WorkflowSuspended).snapshot);
+      }
+
+      // === Phase 2: Resume with streaming ===
+      const loaded: WorkflowSnapshot = JSON.parse(db["snap"]);
+      const resumed = pipeline.loadState("review", loaded);
+      const { output, stream: resumeStream } = resumed.stream(testCtx, "human says ok");
+
+      const reader2 = resumeStream.getReader();
+      while (!(await reader2.read()).done) { /* drain */ }
+
+      expect(await output).toBe("final-streamed");
+    });
+
+    it("multi-gate lifecycle: serialize/deserialize at each gate", async () => {
+      const db: Record<string, string> = {};
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "initial"))
+        .gate("gate-1")
+        .step("process", ({ input }) => `after-gate-1: ${input}`)
+        .gate("gate-2")
+        .step("finalize", ({ input }) => `done: ${input}`);
+
+      // Gate 1
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        db["snap"] = JSON.stringify((e as WorkflowSuspended).snapshot);
+      }
+
+      // Resume gate 1 → hits gate 2
+      const snap1: WorkflowSnapshot = JSON.parse(db["snap"]);
+      expect(snap1.gateId).toBe("gate-1");
+
+      try {
+        const resumed1 = pipeline.loadState("gate-1", snap1);
+        await resumed1.generate(testCtx, "response-1");
+      } catch (e) {
+        db["snap"] = JSON.stringify((e as WorkflowSuspended).snapshot);
+      }
+
+      // Resume gate 2 → completes
+      const snap2: WorkflowSnapshot = JSON.parse(db["snap"]);
+      expect(snap2.gateId).toBe("gate-2");
+      expect(snap2.output).toBe("after-gate-1: response-1");
+
+      const resumed2 = pipeline.loadState("gate-2", snap2);
+      const { output } = await resumed2.generate(testCtx, "response-2");
+      expect(output).toBe("done: response-2");
+    });
+  });
+
+  describe("multi-step streaming", () => {
+    it("output flows correctly across multiple streamed agents", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "first"))
+        .step(createPassthroughAgent("a2", "second"))
+        .step("transform", ({ input }) => `final: ${input}`);
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      expect(await output).toBe("final: second");
+    });
+
+    it("stream with branch routes correctly", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("classifier", "premium"))
+        .branch([
+          { when: ({ input }) => input === "premium", agent: createPassthroughAgent("premium", "vip-response") },
+          { agent: createPassthroughAgent("standard", "basic-response") },
+        ]);
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      expect(await output).toBe("vip-response");
+    });
+  });
+
+  describe("context flow", () => {
+    it("ctx is accessible in transform steps", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step("greet", ({ ctx }) => `hello ${ctx.userId}`);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("hello user-1");
+    });
+
+    it("ctx is accessible in branch predicates", async () => {
+      const ctxSpy = vi.fn().mockReturnValue(true);
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "input"))
+        .branch([
+          { when: ({ ctx }) => { ctxSpy(ctx); return true; }, agent: createPassthroughAgent("a", "matched") },
+        ]);
+
+      await pipeline.generate(testCtx);
+      expect(ctxSpy).toHaveBeenCalledWith(testCtx);
+    });
+
+    it("ctx is accessible in catch handlers", async () => {
+      const failingModel = createMockModel("x");
+      failingModel.doGenerate = async () => { throw new Error("fail"); };
+
+      const pipeline = Workflow.create<TestCtx>()
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .step(new Agent<TestCtx, any, any>({
+          id: "failing",
+          model: failingModel,
+          prompt: () => "go",
+        }))
+        .catch("handle", ({ ctx }) => `recovered by ${ctx.userId}`);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("recovered by user-1");
+    });
+  });
+
+  describe("typed workflow input", () => {
+    it("Workflow.create with explicit TInput", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("upper", ({ input }) => input.toUpperCase());
+
+      const { output } = await pipeline.generate(testCtx, "hello");
+      expect(output).toBe("HELLO");
+    });
+
+    it("input flows to first agent", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("a1", "processed"));
+
+      const { output } = await pipeline.generate(testCtx, "my-input");
+      expect(output).toBe("processed");
+    });
+  });
+
+  describe("edge cases", () => {
+    it("empty workflow throws on generate", async () => {
+      const pipeline = Workflow.create<TestCtx>();
+      await expect(pipeline.generate(testCtx)).rejects.toThrow("no steps");
+    });
+
+    it("empty workflow throws on stream", async () => {
+      const pipeline = Workflow.create<TestCtx>();
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      await expect(output).rejects.toThrow("no steps");
+    });
+
+    it("finally preserves output (does not change it)", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "important-value"))
+        .finally("cleanup", () => { /* side effect only */ });
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("important-value");
+    });
+
+    it("Workflow.create with id option", async () => {
+      const pipeline = Workflow.create<TestCtx>({ id: "my-pipeline" })
+        .step(createTextAgent("a1", "ok"));
+
+      expect(pipeline.id).toBe("my-pipeline");
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("ok");
+    });
+  });
+
+  describe("output chaining", () => {
+    it("foreach output feeds into next step", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step("items", () => ["a", "b", "c"])
+        .foreach(createPassthroughAgent("proc", "x"))
+        .step("count", ({ input }) => `count: ${input.length}`);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("count: 3");
+    });
+
+    it("repeat output feeds into next step", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const agent = new Agent<TestCtx, any, any>({
+        id: "refiner",
+        model: createMockModel("refined"),
+        prompt: () => "go",
+      });
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("init", () => "draft")
+        .repeat(agent, { until: () => true })
+        .step("wrap", ({ input }) => `[${input}]`);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("[refined]");
+    });
+
+    it("branch output feeds into next step", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("classifier", "route-a"))
+        .branch({
+          select: ({ input }) => input as "route-a" | "route-b",
+          agents: {
+            "route-a": createPassthroughAgent("a", "from-a"),
+            "route-b": createPassthroughAgent("b", "from-b"),
+          },
+        })
+        .step("wrap", ({ input }) => `result: ${input}`);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("result: from-a");
+    });
+  });
+
+  describe("end-to-end: classify → route → persist", () => {
+    it("simulates a real support ticket pipeline", async () => {
+      const saved: string[] = [];
+
+      // Classifier outputs a category
+      const classifier = createTextAgent("classifier", "bug");
+
+      // Specialist agents
+      const bugAgent = createPassthroughAgent("bug-agent", "Fixed the bug: restarted the service");
+      const featureAgent = createPassthroughAgent("feature-agent", "Feature request noted");
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(classifier)
+        .branch({
+          select: ({ input }) => input as "bug" | "feature",
+          agents: { bug: bugAgent, feature: featureAgent },
+          fallback: createPassthroughAgent("fallback", "Unknown category"),
+        })
+        .step("persist", ({ input, ctx }) => {
+          saved.push(`${ctx.userId}: ${input}`);
+          return input;
+        })
+        .catch("error-handler", ({ ctx }) => {
+          return `Error handling request for ${ctx.userId}`;
+        });
+
+      const { output } = await pipeline.generate(testCtx);
+
+      expect(output).toBe("Fixed the bug: restarted the service");
+      expect(saved).toEqual(["user-1: Fixed the bug: restarted the service"]);
+    });
+  });
+
+  describe("handleStream option", () => {
+    it("suppresses agent stream when consuming without forwarding", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("silent", "classified"), {
+          handleStream: async ({ result }) => {
+            await result.text; // consume without forwarding
+          },
+        })
+        .step(createPassthroughAgent("responder", "visible-response"));
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      expect(await output).toBe("visible-response");
+    });
+
+    it("handleStream receives ctx", async () => {
+      const ctxSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "value"), {
+          handleStream: async ({ result, ctx }) => {
+            ctxSpy(ctx);
+            await result.text;
+          },
+        });
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      await output;
+
+      expect(ctxSpy).toHaveBeenCalledWith(testCtx);
     });
   });
 });

@@ -11,7 +11,7 @@ The library is ~1000 lines across 4 files. It's designed to be read, understood,
 | Primitive      | Purpose                                                                                              |
 | -------------- | ---------------------------------------------------------------------------------------------------- |
 | `Agent`        | A pure AI SDK wrapper. Supports `generate()`, `stream()`, `asTool()`, and `asToolProvider()`. |
-| `Workflow`     | A typed pipeline that chains agents with `step()`, `branch()`, `foreach()`, `repeat()`, `catch()`, and `finally()`. |
+| `Workflow`     | A typed pipeline that chains agents with `step()`, `branch()`, `foreach()`, `repeat()`, `gate()`, `catch()`, and `finally()`. |
 | `defineTool`   | A context-aware tool factory — injects runtime context into tool `execute` calls.                     |
 
 ## Installation
@@ -596,6 +596,7 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
 | `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` controls parallelism (default: 1). |
 | `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
+| `.gate(id, opts?)`        | Human-in-the-loop suspension point. Throws `WorkflowSuspended` with a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
 | `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. |
 | `.finally(id, fn)`        | Always runs. `fn` receives `{ ctx }`.                                      |
 
@@ -617,6 +618,191 @@ Auto-extraction priority for `step()` with an agent:
 | `step(workflow)`     | Deterministic         | Full streaming         | Compose reusable sub-workflows into larger pipelines |
 | `foreach()`          | Deterministic         | Items don't stream     | Process each element of an array through an agent or workflow |
 | `repeat()`           | Condition function    | Each iteration streams | Iterative refinement until a quality threshold is met |
+
+## Human-in-the-Loop via `gate()`
+
+`gate()` suspends a workflow at a designated point, producing a JSON-serializable snapshot. The consumer persists the snapshot, collects human input out-of-band (HTTP, WebSocket, CLI, queue — any transport), then resumes the workflow from where it left off.
+
+### Basic gate
+
+```ts
+import { Workflow, WorkflowSuspended } from "pipeai";
+
+const pipeline = Workflow.create<Ctx>()
+  .step(draftAgent)
+  .gate("review", {
+    payload: ({ input }) => ({ draft: input, instructions: "Please review this draft" }),
+  })
+  .step(publishAgent);
+
+// Run — suspends at gate
+try {
+  await pipeline.generate(ctx, input);
+} catch (e) {
+  if (e instanceof WorkflowSuspended) {
+    await db.saveSnapshot(e.snapshot);
+    return res.status(202).json(e.snapshot.gatePayload);
+  }
+}
+
+// Resume — load state, pass gate ID + snapshot to generate or stream
+const snapshot = await db.loadSnapshot(id);
+const resumed = pipeline.loadState("review", snapshot);
+const { output } = await resumed.generate(ctx, humanResponse);
+```
+
+The `snapshot` is plain JSON — it survives `JSON.parse(JSON.stringify())`, database storage, and process restarts. The workflow definition (code) stays in the process; only the data is serialized.
+
+### Resuming with streaming
+
+For chat applications where the client reconnects and needs a live stream for the remaining steps:
+
+```ts
+const resumed = pipeline.loadState("review", snapshot);
+const { stream, output } = resumed.stream(ctx, humanResponse);
+return new Response(stream);
+```
+
+The previous stream is gone — the library only streams forward from the resume point. Load prior chat history from your database and send it to the client before piping the resume stream.
+
+### Streaming suspension
+
+When `stream()` hits a gate, the stream closes cleanly (partial content from steps before the gate is delivered). The `output` promise rejects with `WorkflowSuspended`:
+
+```ts
+const { stream, output } = pipeline.stream(ctx, input);
+pipeStreamToResponse(res, stream); // partial content delivered normally
+
+try {
+  await output;
+} catch (e) {
+  if (e instanceof WorkflowSuspended) {
+    await db.saveSnapshot(e.snapshot);
+  }
+}
+```
+
+### Schema validation
+
+Add a `schema` to validate the human response at runtime. The schema uses a structural type — any object with a `.parse()` method works (Zod, Valibot, ArkType, etc.):
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step(draftAgent)
+  .gate("review", {
+    schema: z.object({ approved: z.boolean(), notes: z.string() }),
+  })
+  .step("publish", ({ input }) => {
+    if (!input.approved) return "Rejected";
+    return `Published with notes: ${input.notes}`;
+  });
+
+// Resume — gate ID enables type inference, schema validates at runtime
+const resumed = pipeline.loadState("review", snapshot);
+await resumed.generate(ctx, { approved: true, notes: "lgtm" }); // passes
+await resumed.generate(ctx, { approved: "yes" });                // throws parse error
+```
+
+### Multiple gates
+
+A workflow can have multiple gates. Each `generate()`/`stream()` call advances to the next gate or completes:
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step(draftAgent)
+  .gate("review")
+  .step("process", ({ input }) => `reviewed: ${input}`)
+  .gate("final-approval")
+  .step("publish", ({ input }) => `published: ${input}`);
+
+// First gate
+let snapshot: WorkflowSnapshot;
+try { await pipeline.generate(ctx, input); }
+catch (e) { snapshot = (e as WorkflowSuspended).snapshot; }
+
+// Second gate
+const resumed1 = pipeline.loadState("review", snapshot);
+try { await resumed1.generate(ctx, "first approval"); }
+catch (e) { snapshot = (e as WorkflowSuspended).snapshot; }
+
+// Complete
+const resumed2 = pipeline.loadState("final-approval", snapshot);
+const { output } = await resumed2.generate(ctx, "final approval");
+```
+
+### Merging pre-gate output with response
+
+The `snapshot.output` field contains the pre-gate output. Use it to merge with the human response:
+
+```ts
+// The step after the gate needs both the draft and the approval
+const resumed = pipeline.loadState("review", snapshot);
+await resumed.generate(ctx, {
+  draft: snapshot.output,       // pre-gate output
+  approval: humanResponse,      // human's response
+});
+```
+
+### Injecting updated context on resume
+
+`ctx` is provided fresh on every `generate()`/`stream()` call — never serialized. Use it to inject updated chat history, refreshed auth tokens, or new database connections:
+
+```ts
+const freshCtx = {
+  chatHistory: await db.loadChatHistory(userId), // includes messages added during the pause
+  db: getDbConnection(),
+  userId,
+};
+const resumed = pipeline.loadState("review", snapshot);
+await resumed.stream(freshCtx, humanResponse);
+```
+
+### Conditional gates
+
+Use `condition` to make a gate fire only when a predicate returns `true`. When the condition returns `false`, the gate is skipped and the current output passes through unchanged:
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step(draftAgent)
+  .gate("review", {
+    condition: ({ input }) => input.needsReview,
+  })
+  .step(publishAgent);
+```
+
+### Merging pre-gate output with response
+
+Use `merge` to combine the pre-gate output with the human response into a single value for the next step. Without `merge`, only the human response is forwarded:
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step(draftAgent)
+  .gate("review", {
+    merge: ({ priorOutput, response }) => ({
+      draft: priorOutput,
+      approval: response,
+    }),
+  })
+  .step("publish", ({ input }) => {
+    // input is { draft, approval }
+  });
+```
+
+### Snapshot shape
+
+```ts
+interface WorkflowSnapshot {
+  version: 1;
+  resumeFromIndex: number;  // step index of the gate
+  output: unknown;          // pre-gate output
+  gateId: string;           // gate identifier
+  gatePayload: unknown;     // data for the human
+}
+```
+
+### Limitations
+
+Gates inside nested workflows, `foreach()`, and `repeat()` are not yet supported — a descriptive error is thrown at runtime. Gates at the top level of a workflow work in all cases.
 
 ## Full Example
 
