@@ -36,7 +36,7 @@ export class ToolProvider<
     const { execute, input: inputSchema, ...toolDef } = this.config;
     return tool({
       ...toolDef,
-      parameters: inputSchema,
+      inputSchema,
       execute: (input: TInput, options?: ToolExecutionOptions) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);

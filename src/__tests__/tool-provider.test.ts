@@ -29,6 +29,20 @@ describe("defineTool", () => {
     const result = await tool.execute!({ query: "hello" }, {} as never);
     expect(result).toBe("result for user-1: hello");
   });
+
+  it("forwards the input schema via the v6 `inputSchema` key (not `parameters`)", () => {
+    const define = defineTool<TestCtx>();
+    const inputSchema = z.object({ query: z.string() });
+    const myTool = define({
+      description: "search",
+      input: inputSchema,
+      execute: async () => "ok",
+    });
+
+    const tool = myTool.createTool(testCtx) as unknown as Record<string, unknown>;
+    expect(tool.inputSchema).toBe(inputSchema);
+    expect(tool.parameters).toBeUndefined();
+  });
 });
 
 describe("isToolProvider", () => {

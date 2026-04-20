@@ -205,7 +205,7 @@ export class Agent<
 
     return tool({
       description: this.description,
-      parameters: this.config.input,
+      inputSchema: this.config.input,
       execute: async (toolInput: TInput) => {
         // When inside a streaming workflow, automatically use stream() and merge to the active writer.
         // Otherwise fall back to generate().
