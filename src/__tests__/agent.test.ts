@@ -214,5 +214,19 @@ describe("Agent", () => {
       const result = await agent.generate(testCtx, "go");
       expect(result.text).toBe("ok");
     });
+
+    it("asTool forwards the input schema via the v6 `inputSchema` key (not `parameters`)", () => {
+      const inputSchema = z.object({ query: z.string() });
+      const agent = new Agent<TestCtx, { query: string }>({
+        id: "subagent",
+        model: createMockModel("ok"),
+        input: inputSchema,
+        prompt: (_ctx, input) => input.query,
+      });
+
+      const tool = agent.asTool(testCtx) as unknown as Record<string, unknown>;
+      expect(tool.inputSchema).toBe(inputSchema);
+      expect(tool.parameters).toBeUndefined();
+    });
   });
 });
