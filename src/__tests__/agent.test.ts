@@ -228,5 +228,57 @@ describe("Agent", () => {
       expect(tool.inputSchema).toBe(inputSchema);
       expect(tool.parameters).toBeUndefined();
     });
+
+    it("asToolProvider forwards the input schema via the v6 `inputSchema` key (not `parameters`)", () => {
+      const inputSchema = z.object({ query: z.string() });
+      const agent = new Agent<TestCtx, { query: string }>({
+        id: "subagent",
+        model: createMockModel("ok"),
+        input: inputSchema,
+        prompt: (_ctx, input) => input.query,
+      });
+
+      const provider = agent.asToolProvider();
+      const tool = provider.createTool(testCtx) as unknown as Record<string, unknown>;
+      expect(tool.inputSchema).toBe(inputSchema);
+      expect(tool.parameters).toBeUndefined();
+    });
+
+    it("subagent tool reaches the parent model with a populated JSON schema", async () => {
+      // Behavioral guard: regardless of how the wrapper is keyed, the parent model
+      // must receive the subagent's input schema as a non-empty JSONSchema7. If the
+      // schema is silently dropped (as it was when the wrapper used `parameters`),
+      // the captured `inputSchema` here will be `{}` instead.
+      const subagent = new Agent<TestCtx, { query: string }>({
+        id: "subagent",
+        model: createMockModel("ok"),
+        input: z.object({ query: z.string() }),
+        prompt: (_ctx, input) => input.query,
+      });
+
+      let capturedInputSchema: Record<string, unknown> | undefined;
+      const parentModel = createMockModel("done");
+      const originalDoGenerate = parentModel.doGenerate;
+      parentModel.doGenerate = async (options) => {
+        const fn = options.tools?.find((t) => t.type === "function");
+        if (fn && fn.type === "function") {
+          capturedInputSchema = fn.inputSchema as unknown as Record<string, unknown>;
+        }
+        return originalDoGenerate(options);
+      };
+
+      const parent = new Agent<TestCtx>({
+        id: "parent",
+        model: parentModel,
+        prompt: () => "use the subagent",
+        tools: () => ({ subagent: subagent.asTool(testCtx) }),
+      });
+
+      await parent.generate(testCtx);
+
+      expect(capturedInputSchema).toBeDefined();
+      expect(capturedInputSchema!.type).toBe("object");
+      expect(capturedInputSchema!.properties).toMatchObject({ query: { type: "string" } });
+    });
   });
 });

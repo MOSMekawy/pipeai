@@ -18,7 +18,7 @@ import {
 
 // Extract the Output interface type from the Output.object return type
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type OutputType<T = any> = ReturnType<typeof Output.object<T>>;
+export type OutputType<T = any> = ReturnType<typeof Output.object<T>>;
 import type { ZodType } from "zod";
 import { isToolProvider, TOOL_PROVIDER_BRAND, type IToolProvider } from "./tool-provider";
 import { extractOutput, getActiveWriter, resolveValue, type MaybePromise, type Resolvable } from "./utils";
@@ -147,7 +147,7 @@ export class Agent<
     this._onFinish = onFinish;
   }
 
-  async generate(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<GenerateTextResult> {
+  async generate(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
     const resolved = await this.resolveConfig(ctx, input);
     const options = this.buildCallOptions(resolved, ctx, input);
@@ -163,7 +163,7 @@ export class Agent<
     }
   }
 
-  async stream(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<StreamTextResult> {
+  async stream(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
     const resolved = await this.resolveConfig(ctx, input);
     const options = this.buildCallOptions(resolved, ctx, input);
@@ -178,13 +178,13 @@ export class Agent<
   }
 
   asTool(ctx: TContext, options?: {
-    mapOutput?: (result: GenerateTextResult) => MaybePromise<TOutput>;
+    mapOutput?: (result: GenerateTextResult<ToolSet, OutputType<TOutput>>) => MaybePromise<TOutput>;
   }): Tool {
     return this.createToolInstance(ctx, options);
   }
 
   asToolProvider(options?: {
-    mapOutput?: (result: GenerateTextResult) => MaybePromise<TOutput>;
+    mapOutput?: (result: GenerateTextResult<ToolSet, OutputType<TOutput>>) => MaybePromise<TOutput>;
   }): IToolProvider<TContext> {
     if (!this.config.input) {
       throw new Error(`Agent "${this.id}": asToolProvider() requires an input schema`);
@@ -197,13 +197,13 @@ export class Agent<
   }
 
   private createToolInstance(ctx: TContext, options?: {
-    mapOutput?: (result: GenerateTextResult) => MaybePromise<TOutput>;
+    mapOutput?: (result: GenerateTextResult<ToolSet, OutputType<TOutput>>) => MaybePromise<TOutput>;
   }): Tool {
     if (!this.config.input) {
       throw new Error(`Agent "${this.id}": asTool() requires an input schema`);
     }
 
-    return tool({
+    return tool<TInput, TOutput>({
       description: this.description,
       inputSchema: this.config.input,
       execute: async (toolInput: TInput) => {
@@ -220,8 +220,9 @@ export class Agent<
         if (options?.mapOutput) return options.mapOutput(result);
         return extractOutput(result, this.hasOutput);
       },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+      // TS cannot simplify the SDK's `NeverOptional<TOutput, ...>` conditional in a
+      // generic context, so we cast through `unknown` instead of `any`.
+    } as unknown as Tool<TInput, TOutput>);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -1,8 +1,9 @@
 import {
   createUIMessageStream,
   type UIMessageStreamWriter,
+  type ToolSet,
 } from "ai";
-import { type Agent, type GenerateTextResult, type StreamTextResult } from "./agent";
+import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
 import { extractOutput, runWithWriter, type MaybePromise } from "./utils";
 
 // ── Error Types ─────────────────────────────────────────────────────
@@ -49,12 +50,12 @@ export class WorkflowSuspended extends Error {
 // ── Shared Agent Step Hooks ─────────────────────────────────────────
 
 export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
-  mapGenerateResult?: (params: { result: GenerateTextResult; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
-  mapStreamResult?: (params: { result: StreamTextResult; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
-  onGenerateResult?: (params: { result: GenerateTextResult; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
-  onStreamResult?: (params: { result: StreamTextResult; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
+  mapGenerateResult?: (params: { result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
+  mapStreamResult?: (params: { result: StreamTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
+  onGenerateResult?: (params: { result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
+  onStreamResult?: (params: { result: StreamTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
   handleStream?: (params: {
-    result: StreamTextResult;
+    result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
     writer: UIMessageStreamWriter;
     ctx: Readonly<TContext>;
   }) => MaybePromise<void>;
@@ -320,7 +321,7 @@ export class SealedWorkflow<
       const writer = state.writer;
       // Run inside writer context so tools (asTool, defineTool) can access the writer automatically
       await runWithWriter(writer, async () => {
-        const result = await (agent.stream as (ctx: TContext, input: unknown) => Promise<StreamTextResult>)(ctx, state.output);
+        const result = await (agent.stream as (ctx: TContext, input: unknown) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output);
 
         if (options?.handleStream) {
           await options.handleStream({ result, writer, ctx });
@@ -339,7 +340,7 @@ export class SealedWorkflow<
         }
       });
     } else {
-      const result = await (agent.generate as (ctx: TContext, input: unknown) => Promise<GenerateTextResult>)(ctx, state.output);
+      const result = await (agent.generate as (ctx: TContext, input: unknown) => Promise<GenerateTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output);
 
       if (options?.onGenerateResult) {
         await options.onGenerateResult({ result, ctx, input });

@@ -3,6 +3,7 @@ export type {
   AgentConfig,
   GenerateTextResult,
   StreamTextResult,
+  OutputType,
 } from "./agent";
 
 export { Workflow, WorkflowBranchError, WorkflowLoopError, WorkflowSuspended } from "./workflow";

@@ -1,6 +1,6 @@
 {
   "name": "pipeai",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A typed multi-agent workflow pipeline built on top of the Vercel AI SDK",
   "type": "module",
   "main": "./dist/index.cjs",

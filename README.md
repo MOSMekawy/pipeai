@@ -238,7 +238,7 @@ This is useful when the agent is defined at module scope but the context isn't a
 
 ## defineTool — Context-Aware Tools
 
-`defineTool` wraps a tool definition so the agent's runtime context is injected into every `execute` call. The `input` field maps to AI SDK's `parameters`. When running inside a streaming workflow, the `writer` is automatically available in the third parameter for streaming metadata or progress updates to the client:
+`defineTool` wraps a tool definition so the agent's runtime context is injected into every `execute` call. The `input` field maps to AI SDK's `inputSchema`. When running inside a streaming workflow, the `writer` is automatically available in the third parameter for streaming metadata or progress updates to the client:
 
 ```ts
 import { defineTool } from "pipeai";

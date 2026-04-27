@@ -7,11 +7,13 @@ export type ToolExecuteOptions = ToolExecutionOptions & {
   writer?: UIMessageStreamWriter;
 };
 
+type ToolProviderOptions = NonNullable<Tool["providerOptions"]>;
+
 export type ToolProviderConfig<TContext, TInput, TOutput> = {
   description?: string;
   input: FlexibleSchema<TInput>;
-  output?: FlexibleSchema<unknown>;
-  providerOptions?: unknown;
+  outputSchema?: FlexibleSchema<TOutput>;
+  providerOptions?: ToolProviderOptions;
   execute: (input: TInput, ctx: Readonly<TContext>, options: ToolExecuteOptions) => Promise<TOutput>;
 };
 
@@ -34,12 +36,15 @@ export class ToolProvider<
 
   createTool(context: Readonly<TContext>): Tool {
     const { execute, input: inputSchema, ...toolDef } = this.config;
-    return tool({
+    // The shape matches `Tool<TInput, TOutput>`, but TS cannot simplify the SDK's
+    // `NeverOptional<TOutput, ...>` conditional in a generic context, so the literal
+    // is not assignable directly. Cast through `unknown` rather than `any` so the
+    // return type and call sites still get type-checked.
+    return tool<TInput, TOutput>({
       ...toolDef,
       inputSchema,
-      execute: (input: TInput, options?: ToolExecutionOptions) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+      execute: (input: TInput, options: ToolExecutionOptions) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
+    } as unknown as Tool<TInput, TOutput>);
   }
 }
 
