@@ -508,6 +508,13 @@ export class Workflow<
   TGates extends Record<string, unknown> = {},
 > extends SealedWorkflow<TContext, TInput, TOutput, TGates> {
 
+  /**
+   * Sentinel value for `foreach`'s `onError` handler. Returning `Workflow.SKIP`
+   * from `onError` omits the failed item's index from the output array,
+   * shortening it relative to the input array.
+   */
+  static readonly SKIP: unique symbol = Symbol("pipeai.foreach.skip");
+
   private constructor(steps: ReadonlyArray<StepNode> = [], id?: string) {
     super(steps, id);
   }
@@ -720,11 +727,32 @@ export class Workflow<
 
   // ── foreach: array iteration ─────────────────────────────────
 
+  /**
+   * Map each item of an array through an agent or sub-workflow.
+   *
+   * @param target Agent or `SealedWorkflow` invoked once per item.
+   * @param options.concurrency Max in-flight items per batch (default 1).
+   * @param options.onError Per-iteration error handler. When provided, a single
+   *   item's failure no longer aborts the batch. Return a `TNextOutput` value
+   *   to substitute for the failed item, return `Workflow.SKIP` to omit the
+   *   index (shortening the output array), or throw / return a rejected promise
+   *   to abort the foreach step (the thrown error is caught by any downstream
+   *   `.catch()`). When omitted, the existing fail-fast behavior is preserved.
+   */
   foreach<TNextOutput>(
     target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput>,
-    options?: { concurrency?: number },
+    options?: {
+      concurrency?: number;
+      onError?: (params: {
+        error: unknown;
+        item: ElementOf<TOutput>;
+        index: number;
+        ctx: Readonly<TContext>;
+      }) => MaybePromise<TNextOutput | typeof Workflow.SKIP>;
+    },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
     const concurrency = options?.concurrency ?? 1;
+    const onError = options?.onError;
     const isWorkflow = target instanceof SealedWorkflow;
     const id = isWorkflow ? (target.id ?? "foreach") : `foreach:${(target as Agent<TContext, ElementOf<TOutput>, TNextOutput>).id}`;
 
@@ -739,6 +767,7 @@ export class Workflow<
 
         const ctx = state.ctx as TContext;
         const results: unknown[] = new Array(items.length);
+        const skipped = new Set<number>();
 
         // Streaming is intentionally not propagated to foreach items —
         // each item runs in generate mode because merging interleaved
@@ -753,18 +782,47 @@ export class Workflow<
           results[index] = itemState.output;
         };
 
+        const handleRejection = async (error: unknown, item: unknown, index: number) => {
+          if (!onError) throw error;
+          const recovered = await onError({
+            error,
+            item: item as ElementOf<TOutput>,
+            index,
+            ctx: state.ctx as Readonly<TContext>,
+          });
+          if (recovered === Workflow.SKIP) {
+            skipped.add(index);
+          } else {
+            results[index] = recovered;
+          }
+        };
+
         if (concurrency <= 1) {
           for (let i = 0; i < items.length; i++) {
-            await executeItem(items[i], i);
+            try {
+              await executeItem(items[i], i);
+            } catch (error) {
+              await handleRejection(error, items[i], i);
+            }
           }
         } else {
           for (let i = 0; i < items.length; i += concurrency) {
             const batch = items.slice(i, i + concurrency);
-            await Promise.all(batch.map((item, j) => executeItem(item, i + j)));
+            const settled = await Promise.allSettled(
+              batch.map((item, j) => executeItem(item, i + j))
+            );
+            for (let j = 0; j < settled.length; j++) {
+              const r = settled[j];
+              if (r.status === "rejected") {
+                await handleRejection(r.reason, batch[j], i + j);
+              }
+            }
           }
         }
 
-        state.output = results;
+        state.output = skipped.size === 0
+          ? results
+          : results.filter((_, i) => !skipped.has(i));
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

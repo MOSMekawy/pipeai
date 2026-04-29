@@ -22,6 +22,22 @@ function createPassthroughAgent(id: string, text: string): Agent<TestCtx, string
   });
 }
 
+function createFailingAgent(
+  id: string,
+  shouldFail: (input: string) => boolean,
+  errorMessage = "agent failed",
+): Agent<TestCtx, string, string> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return new Agent<TestCtx, any, any>({
+    id,
+    model: createMockModel("ok"),
+    prompt: (_ctx: TestCtx, input: string) => {
+      if (shouldFail(input)) throw new Error(`${errorMessage}: ${input}`);
+      return input;
+    },
+  });
+}
+
 describe("Workflow", () => {
   describe("step() with agent", () => {
     it("runs a single step", async () => {
@@ -623,6 +639,223 @@ describe("Workflow", () => {
         .foreach(agent as any);
 
       await expect(pipeline.generate(testCtx)).rejects.toThrow("expected array input");
+    });
+
+    describe("onError", () => {
+      it("recovers a single failure with an Agent target", async () => {
+        const agent = createFailingAgent("proc", input => input === "b");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            onError: ({ item }) => `recovered:${item}`,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["ok", "recovered:b", "ok"]);
+      });
+
+      it("recovers a single failure with a SealedWorkflow target", async () => {
+        const sub = Workflow.create<TestCtx, string>()
+          .step("inner", ({ input }) => {
+            if (input === "b") throw new Error(`inner failed: ${input}`);
+            return input;
+          });
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(sub, {
+            onError: ({ item }) => `recovered:${item}`,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["a", "recovered:b", "c"]);
+      });
+
+      it("calls onError with { error, item, index, ctx }", async () => {
+        const agent = createFailingAgent("proc", () => true, "boom");
+        const onError = vi.fn(({ item }) => `r:${item}`);
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["x"])
+          .foreach(agent, { onError });
+
+        await pipeline.generate(testCtx);
+        expect(onError).toHaveBeenCalledOnce();
+        expect(onError).toHaveBeenCalledWith({
+          error: expect.any(Error),
+          item: "x",
+          index: 0,
+          ctx: testCtx,
+        });
+      });
+
+      it("aborts foreach when onError rethrows; outer .catch() recovers", async () => {
+        const agent = createFailingAgent("proc", input => input === "b", "agent boom");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            onError: ({ error }) => { throw error; },
+          })
+          .catch("recover", ({ error }) => {
+            expect((error as Error).message).toContain("agent boom");
+            return ["caught"];
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["caught"]);
+      });
+
+      it("Workflow.SKIP omits the failed index", async () => {
+        const agent = createFailingAgent("proc", input => input === "c");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c", "d", "e"])
+          .foreach(agent, {
+            onError: () => Workflow.SKIP,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["ok", "ok", "ok", "ok"]);
+      });
+
+      it("preserves fail-fast when onError is not provided", async () => {
+        const agent = createFailingAgent("proc", input => input === "b", "fail-fast");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent);
+
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("fail-fast");
+      });
+
+      it("lets in-flight siblings finish when one fails (allSettled semantics)", async () => {
+        const seen: string[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "seen",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            seen.push(input);
+            await new Promise(r => setTimeout(r, 5));
+            if (input === "b") throw new Error(`boom: ${input}`);
+            return input;
+          },
+        });
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            concurrency: 3,
+            onError: ({ item }) => `r:${item}`,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(seen.sort()).toEqual(["a", "b", "c"]);
+        expect(output).toEqual(["ok", "r:b", "ok"]);
+      });
+
+      it("invokes onError in index order, not completion order", async () => {
+        const calls: number[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "ordering",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            // index 0 finishes slower than index 1, both fail
+            const delay = input === "first" ? 20 : 1;
+            await new Promise(r => setTimeout(r, delay));
+            throw new Error(`boom: ${input}`);
+          },
+        });
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["first", "second"])
+          .foreach(agent, {
+            concurrency: 2,
+            onError: ({ index }) => {
+              calls.push(index);
+              return "x";
+            },
+          });
+
+        await pipeline.generate(testCtx);
+        expect(calls).toEqual([0, 1]);
+      });
+
+      it("does not call onError for successful items", async () => {
+        const agent = createPassthroughAgent("ok", "ok");
+        const onError = vi.fn(() => "x");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, { onError });
+
+        await pipeline.generate(testCtx);
+        expect(onError).not.toHaveBeenCalled();
+      });
+
+      it("returns empty array when all items are skipped", async () => {
+        const agent = createFailingAgent("proc", () => true);
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            onError: () => Workflow.SKIP,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual([]);
+      });
+
+      it("applies onError in the sequential branch (concurrency: 1)", async () => {
+        const agent = createFailingAgent("proc", input => input === "b");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            concurrency: 1,
+            onError: ({ item }) => `recovered:${item}`,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["ok", "recovered:b", "ok"]);
+      });
+
+      it("awaits an async onError handler", async () => {
+        const agent = createFailingAgent("proc", input => input === "b");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(agent, {
+            onError: async ({ item }) => {
+              await new Promise(r => setTimeout(r, 5));
+              return `async:${item}`;
+            },
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["ok", "async:b", "ok"]);
+      });
+
+      it("mixes recovery values and Workflow.SKIP in a single batch", async () => {
+        const agent = createFailingAgent(
+          "proc",
+          input => input === "b" || input === "c",
+        );
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c", "d"])
+          .foreach(agent, {
+            concurrency: 4,
+            onError: ({ item }) =>
+              item === "c" ? Workflow.SKIP : `r:${item}`,
+          });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect(output).toEqual(["ok", "r:b", "ok"]);
+      });
     });
   });
 
