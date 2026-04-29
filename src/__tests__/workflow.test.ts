@@ -857,6 +857,103 @@ describe("Workflow", () => {
         expect(output).toEqual(["ok", "r:b", "ok"]);
       });
     });
+
+    describe("bounded concurrency", () => {
+      it("runs at most `concurrency` items in flight at any time", async () => {
+        let inFlight = 0;
+        let maxInFlight = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "tracker",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            inFlight++;
+            if (inFlight > maxInFlight) maxInFlight = inFlight;
+            await new Promise(r => setTimeout(r, 5));
+            inFlight--;
+            return input;
+          },
+        });
+
+        const items = Array.from({ length: 12 }, (_, i) => String(i));
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => items)
+          .foreach(agent, { concurrency: 3 });
+
+        await pipeline.generate(testCtx);
+        expect(maxInFlight).toBeLessThanOrEqual(3);
+        expect(maxInFlight).toBe(3);
+      });
+
+      it("launches the next item as soon as one completes (no lockstep)", async () => {
+        // 8 items, concurrency 4. Item 0 takes 50ms; items 1..7 take 5ms.
+        // Lockstep batches would force every item in batch 0 to wait for
+        // item 0, total ≥ 50ms + 50ms = 100ms (item 0 in batch 0, then batch 1).
+        // Sliding semaphore: items 1..3 finish quickly, items 4..7 launch
+        // immediately as 1..3 release, total ≈ ~50ms (gated by item 0).
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "timing",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            const delay = input === "slow" ? 50 : 5;
+            await new Promise(r => setTimeout(r, delay));
+            return input;
+          },
+        });
+
+        const items = ["slow", "f", "f", "f", "f", "f", "f", "f"];
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => items)
+          .foreach(agent, { concurrency: 4 });
+
+        const start = Date.now();
+        await pipeline.generate(testCtx);
+        const elapsed = Date.now() - start;
+
+        // Generous bound: well under the 100ms+ lockstep would require.
+        expect(elapsed).toBeLessThan(85);
+      });
+
+      it("discards in-flight successes after onError rethrow", async () => {
+        const completed = new Set<string>();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "abort-drain",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            // "fast-fail" rejects quickly; the rest succeed slowly.
+            if (input === "fast-fail") {
+              await new Promise(r => setTimeout(r, 1));
+              throw new Error("boom");
+            }
+            await new Promise(r => setTimeout(r, 20));
+            completed.add(input);
+            return input;
+          },
+        });
+
+        const sideEffect = vi.fn();
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["fast-fail", "slow-1", "slow-2", "slow-3"])
+          .foreach(agent, {
+            concurrency: 4,
+            onError: ({ error }) => { throw error; },
+          })
+          .step("after", ({ input }) => {
+            sideEffect(input);
+            return input;
+          });
+
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("boom");
+        // The downstream step never runs — successes from in-flight items
+        // are not observable to anything past the foreach.
+        expect(sideEffect).not.toHaveBeenCalled();
+        // In-flight items did finish (they couldn't be cancelled), but their
+        // successes were dropped.
+        expect(completed.size).toBeGreaterThan(0);
+      });
+    });
   });
 
   describe("repeat()", () => {

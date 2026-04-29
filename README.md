@@ -484,12 +484,14 @@ const pipeline = Workflow.create<Ctx>()
   .step("combine", ({ input }) => input.join("\n\n"));
 ```
 
-Concurrent processing with batched parallelism:
+Concurrent processing with bounded parallelism:
 
 ```ts
-// Process 3 items at a time
+// Up to 3 items run simultaneously; the next launches as soon as one finishes.
 .foreach(summarizer, { concurrency: 3 })
 ```
+
+`concurrency` is the **maximum number of items in flight at any moment** — backed by a semaphore. There's no lockstep batching: a slow item never blocks a finished slot from picking up the next pending one.
 
 Works with nested workflows too:
 
@@ -502,6 +504,28 @@ const pipeline = Workflow.create<Ctx>()
   .step("fetch-items", async ({ ctx }) => ctx.db.items.getAll())
   .foreach(processItem, { concurrency: 5 });
 ```
+
+#### Per-item error recovery via `onError`
+
+By default a single item's failure aborts the whole `foreach`. Pass an `onError` handler to recover individual items — return a substitute value, return `Workflow.SKIP` to drop the failed index from the output array, or rethrow to abort the step (the throw is catchable by a downstream `.catch()`):
+
+```ts
+import { Workflow } from "pipeai";
+
+const pipeline = Workflow.create<Ctx>()
+  .step("fetch", async ({ ctx }) => ctx.db.urls.getAll())
+  .foreach(scraper, {
+    concurrency: 5,
+    onError: ({ error, item, index }) => {
+      // Substitute a placeholder
+      if (isTransient(error)) return { url: item, body: "" };
+      // Or drop the item entirely (output array is shortened)
+      return Workflow.SKIP;
+    },
+  });
+```
+
+`onError` is invoked sequentially in **index order** after all items settle, so its observable order is deterministic regardless of completion timing. In-flight siblings are never cancelled by another item's failure.
 
 **Type safety:** `foreach()` uses `ElementOf<TOutput>` to extract the array element type. If the previous step doesn't produce an array, the call is rejected at compile time.
 
@@ -594,7 +618,7 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | `.step(id, fn)`           | Transform the output. `fn` receives `{ ctx, input }` and returns the new output. |
 | `.branch([...cases])`     | Predicate routing. First `when` match wins; case without `when` is default. |
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
-| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` controls parallelism (default: 1). |
+| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: 1). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
 | `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
 | `.gate(id, opts?)`        | Human-in-the-loop suspension point. Throws `WorkflowSuspended` with a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
 | `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. |

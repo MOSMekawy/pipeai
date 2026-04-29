@@ -4,7 +4,7 @@ import {
   type ToolSet,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
-import { extractOutput, runWithWriter, type MaybePromise } from "./utils";
+import { extractOutput, runWithWriter, Semaphore, type MaybePromise } from "./utils";
 
 // ── Error Types ─────────────────────────────────────────────────────
 
@@ -731,13 +731,16 @@ export class Workflow<
    * Map each item of an array through an agent or sub-workflow.
    *
    * @param target Agent or `SealedWorkflow` invoked once per item.
-   * @param options.concurrency Max in-flight items per batch (default 1).
+   * @param options.concurrency Max items in flight at any moment (default 1).
+   *   Backed by a semaphore: as soon as one item completes, the next launches —
+   *   no lockstep batching.
    * @param options.onError Per-iteration error handler. When provided, a single
-   *   item's failure no longer aborts the batch. Return a `TNextOutput` value
+   *   item's failure no longer aborts the foreach. Return a `TNextOutput` value
    *   to substitute for the failed item, return `Workflow.SKIP` to omit the
    *   index (shortening the output array), or throw / return a rejected promise
    *   to abort the foreach step (the thrown error is caught by any downstream
    *   `.catch()`). When omitted, the existing fail-fast behavior is preserved.
+   *   `onError` is invoked sequentially in index order after all items settle.
    */
   foreach<TNextOutput>(
     target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput>,
@@ -806,17 +809,27 @@ export class Workflow<
             }
           }
         } else {
-          for (let i = 0; i < items.length; i += concurrency) {
-            const batch = items.slice(i, i + concurrency);
-            const settled = await Promise.allSettled(
-              batch.map((item, j) => executeItem(item, i + j))
-            );
-            for (let j = 0; j < settled.length; j++) {
-              const r = settled[j];
-              if (r.status === "rejected") {
-                await handleRejection(r.reason, batch[j], i + j);
-              }
+          // Bounded concurrency via semaphore: at most `concurrency` items run
+          // simultaneously; the next one starts as soon as one releases.
+          // Failures are buffered and processed in index order AFTER all items
+          // settle so onError invocations remain deterministic.
+          const sem = new Semaphore(concurrency);
+          const failures: Array<{ index: number; error: unknown }> = [];
+
+          await Promise.all(items.map(async (item, i) => {
+            await sem.acquire();
+            try {
+              await executeItem(item, i);
+            } catch (error) {
+              failures.push({ index: i, error });
+            } finally {
+              sem.release();
             }
+          }));
+
+          failures.sort((a, b) => a.index - b.index);
+          for (const { index, error } of failures) {
+            await handleRejection(error, items[index], index);
           }
         }
 
