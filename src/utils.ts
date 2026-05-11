@@ -87,3 +87,19 @@ export async function extractOutput(result: any, hasStructuredOutput: boolean): 
   }
   return await result.text;
 }
+
+/**
+ * Recursively freeze an object graph. Cycles are tracked via a WeakSet so we
+ * never recurse into the same node twice. Maps/Sets stay structurally frozen
+ * but `.set()`/`.add()` still mutate them — Object.freeze doesn't cover those.
+ */
+export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+  if (value === null || typeof value !== "object" || seen.has(value as object)) return value;
+  seen.add(value as object);
+  Object.freeze(value);
+  for (const key of Reflect.ownKeys(value as object)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    deepFreeze((value as any)[key], seen);
+  }
+  return value;
+}
