@@ -2041,25 +2041,41 @@ describe("Workflow", () => {
       });
 
       it("item warnings merged into parent under namespace `<id>[index]:<inner-stepId>`", async () => {
-        // Inner workflow: step → finally(throws) → catch → completes successfully.
-        // The finally error becomes a warning in the inner state, which we want
-        // to surface up the foreach into the parent's result.warnings.
-        const sub = Workflow.create<TestCtx, string>()
-          .step("ok", ({ input }) => input)
-          .finally("inner-finally", () => { throw new Error("inner-cleanup-fail"); });
+        // The contract: foreach merges per-item itemState.warnings into the
+        // parent state.warnings, namespaced as `${id}[${index}]:${w.stepId}`,
+        // on BOTH branches (suspension + completion).
+        //
+        // F0 has no path where an inner workflow completes cleanly with
+        // non-empty state.warnings (the only thing that pushes is "step error
+        // pushed when finally also throws" — which leaves pendingError set,
+        // triggering an inner throw at the tail). So we exercise the merge on
+        // the SUSPENSION branch instead: inner suspends + has a throwing
+        // finally → inner's state.warnings carries the finally error → foreach
+        // merges into parent state.warnings → foreach throws
+        // NestedGateUnsupportedError → outer .catch() swallows it →
+        // result.status === "complete" and result.warnings contains the
+        // namespaced entry.
+        const innerSuspends = Workflow.create<TestCtx, string>()
+          .step(createPassthroughAgent("inner-step", "x"))
+          .gate("inner-g")
+          .finally("inner-fin", () => { throw new Error("inner-fin-fail"); });
 
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => ["a"])
-          .foreach(sub, { id: "items-fe" });
+          .foreach(innerSuspends, { id: "fe" })
+          .catch("rec", () => ["recovered-outer"]);
 
-        // The finally on completion path throws AggregateError.
-        // For the merge test, we need a successful completion of the inner with a non-fatal warning.
-        // Since the only path that yields warnings on success is the suspension-path,
-        // we restructure the test: use a step that throws followed by a catch, then finally.
-        await expect(pipeline.generate(testCtx)).rejects.toThrow(AggregateError);
-        // The merge happens inside foreach.execute() — but on AggregateError throw,
-        // warnings have already been merged. The throw's path doesn't surface warnings.
-        // This test intentionally documents that limitation.
+        const result = await pipeline.generate(testCtx);
+        expect(result.status).toBe("complete");
+        // The namespaced warning from the inner finally must have been merged
+        // into the parent's warnings BEFORE the foreach threw the marker. If
+        // mergeItemWarnings() were removed, this assertion would fail —
+        // proving the test exercises the contract.
+        const stepIds = result.warnings.map(w => w.stepId);
+        expect(stepIds).toContain("fe[0]:inner-fin");
+        const innerFin = result.warnings.find(w => w.stepId === "fe[0]:inner-fin");
+        expect(innerFin?.source).toBe("finally");
+        expect((innerFin?.error as Error).message).toBe("inner-fin-fail");
       });
     });
 
@@ -2208,19 +2224,39 @@ describe("Workflow", () => {
         await expect(output).rejects.toThrow("real-error");
       });
 
-      it("onError NOT invoked on suspension (one-time console.warn)", async () => {
-        // Reset module-level dedup by importing fresh — vitest each-file isolation
-        // means this test may or may not see the warning depending on prior tests.
-        // We assert the no-call contract on options.onError instead.
-        const pipeline = Workflow.create<TestCtx>()
-          .step(createTextAgent("a1", "draft"))
-          .gate("review");
-        const onError = vi.fn().mockReturnValue("formatted");
-        const { output, stream } = pipeline.stream(testCtx, undefined, { onError });
-        const reader = stream.getReader();
-        while (!(await reader.read()).done) { /* drain */ }
-        await output;   // resolves with suspended
-        expect(onError).not.toHaveBeenCalled();
+      it("onError NOT invoked on suspension; one-time console.warn fires", async () => {
+        const { __resetStreamOnErrorOnSuspendWarnForTests } = await import("../workflow");
+        __resetStreamOnErrorOnSuspendWarnForTests();
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => { /* swallow */ });
+        try {
+          const pipeline = Workflow.create<TestCtx>()
+            .step(createTextAgent("a1", "draft"))
+            .gate("review");
+          const onError = vi.fn().mockReturnValue("formatted");
+          const { output, stream } = pipeline.stream(testCtx, undefined, { onError });
+          const reader = stream.getReader();
+          while (!(await reader.read()).done) { /* drain */ }
+          await output;   // resolves with suspended
+          expect(onError).not.toHaveBeenCalled();
+
+          // The one-time console.warn fires.
+          expect(warnSpy).toHaveBeenCalledTimes(1);
+          expect(warnSpy.mock.calls[0][0] as string).toMatch(/pipeai: stream\(\) with options\.onError suspended at a gate/);
+
+          // Run again WITHOUT reset — warn must NOT fire a second time (dedup contract).
+          warnSpy.mockClear();
+          const pipeline2 = Workflow.create<TestCtx>()
+            .step(createTextAgent("a2", "draft"))
+            .gate("review2");
+          const onError2 = vi.fn();
+          const { output: out2, stream: s2 } = pipeline2.stream(testCtx, undefined, { onError: onError2 });
+          const r2 = s2.getReader();
+          while (!(await r2.read()).done) { /* drain */ }
+          await out2;
+          expect(warnSpy).not.toHaveBeenCalled();
+        } finally {
+          warnSpy.mockRestore();
+        }
       });
     });
 
@@ -2240,25 +2276,56 @@ describe("Workflow", () => {
     });
 
     describe("checkpointFailed plumbing (F1 forward-compat)", () => {
-      it("catch-bypass branch fires when state.checkpointFailed is set mid-run", async () => {
-        // F0 has no organic path that sets state.checkpointFailed — F1 will.
-        // We exercise the branch-coverage placeholder by reaching into execute
-        // through a custom step body. Since RuntimeState is private, use a step
-        // that throws — then verify catch is bypassed only when checkpointFailed.
-        // This test acts as a guard so F1 doesn't accidentally unbreak the bypass.
+      it("catch is bypassed when state.checkpointFailed is true mid-run; uncaught error reaches caller", async () => {
+        // F0 has no organic path that sets state.checkpointFailed — F1 will
+        // populate it from a thrown onCheckpoint. We exercise the branch by
+        // splicing a synthetic step into the protected `steps` array that
+        // sets state.checkpointFailed = true mid-run, then proves:
+        //   1. .catch() does NOT recover (bypass branch fires)
+        //   2. .finally() still runs (finally bodies always run)
+        //   3. Caller receives the original step error
+        const failing = createMockModel("x");
+        failing.doGenerate = async () => { throw new Error("step-fail"); };
+        const catchSpy = vi.fn().mockReturnValue("recovered");
+        const finallySpy = vi.fn();
+
+        const pipeline = Workflow.create<TestCtx>()
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .step(new Agent<TestCtx, any, any>({ id: "f", model: failing, prompt: () => "go" }))
+          .catch("c", catchSpy)
+          .finally("fin", finallySpy);
+
+        // Splice a synthetic step BEFORE the failing one that sets the flag.
+        // `steps` is `protected readonly` from TS's POV; `readonly` is a type-only
+        // constraint — the array itself is mutable at runtime. Honest test-only hack.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const stepsArr = (pipeline as any).steps as Array<{ type: string; id: string; execute: (s: { checkpointFailed?: boolean }) => Promise<void> }>;
+        stepsArr.unshift({
+          type: "step",
+          id: "set-checkpoint-failed-flag",
+          execute: async (state) => { state.checkpointFailed = true; },
+        });
+
+        // The failing step still throws; catch is bypassed because checkpointFailed
+        // is true; finally runs; the step error reaches the caller bare.
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("step-fail");
+        expect(catchSpy).not.toHaveBeenCalled();
+        expect(finallySpy).toHaveBeenCalledOnce();
+      });
+
+      it("baseline: without checkpointFailed, catch DOES run (proves the bypass test isn't trivial)", async () => {
         const failing = createMockModel("x");
         failing.doGenerate = async () => { throw new Error("step-fail"); };
         const catchSpy = vi.fn().mockReturnValue("recovered");
 
         const pipeline = Workflow.create<TestCtx>()
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          .step(new Agent<TestCtx, any, any>({ id: "f", model: failing, prompt: () => "go" }))
-          .catch("c", catchSpy);
+          .step(new Agent<TestCtx, any, any>({ id: "f2", model: failing, prompt: () => "go" }))
+          .catch("c2", catchSpy);
 
-        // Without checkpointFailed, catch runs (existing behavior).
         const result = await pipeline.generate(testCtx);
         expect(result.status).toBe("complete");
-        expect(catchSpy).toHaveBeenCalled();
+        expect(catchSpy).toHaveBeenCalledOnce();
       });
     });
   });

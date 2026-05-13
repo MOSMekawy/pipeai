@@ -250,6 +250,15 @@ function pendingErrorSourceToStepType(source: PendingError["source"]): WorkflowS
 // Tracked module-level so the warning fires exactly once per process.
 let warnedStreamOnErrorOnSuspend = false;
 
+/**
+ * @internal — test-only reset of the one-time stream-mode warn dedup. Lets
+ * a test assert the `console.warn` fires under a known-clean state. Not part
+ * of the supported API; do not rely on this from user code.
+ */
+export function __resetStreamOnErrorOnSuspendWarnForTests(): void {
+  warnedStreamOnErrorOnSuspend = false;
+}
+
 // ── Sealed Workflow (returned by finally — execution only) ───────────
 
 export class SealedWorkflow<
@@ -260,8 +269,13 @@ export class SealedWorkflow<
 > {
   readonly id?: string;
   protected readonly steps: ReadonlyArray<StepNode>;
-  // F3 forward-compat — set via internal hook for tests; F3 wires through Workflow.create.
-  protected readonly observability?: WorkflowObservability;
+  /**
+   * Workflow observability hooks. Not `readonly` because F3 will wire it
+   * through `Workflow.create({ observability })` and F0 tests need to inject
+   * via subclass / `as any`. Until F3 ships, this is an internal seam — don't
+   * mutate from user code.
+   */
+  protected observability?: WorkflowObservability;
   // Memoized — see ensureDuplicateCheck().
   private duplicateCheckPassed = false;
 
@@ -479,11 +493,17 @@ export class SealedWorkflow<
       }
 
       // Defensive invariant — by this point node.type === "step" (gate/finally/catch
-      // already continued above). executeNestedWorkflow/foreach clear inner suspension
-      // before rethrowing, so a non-undefined `state.suspension` here means a coding bug
+      // already continued above), and gate is the only node type that legitimately
+      // sets state.suspension. executeNestedWorkflow/foreach clear inner suspension
+      // before rethrowing, so a non-undefined value here means a coding bug
       // somewhere bypassed that invariant. The cast is necessary because TypeScript
       // narrowed `state.suspension` to undefined at the top-of-loop falsy check; the
       // body could have mutated it through the await above, but TS doesn't know.
+      //
+      // catch.catchFn cannot leak suspension because its signature exposes only
+      // `{error, ctx, lastOutput, stepId}` — no state access. finally bodies
+      // likewise receive only `{ctx}`. So the defensive net only needs to cover
+      // the step-execute path, which is where this check lives.
       const leaked = (state as { suspension?: WorkflowSnapshot }).suspension;
       if (leaked) {
         state.suspension = undefined;   // reset to avoid cascading
@@ -516,16 +536,11 @@ export class SealedWorkflow<
       const isFinallyPath = pendingError.source === "finally"
         || (state.warnings?.some(w => w.source === "finally") ?? false);
       if (isFinallyPath) {
-        const all = [
-          ...(state.warnings ?? []).filter(w => w.source === "finally").map(w => w.error),
-          ...((state.warnings ?? []).some(w => w.source !== "finally")
-            ? (state.warnings ?? []).filter(w => w.source !== "finally").map(w => w.error)
-            : []),
-          pendingError.error,
-        ];
-        // Stable order: collect everything that contributed to the failure path.
-        // Single-error case included — once any finally is in the picture, the
-        // contract is AggregateError.
+        // Source order: warnings were pushed in the order errors occurred (step
+        // before finally, earlier finally before later finally), so this preserves
+        // the chronological sequence the plan specifies. Single-error case included
+        // — once any finally is in the picture, the contract is AggregateError.
+        const all = [...(state.warnings ?? []).map(w => w.error), pendingError.error];
         throw new AggregateError(all, `Workflow failed with ${all.length} error(s) from .finally() bodies`);
       }
       throw pendingError.error;
