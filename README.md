@@ -538,6 +538,53 @@ const pipeline = Workflow.create<Ctx>()
 
 **Type safety:** `foreach()` uses `ElementOf<TOutput>` to extract the array element type. If the previous step doesn't produce an array, the call is rejected at compile time.
 
+### Fan-out via `parallel()`
+
+`parallel()` runs several branches against the **same input** concurrently and collects their results. Two type-overload forms — record (keyed by name) and tuple (positional):
+
+```ts
+// Record form — returns { researcher: ResearchOutput, critic: CriticOutput }
+const pipeline = Workflow.create<Ctx, string>()
+  .step("classify", classifier)
+  .parallel({ researcher, critic });
+
+// Tuple form — returns [ResearchOutput, CriticOutput]
+const pipeline = Workflow.create<Ctx, string>()
+  .step("classify", classifier)
+  .parallel([researcher, critic] as const);
+```
+
+The same input (`state.output`) is fed to each branch. Default concurrency is `min(branches.length, 5)` — most users want fan-out, but the cap protects against rate-limit pressure. Pass `concurrency: Infinity` (or `branches.length`) to opt out.
+
+```ts
+.parallel({ a, b, c, d, e, f, g, h }, { concurrency: 3 })     // explicit override
+.parallel({ a, b, c, d, e, f, g, h }, { concurrency: Infinity })  // full fan-out
+```
+
+**Generate mode only.** Streams aren't threaded through to branches — interleaving multiple agent streams into one writer is out of scope.
+
+#### Per-branch error handling
+
+```ts
+.parallel({ a, b }, {
+  onError: ({ error, key, ctx }) => {
+    if (key === "a") return "fallback-a";   // substitute
+    if (key === "b") return Workflow.SKIP;  // record form: undefined slot
+    throw error;                            // rethrow to abort the parallel
+  },
+})
+```
+
+`onError` is **bypassed** on the suspension path — if any branch hits a nested gate, the marker reaches the caller without onError running. Non-suspension errors flow through onError in branch order.
+
+#### Suspension under parallel
+
+Gates inside parallel branches throw `NestedGateUnsupportedError`, same as `foreach` concurrent. The lowest-index suspending branch wins the marker; others contribute to `siblingSuspensions`. Multi-branch suspension semantics are finalized in F0.6 alongside `cancelOnFirstSuspend` — until then, all branches run to completion (or sibling-failure) before the marker reaches the caller.
+
+> **Rate-limit hazard:** `parallel`'s default `min(N, 5)` assumes ≥5 RPS headroom on your model provider. Symptoms of overflow: 429s and stair-stepped latency.
+
+> **Concurrent ctx-mutation hazard:** branches share the `ctx` object by reference. Treat `ctx` as immutable inside parallel branches.
+
 ### Conditional loops via `repeat()`
 
 `repeat()` runs an agent or workflow in a loop until a condition is met. The body's output feeds back as input — same type in, same type out:

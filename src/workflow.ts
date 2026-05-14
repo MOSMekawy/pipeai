@@ -282,6 +282,63 @@ export type RepeatOptions<TContext, TOutput> =
 // making foreach uncallable at compile time when the previous step doesn't produce an array.
 type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
 
+// ── parallel() supporting types (F2) ────────────────────────────────
+
+/** A target for a `parallel()` branch — agent or sealed workflow. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type ParallelTarget<TContext, TInput> =
+  | Agent<TContext, TInput, any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  | SealedWorkflow<TContext, TInput, any>;
+
+/** Extract the output type of a single parallel branch target. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type BranchOutput<T> = T extends Agent<any, any, infer O>
+  ? O
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  : T extends SealedWorkflow<any, any, infer O>
+  ? O
+  : never;
+
+/** Output shape for the record form: `{ [K]: BranchOutput<T[K]> }`. */
+export type ParallelOutputRecord<T extends Record<string, unknown>> = {
+  [K in keyof T]: BranchOutput<T[K]>;
+};
+
+/** Output shape for the tuple form: `[O1, O2, ...]`. */
+export type ParallelOutputTuple<T extends ReadonlyArray<unknown>> = {
+  [K in keyof T]: BranchOutput<T[K]>;
+};
+
+export interface ParallelOptions<TContext> {
+  /** Override the default step id. Default: `parallel:record` or `parallel:tuple`. */
+  id?: string;
+  /**
+   * Max branches in flight at any moment. Default: `min(branches.length, 5)`.
+   * Pass `Infinity` (or `branches.length`) for full fan-out on >5-branch calls
+   * — the default caps at 5 to protect against rate limits and emits a
+   * one-time warn when the cap kicks in.
+   */
+  concurrency?: number;
+  /**
+   * Per-branch error handler. On the no-suspension path, called once per
+   * rejected branch in index order after all settle. Return a value to
+   * substitute, return `Workflow.SKIP` to leave the slot undefined (record
+   * form only — see CHANGELOG), or rethrow to abort the parallel.
+   *
+   * **Bypassed entirely on the suspension path** (any branch hit a nested
+   * gate). See README's "Suspension under `parallel()`" section.
+   */
+  onError?: (params: {
+    error: unknown;
+    /** Branch key in the record form; `undefined` in the tuple form. */
+    key?: string;
+    /** Branch index in the tuple form; `undefined` in the record form. */
+    index?: number;
+    ctx: Readonly<TContext>;
+  }) => unknown | typeof Workflow.SKIP | Promise<unknown | typeof Workflow.SKIP>;
+}
+
 // ── Schema type (structural — works with Zod, Valibot, ArkType, etc.) ──
 
 interface SchemaWithParse<T = unknown> {
@@ -1694,6 +1751,174 @@ export class Workflow<
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return new Workflow<TContext, TInput, TNextOutput[], TGates>([...this.steps, node] as any, this.id);
+  }
+
+  // ── parallel: fan-out combinator (F2) ───────────────────────────
+  //
+  // Same input fed to each branch. Generate mode only — writer is NOT threaded
+  // through (interleaving multiple agent streams into one writer is not
+  // supported in F2). For SealedWorkflow branches, a nested gate throws
+  // NestedGateUnsupportedError (same machinery as foreach concurrent).
+  //
+  // Default concurrency: `min(branches.length, 5)` — most users want fan-out,
+  // not lockstep batching. Warn-once when branch count exceeds the 5 cap so
+  // users notice unexpected rate-limit pressure.
+
+  /** Record-form overload. Returns `{ [K]: BranchOutput<T[K]> }`. */
+  parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
+    branches: TBranches,
+    options?: ParallelOptions<TContext>,
+  ): Workflow<TContext, TInput, ParallelOutputRecord<TBranches>, TGates>;
+
+  /** Tuple-form overload. Returns `[O1, O2, ...]`. Use `as const`. */
+  parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
+    branches: TBranches,
+    options?: ParallelOptions<TContext>,
+  ): Workflow<TContext, TInput, ParallelOutputTuple<TBranches>, TGates>;
+
+  // Implementation
+  parallel(
+    branches: Record<string, ParallelTarget<TContext, TOutput>> | ReadonlyArray<ParallelTarget<TContext, TOutput>>,
+    options?: ParallelOptions<TContext>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Workflow<TContext, TInput, any, TGates> {
+    const isTuple = Array.isArray(branches);
+    const entries: Array<{ key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }> = isTuple
+      ? (branches as ReadonlyArray<ParallelTarget<TContext, TOutput>>).map((target, i) => ({ key: i, index: i, target }))
+      : Object.entries(branches as Record<string, ParallelTarget<TContext, TOutput>>).map(([k, t], i) => ({ key: k, index: i, target: t }));
+    const branchCount = entries.length;
+    const requestedConcurrency = options?.concurrency;
+    let effectiveConcurrency: number;
+    if (requestedConcurrency === undefined) {
+      effectiveConcurrency = Math.min(branchCount, 5);
+    } else {
+      effectiveConcurrency = requestedConcurrency;
+    }
+    // Warn-once when >5 branches without explicit concurrency override.
+    if (requestedConcurrency === undefined && branchCount > 5) {
+      warnOnce(
+        "pipeai:parallel-cap",
+        `pipeai: parallel() with ${branchCount} branches capped at concurrency 5 by default. Pass { concurrency: ${branchCount} } (or Infinity) to opt in, or set { concurrency: N } if you want fewer.`,
+      );
+    }
+    const onError = options?.onError;
+    const id = options?.id ?? (isTuple ? "parallel:tuple" : "parallel:record");
+
+    const node: StepNode = {
+      type: "step",
+      id,
+      execute: async (state) => {
+        const ctx = state.ctx as TContext;
+        const input = state.output;
+        const results: Record<string | number, unknown> = (isTuple ? new Array(branchCount) : {}) as Record<string | number, unknown>;
+        const branchStates: (RuntimeState | undefined)[] = new Array(branchCount);
+
+        const executeBranch = async ({ key, index, target }: { key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }) => {
+          // Per-branch itemState — same isolation as foreach (no runOptions).
+          const branchState: RuntimeState = { ctx: state.ctx, output: input, mode: "generate" };
+          branchStates[index] = branchState;
+          if (target instanceof SealedWorkflow) {
+            await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
+          } else {
+            await this.executeAgent(branchState, target as Agent<TContext, unknown, unknown>, ctx);
+          }
+          results[key] = branchState.output;
+        };
+
+        // Same partition + suspension contract as foreach concurrent.
+        type Failure = { key: string | number; index: number; error: unknown };
+        const failures: Failure[] = [];
+
+        const eff = Number.isFinite(effectiveConcurrency) ? Math.max(1, effectiveConcurrency) : branchCount;
+        if (eff <= 1) {
+          for (const e of entries) {
+            try {
+              await executeBranch(e);
+            } catch (error) {
+              failures.push({ key: e.key, index: e.index, error });
+            }
+          }
+        } else {
+          const sem = new Semaphore(eff);
+          await Promise.all(entries.map(async (e) => {
+            await sem.acquire();
+            try {
+              await executeBranch(e);
+            } catch (error) {
+              failures.push({ key: e.key, index: e.index, error });
+            } finally {
+              sem.release();
+            }
+          }));
+        }
+
+        // Always merge per-branch warnings into the parent, namespaced.
+        for (let idx = 0; idx < branchCount; idx++) {
+          const bs = branchStates[idx];
+          if (!bs?.warnings) continue;
+          for (const w of bs.warnings) {
+            (state.warnings ??= []).push({
+              source: w.source,
+              stepId: `${id}[${entries[idx].key}]:${w.stepId}`,
+              error: w.error,
+            });
+          }
+        }
+
+        // Partition rejections into gate vs non-gate.
+        const gateFailures: { key: string | number; index: number; error: NestedGateUnsupportedError }[] = [];
+        const nonGateFailures: Failure[] = [];
+        for (const f of failures) {
+          if (f.error instanceof NestedGateUnsupportedError) gateFailures.push({ key: f.key, index: f.index, error: f.error });
+          else nonGateFailures.push(f);
+        }
+        gateFailures.sort((a, b) => a.index - b.index);
+        nonGateFailures.sort((a, b) => a.index - b.index);
+
+        if (gateFailures.length > 0) {
+          // Suspension path — onError bypassed; non-gate rejections become warnings.
+          for (const nr of nonGateFailures) {
+            (state.warnings ??= []).push({
+              source: "foreach-sibling",   // F2 reuses the same source tag — F0.6 may add "parallel-sibling"
+              stepId: `${id}[${nr.key}]`,
+              error: nr.error,
+            });
+          }
+          const lowest = gateFailures[0];
+          const otherSuspensions = gateFailures.slice(1).map(g => ({ index: g.index, gateId: g.error.gateId }));
+          const siblingErrors = nonGateFailures.map(nr => nr.error);
+          throw new NestedGateUnsupportedError(
+            lowest.error.gateId,
+            lowest.error.workflowId,
+            siblingErrors,
+            otherSuspensions,
+          );
+        }
+
+        // No suspension — handle non-gate failures via onError or rethrow.
+        for (const { key, index, error } of nonGateFailures) {
+          if (!onError) throw error;
+          const recovered = await onError({
+            error,
+            key: isTuple ? undefined : (key as string),
+            index: isTuple ? (index) : undefined,
+            ctx: state.ctx as Readonly<TContext>,
+          });
+          if (recovered === Workflow.SKIP) {
+            // Record form: leave the key as `undefined`. Tuple form: same — the
+            // slot stays `undefined`. The output type accepts SKIP only on the
+            // record form at compile time.
+            results[key] = undefined;
+          } else {
+            results[key] = recovered;
+          }
+        }
+
+        state.output = results;
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new Workflow<TContext, TInput, any, TGates>([...this.steps, node] as any, this.id);
   }
 
   // ── repeat: conditional loop ─────────────────────────────────

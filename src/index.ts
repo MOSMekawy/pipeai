@@ -33,6 +33,10 @@ export type {
   WorkflowStepType,
   WorkflowObservability,
   RunOptions,
+  ParallelTarget,
+  ParallelOutputRecord,
+  ParallelOutputTuple,
+  ParallelOptions,
 } from "./workflow";
 
 export { defineTool } from "./tool-provider";

@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-08
+
+**Additive. New `.parallel()` fan-out combinator. Contrast with `foreach`: parallel defaults to `min(N, 5)` concurrency (most users want fan-out), foreach defaults to `1` (most users want lockstep). Read on for the rate-limit hazard.**
+
+### Added
+
+- `Workflow.parallel(branches, options?)` — fan-out combinator with two type-overload forms:
+  - **Record form:** `parallel({ a: agentA, b: agentB })` → `{ a: O_a, b: O_b }`
+  - **Tuple form:** `parallel([agentA, agentB] as const)` → `[O_a, O_b]`
+  Each branch receives the same input (`state.output`) and runs concurrently up to `concurrency`. Generate mode only — writer is NOT threaded through (interleaving multiple agent streams into one writer is out of scope).
+- `ParallelOptions.concurrency` — default `min(branches.length, 5)`. Pass `Infinity` (or the branch count) for full fan-out on >5-branch calls. A one-time `console.warn` fires when the 5 cap kicks in to surface rate-limit hazards.
+- `ParallelOptions.onError` — per-branch error handler. Receives `{ error, key?, index?, ctx }`. Return a value to substitute, return `Workflow.SKIP` to leave the slot undefined (record form), or rethrow to abort the parallel. Bypassed entirely on the suspension path.
+- `ParallelOptions.id` — override the default step id (`parallel:record` or `parallel:tuple`).
+
+### Exported types
+
+- `ParallelTarget<TContext, TInput>` — branch target type (`Agent` or `SealedWorkflow`).
+- `ParallelOutputRecord<T>` / `ParallelOutputTuple<T>` — output-shape helpers.
+- `ParallelOptions<TContext>`.
+
+### Suspension under parallel (deferred contract)
+
+A gate inside a parallel branch reuses F0's `NestedGateUnsupportedError` mechanism — same as `foreach` concurrent: lowest-index marker wins, others in `siblingSuspensions`, non-gate rejections in `state.warnings` with `source: "foreach-sibling"` (we reuse the foreach source tag for now; F0.6 may add `parallel-sibling`). The detailed semantics for multi-branch suspension land in F0.6 alongside `cancelOnFirstSuspend`.
+
+### Rate-limit hazard
+
+`parallel`'s default `concurrency: min(N, 5)` assumes ≥5 RPS of headroom on your model provider. Symptoms of overflow: 429s and stair-stepped latency. If you're rate-limited, drop to `concurrency: 1` or split branches into stages.
+
+### Concurrent ctx-mutation hazard
+
+Branches share the `ctx` object by reference. Concurrent mutation of `ctx` from branches is a race; treat `ctx` as immutable inside parallel branches.
+
+### Verification
+
+- 202 tests pass (`npm test`). 14 new F2 tests covering: record/tuple output shapes, default `min(N,5)` concurrency, warn-once at the 5 cap, `concurrency: 1` serializing, `concurrency: Infinity`, onError substitution, `Workflow.SKIP` → undefined (record form), no-onError + branch throw, onError rethrow, gate-inside-branch → `NestedGateUnsupportedError`, multi-branch suspension lowest-index winner + `siblingSuspensions`, per-branch warning merge with namespaced stepId.
+
 ## [0.5.0] - 2026-05-08
 
 **Additive at the public-API level. Snapshot version field widens (`1 → 1|2`) and gate snapshots gain a `kind` discriminant — runtime narrowing code that ignores `kind` is silently fragile. See the README's "Step-level checkpointing" section.**
