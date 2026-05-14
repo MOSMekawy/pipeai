@@ -40,14 +40,14 @@ export type TestCtx = {
 
 export const testCtx: TestCtx = { userId: "user-1" };
 
-import type { WorkflowResult, WorkflowSnapshot } from "../workflow";
+import type { WorkflowResult, GateSnapshot, WorkflowWarning } from "../workflow";
 
 /**
  * Narrow a `WorkflowResult` to its `complete` variant for tests that expect
  * normal completion. Throws with a useful message when the workflow suspended
  * — much louder than a silent narrowing failure.
  */
-export function expectComplete<T>(result: WorkflowResult<T>): { output: T; warnings: readonly import("../workflow").WorkflowWarning[] } {
+export function expectComplete<T>(result: WorkflowResult<T>): { output: T; warnings: readonly WorkflowWarning[] } {
   if (result.status !== "complete") {
     throw new Error(
       `expectComplete: workflow suspended at gate "${result.snapshot.gateId}" instead of completing`
@@ -57,10 +57,11 @@ export function expectComplete<T>(result: WorkflowResult<T>): { output: T; warni
 }
 
 /**
- * Narrow to the `suspended` variant; returns the snapshot. Throws if the
- * workflow completed without suspending.
+ * Narrow to the `suspended` variant; returns the snapshot (always a
+ * `GateSnapshot` — only gates suspend). Throws if the workflow completed
+ * without suspending.
  */
-export function expectSuspended<T>(result: WorkflowResult<T>): { snapshot: WorkflowSnapshot; warnings: readonly import("../workflow").WorkflowWarning[] } {
+export function expectSuspended<T>(result: WorkflowResult<T>): { snapshot: GateSnapshot; warnings: readonly WorkflowWarning[] } {
   if (result.status !== "suspended") {
     throw new Error(`expectSuspended: workflow completed without suspending`);
   }

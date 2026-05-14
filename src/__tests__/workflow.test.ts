@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
-import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type WorkflowObservability } from "../workflow";
+import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability } from "../workflow";
 import { createMockModel, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
@@ -1170,7 +1170,8 @@ describe("Workflow", () => {
         .gate("review");
 
       const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
-      expect(snapshot.version).toBe(1);
+      expect(snapshot.version).toBe(2);
+      expect(snapshot.kind).toBe("gate");
       expect(snapshot.gateId).toBe("review");
       expect(snapshot.output).toBe("draft");
       expect(snapshot.resumeFromIndex).toBeGreaterThanOrEqual(0);
@@ -1504,10 +1505,13 @@ describe("Workflow", () => {
       db["workflow:user-1"] = JSON.stringify(snapshot);
 
       // === Phase 2: Later (maybe different process), load and resume ===
-      const loaded: WorkflowSnapshot = JSON.parse(db["workflow:user-1"]);
+      // F1: new gate snapshots are v2 with kind="gate"; cast to the specific
+      // variant so we can read gateId/gatePayload after JSON round-trip.
+      const loaded = JSON.parse(db["workflow:user-1"]) as GateSnapshot;
 
       // Verify the deserialized snapshot is valid
-      expect(loaded.version).toBe(1);
+      expect(loaded.version).toBe(2);
+      expect(loaded.kind).toBe("gate");
       expect(loaded.gateId).toBe("manager-approval");
       expect(loaded.gatePayload).toEqual({
         userId: "user-1",
@@ -1563,7 +1567,7 @@ describe("Workflow", () => {
       db["snap"] = JSON.stringify(r1.snapshot);
 
       // Resume gate 1 → hits gate 2
-      const snap1: WorkflowSnapshot = JSON.parse(db["snap"]);
+      const snap1 = JSON.parse(db["snap"]) as GateSnapshot;
       expect(snap1.gateId).toBe("gate-1");
 
       const resumed1 = pipeline.loadState("gate-1", snap1);
@@ -1571,7 +1575,7 @@ describe("Workflow", () => {
       db["snap"] = JSON.stringify(r2.snapshot);
 
       // Resume gate 2 → completes
-      const snap2: WorkflowSnapshot = JSON.parse(db["snap"]);
+      const snap2 = JSON.parse(db["snap"]) as GateSnapshot;
       expect(snap2.gateId).toBe("gate-2");
       expect(snap2.output).toBe("after-gate-1: response-1");
 
@@ -2326,6 +2330,430 @@ describe("Workflow", () => {
         const result = await pipeline.generate(testCtx);
         expect(result.status).toBe("complete");
         expect(catchSpy).toHaveBeenCalledOnce();
+      });
+    });
+  });
+
+  // ── F1 verification tests ─────────────────────────────────────────
+  describe("F1: step-level checkpointing", () => {
+    describe("snapshot union + migrateSnapshot", () => {
+      it("new gate snapshots are v2 with kind='gate'", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step(createTextAgent("a", "x"))
+          .gate("g");
+        const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+        expect(snapshot.version).toBe(2);
+        expect(snapshot.kind).toBe("gate");
+      });
+
+      it("loadState accepts legacy v1 gate snapshots (backward compat)", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step(createTextAgent("a", "x"))
+          .gate("g")
+          .step("after", ({ input }) => input);
+        const legacy: WorkflowSnapshot = {
+          version: 1,
+          resumeFromIndex: 1,
+          output: "x",
+          gateId: "g",
+          gatePayload: "x",
+        };
+        const resumed = pipeline.loadState("g", legacy);
+        const { output } = expectComplete(await resumed.generate(testCtx, "y"));
+        expect(output).toBe("y");
+      });
+
+      it("loadState accepts v2 gate snapshots", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step(createTextAgent("a", "x"))
+          .gate("g")
+          .step("after", ({ input }) => input);
+        const v2: GateSnapshot = {
+          version: 2, kind: "gate",
+          resumeFromIndex: 1,
+          output: "x",
+          gateId: "g",
+          gatePayload: "x",
+        };
+        const resumed = pipeline.loadState("g", v2);
+        const { output } = expectComplete(await resumed.generate(testCtx, "y"));
+        expect(output).toBe("y");
+      });
+
+      it("migrateSnapshot(v1) produces a v2 gate snapshot", async () => {
+        const { migrateSnapshot } = await import("../workflow");
+        const v1 = { version: 1 as const, resumeFromIndex: 0, output: "x", gateId: "g", gatePayload: { foo: 1 } };
+        const v2 = migrateSnapshot(v1);
+        expect(v2.version).toBe(2);
+        expect(v2.kind).toBe("gate");
+        expect(v2.gateId).toBe("g");
+        expect(v2.gatePayload).toEqual({ foo: 1 });
+        expect(v2.resumeFromIndex).toBe(0);
+        expect(v2.output).toBe("x");
+      });
+
+      it("loadState rejects checkpoint snapshots", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step(createTextAgent("a", "x"))
+          .gate("g");
+        const ckpt: CheckpointSnapshot = {
+          version: 2, kind: "checkpoint",
+          resumeFromIndex: 1, output: "x", stepShapeHash: "deadbeef",
+        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect(() => pipeline.loadState("g", ckpt as any)).toThrow(/Use resumeFrom\(\) for checkpoint resume/);
+      });
+    });
+
+    describe("checkpoint emission", () => {
+      it("onCheckpoint fires with v2 checkpoint snapshot after each successful step body (cadence 1)", async () => {
+        const captured: CheckpointSnapshot[] = [];
+        const pipeline = Workflow.create<TestCtx>()
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => `${input}b`)
+          .step("s3", ({ input }) => `${input}c`);
+
+        const result = await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push(snap); },
+          checkpointEvery: 1,
+        });
+        expect(result.status).toBe("complete");
+        expect(captured).toHaveLength(3);
+        // Each snapshot is v2 + kind="checkpoint" + has stepShapeHash
+        for (const snap of captured) {
+          expect(snap.version).toBe(2);
+          expect(snap.kind).toBe("checkpoint");
+          expect(snap.stepShapeHash).toBeTruthy();
+          expect(typeof snap.stepShapeHash).toBe("string");
+        }
+        // resumeFromIndex advances 1, 2, 3
+        expect(captured.map(s => s.resumeFromIndex)).toEqual([1, 2, 3]);
+      });
+
+      it("checkpointEvery: 5 on 12-step pipeline fires at i+1 % 5 === 0 → indices 4 and 9", async () => {
+        let w = Workflow.create<TestCtx, string>().step("init", ({ input }) => input);
+        for (let i = 1; i < 12; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-loop-func
+          w = w.step(`s${i}`, ({ input }) => input);
+        }
+        const captured: number[] = [];
+        await w.generate(testCtx, "x", {
+          onCheckpoint: (snap) => { captured.push(snap.resumeFromIndex); },
+          checkpointEvery: 5,
+        });
+        // Step indices 4 and 9 (zero-based) → resumeFromIndex = 5 and 10.
+        expect(captured).toEqual([5, 10]);
+      });
+
+      it("checkpointWhen predicate fires only when true", async () => {
+        const captured: { stepIndex: number; stepId: string }[] = [];
+        const pipeline = Workflow.create<TestCtx>()
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => `${input}b`)
+          .step("s3", ({ input }) => `${input}c`);
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push({ stepIndex: snap.resumeFromIndex - 1, stepId: "?" }); },
+          checkpointWhen: ({ stepId }) => stepId === "s2",
+        });
+        expect(captured.map(c => c.stepIndex)).toEqual([1]);
+      });
+
+      it("validateRunOptions throws when both checkpointEvery and checkpointWhen are set", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+        await expect(pipeline.generate(testCtx, undefined, {
+          onCheckpoint: () => {},
+          checkpointEvery: 1,
+          checkpointWhen: () => true,
+        })).rejects.toThrow(/mutually exclusive/);
+      });
+
+      it("validateRunOptions throws on bad checkpointEvery values", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+        for (const bad of [0, -1, 1.5, NaN]) {
+          await expect(pipeline.generate(testCtx, undefined, {
+            onCheckpoint: () => {},
+            checkpointEvery: bad,
+          })).rejects.toThrow(/checkpointEvery must be a positive integer/);
+        }
+      });
+
+      it("validateRunOptions throws on bad checkpointTimeout values", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+        for (const bad of [0, -1, NaN, Infinity]) {
+          await expect(pipeline.generate(testCtx, undefined, {
+            onCheckpoint: () => {},
+            checkpointTimeout: bad,
+          })).rejects.toThrow(/checkpointTimeout/);
+        }
+      });
+
+      it("auto-cadence: 4-step pipeline fires at every step (ceil(4/4) = 1)", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => input)
+          .step("s3", ({ input }) => input)
+          .step("s4", ({ input }) => input);
+        const captured: number[] = [];
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push(snap.resumeFromIndex); },
+        });
+        expect(captured).toEqual([1, 2, 3, 4]);
+      });
+
+      it("auto-cadence excludes .catch() and .finally() from the count", async () => {
+        // 4 executable steps (s1..s4) + a catch and finally. Auto-cadence
+        // should still be `ceil(4/4) = 1`, firing on every executable step.
+        const pipeline = Workflow.create<TestCtx>()
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => input)
+          .step("s3", ({ input }) => input)
+          .step("s4", ({ input }) => input)
+          .catch("c", ({ lastOutput }) => lastOutput as string)
+          .finally("f", () => {});
+        const captured: number[] = [];
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push(snap.resumeFromIndex); },
+        });
+        // Cadence based on executable count (4), so every step fires.
+        expect(captured.length).toBeGreaterThanOrEqual(4);
+      });
+
+      it("checkpoint NOT emitted inside nested workflows (runOptions isolation)", async () => {
+        // The plan: foreach itemState omits runOptions, so onCheckpoint never
+        // fires for items. Same for step(workflow) / repeat — executeNestedWorkflow
+        // saves/clears/restores runOptions.
+        const captured: number[] = [];
+        const sub = Workflow.create<TestCtx, string>()
+          .step("inner-s1", ({ input }) => input)
+          .step("inner-s2", ({ input }) => input);
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b"])
+          .foreach(sub, { id: "fe" });
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push(snap.resumeFromIndex); },
+          checkpointEvery: 1,
+        });
+        // Two top-level executable steps fire — NOT the 4 inner steps.
+        expect(captured).toEqual([1, 2]);
+      });
+
+      it("onCheckpoint throws → catch is bypassed → original onCheckpoint error reaches caller", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => input)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .catch("recover", () => "recovered" as any);
+        await expect(pipeline.generate(testCtx, undefined, {
+          onCheckpoint: () => { throw new Error("ckpt-fail"); },
+          checkpointEvery: 1,
+        })).rejects.toThrow("ckpt-fail");
+      });
+
+      it("pendingError.stepId on checkpoint failure is CHECKPOINT_STEP_ID", async () => {
+        const { CHECKPOINT_STEP_ID } = await import("../workflow");
+        expect(CHECKPOINT_STEP_ID).toBe("::pipeai::onCheckpoint");
+      });
+
+      it("checkpoint NOT emitted on a step that threw (pendingError set)", async () => {
+        const captured: number[] = [];
+        const pipeline = Workflow.create<TestCtx>()
+          .step("ok", () => "x")
+          .step("boom", () => { throw new Error("step-fail"); })
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          .catch("c", () => "recovered" as any);
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { captured.push(snap.resumeFromIndex); },
+          checkpointEvery: 1,
+        });
+        // Only step "ok" produced a clean state to snapshot — "boom" threw.
+        expect(captured).toEqual([1]);
+      });
+    });
+
+    describe("checkpoint timeout via AbortSignal", () => {
+      it("aborts onCheckpoint via AbortSignal on timeout, throws CheckpointTimeoutError", async () => {
+        const { CheckpointTimeoutError } = await import("../workflow");
+        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+        await expect(pipeline.generate(testCtx, undefined, {
+          onCheckpoint: async (_snap, { signal }) => {
+            // Wait for abort or 1s — whichever comes first.
+            await new Promise<void>((resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new Error("aborted-but-ignored")), { once: true });
+              setTimeout(resolve, 1000);
+            });
+          },
+          checkpointEvery: 1,
+          checkpointTimeout: 25,
+        })).rejects.toBeInstanceOf(CheckpointTimeoutError);
+      });
+
+      it("signal is passed and not aborted when onCheckpoint completes within timeout", async () => {
+        let signalAborted = false;
+        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+        const result = await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: async (_snap, { signal }) => {
+            // Trivial fast op — signal must NOT be aborted.
+            await new Promise(r => setTimeout(r, 5));
+            signalAborted = signal.aborted;
+          },
+          checkpointEvery: 1,
+          checkpointTimeout: 200,
+        });
+        expect(result.status).toBe("complete");
+        expect(signalAborted).toBe(false);
+      });
+    });
+
+    describe("stepShapeHash + resumeFrom", () => {
+      it("resumeFrom resumes from the checkpoint snapshot's index", async () => {
+        const captured: CheckpointSnapshot[] = [];
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("s1", ({ input }) => `${input}-a`)
+          .step("s2", ({ input }) => `${input}-b`)
+          .step("s3", ({ input }) => `${input}-c`);
+        await pipeline.generate(testCtx, "start", {
+          onCheckpoint: (snap) => { captured.push(snap); },
+          checkpointEvery: 1,
+        });
+        // Resume from the checkpoint after s2 (resumeFromIndex = 2) — should skip s1, s2 and run only s3.
+        const after_s2 = captured[1];
+        const resumed = pipeline.resumeFrom(after_s2);
+        const { output } = expectComplete(await resumed.generate(testCtx));
+        // Output reflects the snapshot's seeded value passed through s3 only.
+        expect(output).toBe("start-a-b-c");   // already had s1+s2 applied; resume runs s3
+      });
+
+      it("resumeFrom rejects gate snapshots", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("a", () => "x").gate("g");
+        const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+        expect(() => pipeline.resumeFrom(snapshot)).toThrow(/Use loadState\(\) for gate resume/);
+      });
+
+      it("resumeFrom rejects checkpoint snapshot with shape mismatch", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("a", () => "x").step("b", ({ input }) => input);
+        let snap!: CheckpointSnapshot;
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (s) => { snap = s; },
+          checkpointEvery: 1,
+        });
+
+        // Build a structurally different pipeline.
+        const reshaped = Workflow.create<TestCtx>().step("a", () => "x").step("c", ({ input }) => input);
+        expect(() => reshaped.resumeFrom(snap)).toThrow(/shape mismatch/);
+      });
+
+      it("resumeFrom { skipShapeCheck: true } allows resume despite mismatch", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("a", () => "x").step("b", ({ input }) => input);
+        let snap!: CheckpointSnapshot;
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (s) => { snap = s; },
+          checkpointEvery: 1,
+        });
+        const reshaped = Workflow.create<TestCtx>().step("a", () => "x").step("c", ({ input }) => input);
+        // No throw despite mismatch.
+        const resumed = reshaped.resumeFrom(snap, { skipShapeCheck: true });
+        const { output } = expectComplete(await resumed.generate(testCtx));
+        expect(output).toBe("x");
+      });
+
+      it("resumeFrom rejects missing stepShapeHash (unless skipShapeCheck)", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("a", () => "x");
+        const badSnap: CheckpointSnapshot = {
+          version: 2, kind: "checkpoint",
+          resumeFromIndex: 0, output: "x",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          stepShapeHash: undefined as any,
+        };
+        expect(() => pipeline.resumeFrom(badSnap)).toThrow(/missing stepShapeHash/);
+      });
+
+      it("resumeFrom rejects out-of-bounds resumeFromIndex", async () => {
+        const pipeline = Workflow.create<TestCtx>().step("a", () => "x");
+        for (const bad of [-1, 999999, NaN, 1.5, Infinity]) {
+          const snap: CheckpointSnapshot = {
+            version: 2, kind: "checkpoint",
+            resumeFromIndex: bad,
+            output: "x",
+            stepShapeHash: "abc",
+          };
+          expect(() => pipeline.resumeFrom(snap, { skipShapeCheck: true })).toThrow(/out of bounds/);
+        }
+      });
+
+      it("resumeFrom on 0-step workflow throws", async () => {
+        const pipeline = Workflow.create<TestCtx>();
+        const snap: CheckpointSnapshot = {
+          version: 2, kind: "checkpoint",
+          resumeFromIndex: 0, output: "x", stepShapeHash: "abc",
+        };
+        expect(() => pipeline.resumeFrom(snap)).toThrow(/no steps/);
+      });
+
+      it("stepShapeHash identical across two checkpoints from the same run", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("a", () => "x")
+          .step("b", ({ input }) => input)
+          .step("c", ({ input }) => input);
+        const hashes: string[] = [];
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (snap) => { hashes.push(snap.stepShapeHash); },
+          checkpointEvery: 1,
+        });
+        expect(hashes).toHaveLength(3);
+        expect(new Set(hashes).size).toBe(1);
+      });
+
+      it("stepShapeHash differs for structurally-different pipelines", async () => {
+        const p1 = Workflow.create<TestCtx>().step("a", () => "x");
+        const p2 = Workflow.create<TestCtx>().step("a", () => "x").step("b", ({ input }) => input);
+        const hashes: string[] = [];
+        await p1.generate(testCtx, undefined, {
+          onCheckpoint: (s) => { hashes.push(s.stepShapeHash); },
+          checkpointEvery: 1,
+        });
+        await p2.generate(testCtx, undefined, {
+          onCheckpoint: (s) => { hashes.push(s.stepShapeHash); },
+          checkpointEvery: 1,
+        });
+        expect(hashes[0]).not.toBe(hashes[1]);
+      });
+    });
+
+    describe("freezeSnapshots catastrophic-combo guard", () => {
+      it("throws on freezeSnapshots: true + checkpointEvery: 1 + 8+ step workflow", async () => {
+        let w = Workflow.create<TestCtx>().step("s0", () => "x");
+        for (let i = 1; i < 8; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-loop-func
+          w = w.step(`s${i}`, ({ input }) => input);
+        }
+        await expect(w.generate(testCtx, undefined, {
+          onCheckpoint: () => {},
+          checkpointEvery: 1,
+          freezeSnapshots: true,
+        })).rejects.toThrow(/catastrophic/);
+      });
+
+      it("\"iAcceptThePerformanceCost\" bypasses the catastrophic-combo guard", async () => {
+        let w = Workflow.create<TestCtx>().step("s0", () => "x");
+        for (let i = 1; i < 8; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-loop-func
+          w = w.step(`s${i}`, ({ input }) => input);
+        }
+        // Doesn't throw; runs successfully.
+        const result = await w.generate(testCtx, undefined, {
+          onCheckpoint: () => {},
+          checkpointEvery: 1,
+          freezeSnapshots: "iAcceptThePerformanceCost",
+        });
+        expect(result.status).toBe("complete");
+      });
+    });
+
+    describe("CHECKPOINT_STEP_ID reservation", () => {
+      it("rejects user step id containing ::pipeai::", async () => {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("::pipeai::malicious", () => "x");
+        await expect(pipeline.generate(testCtx)).rejects.toThrow(/::pipeai::/);
       });
     });
   });

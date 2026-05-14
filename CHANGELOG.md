@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-08
+
+**Additive at the public-API level. Snapshot version field widens (`1 → 1|2`) and gate snapshots gain a `kind` discriminant — runtime narrowing code that ignores `kind` is silently fragile. See the README's "Step-level checkpointing" section.**
+
+### Added
+
+- `RunOptions.onCheckpoint(snapshot, { signal })` — step-level checkpoint sink. Fires after each successful step body when cadence or predicate matches. Receives a v2 `CheckpointSnapshot` and an `AbortSignal` that aborts on `checkpointTimeout` expiration. Throwing here propagates as the run's terminal error (`.catch()` is bypassed via the F0 precedence tail).
+- `RunOptions.checkpointEvery` — fire `onCheckpoint` every N executable steps. Mutually exclusive with `checkpointWhen`. Default: `max(1, ceil(executableCount / 4))` — 4 checkpoints across the run.
+- `RunOptions.checkpointWhen({ stepIndex, stepId, ctx }) => boolean` — predicate variant.
+- `RunOptions.checkpointTimeout` — ms before the AbortSignal fires. On timeout, a `CheckpointTimeoutError` is raised on the run.
+- `freezeSnapshots: "iAcceptThePerformanceCost"` — escape hatch for the catastrophic-combo guard.
+- `Workflow.resumeFrom(snapshot, { skipShapeCheck? })` — resume from a checkpoint snapshot. Validates `stepShapeHash` unless explicitly skipped.
+- `CheckpointResumedWorkflow` — class returned by `resumeFrom`. Its `generate(ctx, opts?)` takes no response argument (state is seeded from the snapshot).
+- `GateSnapshot` (v2 with `kind: "gate"`) and `CheckpointSnapshot` (v2 with `kind: "checkpoint"`) — discriminated snapshot variants.
+- `LegacyGateSnapshotV1` — the F0/0.4.0 gate-only form. Accepted by `loadState` via a shim for one release. Migrate via `migrateSnapshot()` before v0.8.0+.
+- `migrateSnapshot(legacy: LegacyGateSnapshotV1): GateSnapshot` — long-lived storage helper.
+- `CheckpointTimeoutError` — thrown when `onCheckpoint` exceeds `checkpointTimeout`.
+- `CHECKPOINT_STEP_ID = "::pipeai::onCheckpoint"` — synthetic step id reported when `onCheckpoint` throws.
+- Recursive `stepShapeHash` (SHA-256) — encodes index/type/id + nested workflow shapes. Used by `resumeFrom` to detect drift. Cycle-safe via WeakSet. Memoized per terminal instance.
+- `validateRunOptions` — pre-run validation: rejects bad `checkpointEvery`/`checkpointTimeout`, the `freezeSnapshots+checkpointEvery:1` catastrophic combo on 8+ step workflows, and warns once on `freezeSnapshots+cadence<=2`.
+
+### Changed
+
+- **Gate snapshots are now emitted as v2.** Newly suspended workflows produce `{ version: 2, kind: "gate", ... }`. Legacy v1 snapshots are still accepted by `loadState` for one release via the shim — migrate long-lived storage via `migrateSnapshot()` before v0.8.0+.
+- `WorkflowSnapshot` is now a discriminated union: `GateSnapshot | CheckpointSnapshot | LegacyGateSnapshotV1`. Runtime narrowing code that ignores `kind` will need to add the discriminant.
+- `findGateIndex` accepts both v1 and v2 gate snapshots.
+- `loadState` rejects checkpoint snapshots with a clear error pointing at `resumeFrom`. `resumeFrom` likewise rejects gate snapshots.
+- `Workflow.create({ ..., observability })` is **not** added yet — F3 ships that. The internal field is in place; F1 doesn't widen the public constructor.
+
+### Rolling-deploy hazard
+
+A 0.4.0 process receiving a 0.5.0-persisted v2 gate snapshot rejects via the strict `version === 1` check. Either:
+- Drain in-flight 0.4.0 snapshots before cutover, OR
+- Ship a 0.4.x patch that accepts both v1 and v2 ahead of cutover, OR
+- Version-tag storage keys.
+
+### Verification
+
+- 188 tests pass (`npm test`). 31 new F1 tests covering: snapshot union + migration, checkpoint cadence (auto, every, predicate), timeout via AbortSignal, `resumeFrom` (success, gate-reject, shape-mismatch, skipShapeCheck, missing hash, bounds), `stepShapeHash` determinism, catastrophic-combo guard + escape hatch, `CHECKPOINT_STEP_ID` reservation.
+
 ## [0.4.0] - 2026-05-08
 
 **Breaking — eight changes. See the README's "Migration from 0.3.x" section for the migration recipe.**

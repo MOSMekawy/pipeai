@@ -833,15 +833,129 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Snapshot shape
 
+As of 0.5.0, `WorkflowSnapshot` is a discriminated union with three variants — gate snapshots emitted by `.gate()`, checkpoint snapshots emitted by `onCheckpoint`, and the legacy v1 form from 0.4.0 (accepted for one release via the shim):
+
 ```ts
-interface WorkflowSnapshot {
-  version: 1;
+interface GateSnapshot {
+  version: 2;
+  kind: "gate";
   resumeFromIndex: number;  // step index of the gate
   output: unknown;          // pre-gate output
   gateId: string;           // gate identifier
   gatePayload: unknown;     // data for the human
 }
+
+interface CheckpointSnapshot {
+  version: 2;
+  kind: "checkpoint";
+  resumeFromIndex: number;  // index of the NEXT step to run
+  output: unknown;          // output as of the checkpoint
+  stepShapeHash: string;    // SHA-256 hex of the workflow's structural shape
+}
+
+// Legacy v1 — only accepted by loadState() during one release. Migrate via migrateSnapshot().
+interface LegacyGateSnapshotV1 {
+  version: 1;
+  kind?: undefined;
+  resumeFromIndex: number;
+  output: unknown;
+  gateId: string;
+  gatePayload: unknown;
+}
+
+type WorkflowSnapshot = GateSnapshot | CheckpointSnapshot | LegacyGateSnapshotV1;
 ```
+
+`WorkflowResult<T>` narrows the suspended-branch `snapshot` to `GateSnapshot` specifically — only gates suspend, so the union widening doesn't pollute the suspended-state API.
+
+> **Rolling-deploy hazard:** A 0.4.0 process receiving a 0.5.0-persisted v2 gate snapshot rejects via the strict `version === 1` check. Drain in-flight snapshots before cutover, ship a 0.4.x forward-compat patch ahead, or version-tag storage keys.
+
+> **Long-lived storage:** For Redis-without-TTL / S3 / Postgres, call `migrateSnapshot(legacy)` before v0.8.0+ drops v1 acceptance.
+
+## Step-level checkpointing via `onCheckpoint`
+
+Pass `onCheckpoint` in `RunOptions` to receive a v2 checkpoint snapshot after each successful step body. Use this to persist progress so a crashed/restarted process can resume where it left off — no human-in-the-loop required.
+
+```ts
+import { Workflow, type CheckpointSnapshot } from "pipeai";
+
+const pipeline = Workflow.create<Ctx, string>()
+  .step("classify", classifier)
+  .step("summarize", summarizer)
+  .step("publish", publisher);
+
+let lastSnapshot: CheckpointSnapshot | null = null;
+const result = await pipeline.generate(ctx, "input", {
+  onCheckpoint: async (snap) => {
+    lastSnapshot = snap;
+    await db.write({ key: "run:42", snapshot: snap });
+  },
+  checkpointEvery: 5,    // every 5 executable steps
+});
+
+// On restart, resume from the last persisted snapshot:
+const stored = await db.read("run:42");
+const resumed = pipeline.resumeFrom(stored);
+const final = await resumed.generate(ctx);   // no response arg — state is seeded
+```
+
+### Cadence
+
+- `checkpointEvery: N` — fire every N executable steps. Defaults to `max(1, ceil(executableCount / 4))` — 4 checkpoints across the run, floor of every step on tiny pipelines.
+- `checkpointWhen({ stepIndex, stepId, ctx }) => boolean` — predicate variant. Mutually exclusive with `checkpointEvery`.
+- `.catch()` and `.finally()` nodes are NOT counted as executable, so adding cleanup doesn't surprise you with extra checkpoints.
+
+### Timeout via `AbortSignal`
+
+```ts
+const result = await pipeline.generate(ctx, input, {
+  onCheckpoint: async (snap, { signal }) => {
+    await fetch("/persist", { method: "POST", body: JSON.stringify(snap), signal });
+  },
+  checkpointTimeout: 500,   // ms — AbortSignal fires, CheckpointTimeoutError raised
+});
+```
+
+A timed-out `onCheckpoint` raises `CheckpointTimeoutError`, which (like any `onCheckpoint` throw) bypasses `.catch()` and reaches the caller bare. `.finally()` still runs; any finally errors get a `console.warn`.
+
+### `stepShapeHash` and `resumeFrom`
+
+Each checkpoint snapshot carries a SHA-256 of the workflow's structural shape (index + type + id + recursive nested workflow shapes). `resumeFrom` verifies the hash matches before continuing:
+
+```ts
+const resumed = pipeline.resumeFrom(snapshot);                       // throws on shape mismatch
+const resumed = pipeline.resumeFrom(snapshot, { skipShapeCheck: true });  // override
+```
+
+Common shape changes that invalidate snapshots: insertion, removal, reorder, type-swap with same id, nested-workflow refactor. **Agent identity is NOT in the hash** — two checkpoints from runs that used different agent configs (same agent id) hash identically. Version your agents by content if resume-trust matters.
+
+### Stream-mode caveats
+
+- Each `onCheckpoint` fire pauses the stream writer while it awaits — for chunky checkpoints, prefer larger cadence.
+- Per-checkpoint `JSON.stringify` cost grows with `state.output`; the example above uses `checkpointEvery: 5` to amortize.
+- Serializing consumers should leave `freezeSnapshots: false` — `JSON.stringify` already copies.
+
+### Memoization
+
+`stepShapeHash` is memoized per terminal-workflow instance. **Build pipelines once at module load and call `generate()` many times** to amortize. Per-request construction defeats memoization.
+
+### `.catch()` placed before `resumeFromIndex` is dead
+
+After a checkpoint-resume, any `.catch()` nodes BEFORE the resume index never fire (they're skipped along with all earlier steps). Place catches at the end of the workflow or strategically late.
+
+### Gate-vs-checkpoint resume asymmetry
+
+Gate snapshots use a reorder-tolerant id-scan fallback in `loadState`. Checkpoint snapshots use `stepShapeHash`, which is reorder-strict. A workflow with both has two different resume semantics — when in doubt, bump a workflow version id and route old snapshots to old code.
+
+### Catastrophic combos
+
+`validateRunOptions` throws synchronously on:
+- `checkpointEvery` and `checkpointWhen` both set (mutually exclusive)
+- `checkpointEvery` not a positive integer
+- `checkpointTimeout` not a finite positive number
+- `freezeSnapshots: true + checkpointEvery: 1` on a workflow of 8+ steps (catastrophic perf — pass `"iAcceptThePerformanceCost"` to bypass)
+
+And warns once on `freezeSnapshots: true + cadence <= 2` (suspicious but legal).
 
 ### Limitations
 

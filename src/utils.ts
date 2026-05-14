@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import type { UIMessageStreamWriter } from "ai";
 
 // ── Stream writer context ────────────────────────────────────────────
@@ -102,4 +103,95 @@ export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): 
     deepFreeze((value as any)[key], seen);
   }
   return value;
+}
+
+// ── stepShapeHash (F1) ───────────────────────────────────────────────
+//
+// Recursive SHA-256 of the workflow's structural shape (index, type, id,
+// nested workflow shapes). Used by checkpoint resume to detect drift —
+// when the user inserts/removes/reorders a step, the hash changes and
+// resume refuses to continue unless explicitly told to via
+// `{ skipShapeCheck: true }`.
+//
+// **Agent identity is NOT in the hash.** Two checkpoints from runs that
+// used different agent configs (same id) hash identically. Version agents
+// by content if resume-trust matters.
+
+/**
+ * The minimal shape interface this util needs from a `SealedWorkflow`.
+ * Importing the workflow class here would create a circular dependency
+ * (utils.ts ← workflow.ts and workflow.ts ← utils.ts); so we accept any
+ * object exposing `id` and `getStepsForShapeHash()`.
+ */
+export interface WorkflowShapeHashable {
+  readonly id?: string;
+  // Returns the StepNode[] for this workflow. Structurally typed to avoid
+  // a circular import — the real type is `ReadonlyArray<StepNode>`.
+  getStepsForShapeHash(): ReadonlyArray<StepNodeShape>;
+}
+
+/**
+ * Structural typing for a StepNode as seen by the shape hasher. Mirrors
+ * the actual `StepNode` union without importing it. Adding fields to
+ * StepNode without updating this contract won't fail compilation; the
+ * dispatch map in workflow.ts (typed via `Record<StepNode["type"], ...>`)
+ * is the load-bearing exhaustiveness guard.
+ */
+export interface StepNodeShape {
+  readonly type: string;
+  readonly id: string;
+}
+
+export function computeStepShapeHash(
+  steps: ReadonlyArray<StepNodeShape>,
+  getNested: (node: StepNodeShape) => readonly WorkflowShapeHashable[],
+): string {
+  return createHash("sha256").update(canonicalDescriptor(steps, getNested, new WeakSet())).digest("hex");
+}
+
+/**
+ * `path` tracks the current DFS stack only — added on entry, removed on exit.
+ * Sibling re-visits of the same SealedWorkflow are NOT cycles (shared
+ * subgraphs hash identically to two structurally-equivalent distinct
+ * instances). Only ancestor re-visits (true cycles) emit the cycle marker.
+ */
+function canonicalDescriptor(
+  steps: ReadonlyArray<StepNodeShape>,
+  getNested: (node: StepNodeShape) => readonly WorkflowShapeHashable[],
+  path: WeakSet<WorkflowShapeHashable>,
+): string {
+  return JSON.stringify(steps.map((s, i) => {
+    const triple: (number | string)[] = [i, s.type, s.id];
+    for (const inner of getNested(s)) {
+      if (path.has(inner)) {
+        triple.push(`<cycle:${inner.id ?? "anon"}>`);
+        continue;
+      }
+      path.add(inner);
+      try {
+        triple.push(canonicalDescriptor(inner.getStepsForShapeHash(), getNested, path));
+      } finally {
+        path.delete(inner);
+      }
+    }
+    return triple;
+  }));
+}
+
+// ── warnOnce (F1) — module-level dedup helper ────────────────────────
+
+const warnedOnceKeys = new Set<string>();
+export function warnOnce(key: string, message?: string): void {
+  if (warnedOnceKeys.has(key)) return;
+  warnedOnceKeys.add(key);
+  // eslint-disable-next-line no-console
+  console.warn(message ?? key);
+}
+
+/**
+ * @internal — test-only reset of the warnOnce dedup. Same shape as
+ * workflow.ts's `__resetStreamOnErrorOnSuspendWarnForTests`.
+ */
+export function __resetWarnOnceForTests(): void {
+  warnedOnceKeys.clear();
 }
