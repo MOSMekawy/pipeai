@@ -3010,4 +3010,353 @@ describe("Workflow", () => {
       });
     });
   });
+
+  // ── F3 verification tests ─────────────────────────────────────────
+  describe("F3: workflow observability", () => {
+    describe("per-step events", () => {
+      it("onStepStart + onStepFinish fire for each step", async () => {
+        const starts: string[] = [];
+        const finishes: { id: string; durationMs: number; suspended: boolean }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId }) => { starts.push(stepId); },
+            onStepFinish: ({ stepId, durationMs, suspended }) => { finishes.push({ id: stepId, durationMs, suspended }); },
+          },
+        })
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => input + "b");
+        await pipeline.generate(testCtx);
+        expect(starts).toEqual(["s1", "s2"]);
+        expect(finishes.map(f => f.id)).toEqual(["s1", "s2"]);
+        for (const f of finishes) {
+          expect(f.durationMs).toBeGreaterThanOrEqual(0);
+          expect(f.suspended).toBe(false);
+        }
+      });
+
+      it("onStepError fires on step body throw; original error reaches caller with cause = obsError", async () => {
+        const obsErr = new Error("obs-fail");
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepError: () => { throw obsErr; },
+          },
+        })
+          .step("boom", () => { throw new Error("original-error"); });
+        try {
+          await pipeline.generate(testCtx);
+        } catch (e) {
+          expect((e as Error).message).toBe("original-error");
+          expect((e as { cause?: unknown }).cause).toBe(obsErr);
+        }
+      });
+
+      it("onStepStart throws → warning with source 'onStepStart'", async () => {
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: () => { throw new Error("start-fail"); },
+          },
+        }).step("s", () => "x");
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const result = await pipeline.generate(testCtx);
+          expect(result.status).toBe("complete");
+          const sources = result.warnings.map(w => w.source);
+          expect(sources).toContain("onStepStart");
+        } finally {
+          consoleSpy.mockRestore();
+        }
+      });
+
+      it("onStepFinish throws → warning with source 'onStepFinish'", async () => {
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepFinish: () => { throw new Error("finish-fail"); },
+          },
+        }).step("s", () => "x");
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const result = await pipeline.generate(testCtx);
+          expect(result.status).toBe("complete");
+          expect(result.warnings.map(w => w.source)).toContain("onStepFinish");
+        } finally {
+          consoleSpy.mockRestore();
+        }
+      });
+    });
+
+    describe("gate observability", () => {
+      it("gate suspends → onStepFinish fires with suspended: true", async () => {
+        const finishes: { id: string; suspended: boolean }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepFinish: ({ stepId, suspended }) => { finishes.push({ id: stepId, suspended }); },
+          },
+        })
+          .step("s", () => "x")
+          .gate("review");
+        await pipeline.generate(testCtx);
+        const gateFinish = finishes.find(f => f.id === "review");
+        expect(gateFinish?.suspended).toBe(true);
+      });
+
+      it("gate cond-false skip → onStepFinish fires with suspended: false", async () => {
+        const finishes: { id: string; suspended: boolean }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepFinish: ({ stepId, suspended }) => { finishes.push({ id: stepId, suspended }); },
+          },
+        })
+          .step("s", () => "x")
+          .gate("review", { condition: () => false })
+          .step("after", ({ input }) => input);
+        const result = await pipeline.generate(testCtx);
+        expect(result.status).toBe("complete");
+        const gateFinish = finishes.find(f => f.id === "review");
+        expect(gateFinish?.suspended).toBe(false);
+      });
+    });
+
+    describe("combinator-level + per-item events", () => {
+      it("foreach: onStepStart fires for combinator; onItemStart fires per item", async () => {
+        const stepStarts: string[] = [];
+        const itemStarts: { stepId: string; type: string; itemIndex: number | string }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId }) => { stepStarts.push(stepId); },
+            onItemStart: ({ stepId, type, itemIndex }) => { itemStarts.push({ stepId, type, itemIndex }); },
+          },
+        })
+          .step("items", () => ["a", "b", "c"])
+          .foreach(createPassthroughAgent("p", "ok"), { id: "fe" });
+        await pipeline.generate(testCtx);
+        expect(stepStarts).toContain("fe");
+        expect(itemStarts.filter(e => e.stepId === "fe").map(e => e.itemIndex)).toEqual([0, 1, 2]);
+        expect(itemStarts.every(e => e.type === "foreach")).toBe(true);
+      });
+
+      it("parallel record form: onItemStart fires per branch with key as itemIndex", async () => {
+        const itemStarts: { itemIndex: number | string }[] = [];
+        const a = createPassthroughAgent("a", "from-a");
+        const b = createPassthroughAgent("b", "from-b");
+        const pipeline = Workflow.create<TestCtx, string>({
+          observability: {
+            onItemStart: ({ itemIndex }) => { itemStarts.push({ itemIndex }); },
+          },
+        })
+          .step("init", ({ input }) => input)
+          .parallel({ a, b }, { id: "para" });
+        await pipeline.generate(testCtx, "in");
+        expect(itemStarts.map(e => e.itemIndex).sort()).toEqual(["a", "b"]);
+      });
+
+      it("repeat: NO per-item events fire (combinator-level only)", async () => {
+        const itemEvents: unknown[] = [];
+        const stepStarts: string[] = [];
+        let count = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "refiner",
+          model: createMockModel("refined"),
+          prompt: () => "go",
+        });
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId }) => { stepStarts.push(stepId); },
+            onItemStart: (e) => { itemEvents.push(e); },
+            onItemFinish: (e) => { itemEvents.push(e); },
+            onItemError: (e) => { itemEvents.push(e); },
+          },
+        })
+          .step("init", () => "draft")
+          .repeat(agent, { until: () => { count++; return count >= 2; }, id: "loop" });
+        await pipeline.generate(testCtx);
+        expect(stepStarts).toContain("loop");
+        // repeat doesn't emit per-item events even though it iterates.
+        expect(itemEvents).toEqual([]);
+      });
+    });
+
+    describe("nested type", () => {
+      it("step(workflow) reports type: 'nested'", async () => {
+        const types: string[] = [];
+        const sub = Workflow.create<TestCtx>().step("inner", () => "from-inner");
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId, type }) => { if (stepId !== "inner") types.push(type); },
+          },
+        }).step(sub);
+        await pipeline.generate(testCtx);
+        expect(types).toContain("nested");
+      });
+    });
+
+    describe("ResumedWorkflow inheritance", () => {
+      it("ResumedWorkflow inherits parent observability — events fire post-resume", async () => {
+        const startsAfterResume: string[] = [];
+        const obs: WorkflowObservability = {
+          onStepStart: ({ stepId }) => { startsAfterResume.push(stepId); },
+        };
+        const pipeline = Workflow.create<TestCtx>({ observability: obs })
+          .step("a", () => "x")
+          .gate("g")
+          .step("after-gate", ({ input }) => input);
+        const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+        startsAfterResume.length = 0;
+        const resumed = pipeline.loadState("g", snapshot);
+        await resumed.generate(testCtx, "y");
+        expect(startsAfterResume).toContain("after-gate");
+      });
+
+      it("CheckpointResumedWorkflow inherits parent observability", async () => {
+        const startsAfterResume: string[] = [];
+        const obs: WorkflowObservability = {
+          onStepStart: ({ stepId }) => { startsAfterResume.push(stepId); },
+        };
+        const pipeline = Workflow.create<TestCtx, string>({ observability: obs })
+          .step("s1", ({ input }) => input)
+          .step("s2", ({ input }) => input)
+          .step("s3", ({ input }) => input);
+        let snap!: CheckpointSnapshot;
+        await pipeline.generate(testCtx, "x", {
+          onCheckpoint: (s) => { if (s.resumeFromIndex === 2) snap = s; },
+          checkpointEvery: 1,
+        });
+        startsAfterResume.length = 0;
+        const resumed = pipeline.resumeFrom(snap);
+        await resumed.generate(testCtx);
+        expect(startsAfterResume).toEqual(["s3"]);
+      });
+    });
+
+    describe("onCheckpoint failure routes to onStepError", () => {
+      it("onCheckpoint throws → onStepError fires with stepId === CHECKPOINT_STEP_ID, type === 'step'", async () => {
+        const { CHECKPOINT_STEP_ID } = await import("../workflow");
+        const errors: { stepId: string; type: string }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepError: ({ stepId, type }) => { errors.push({ stepId, type }); },
+          },
+        }).step("s", () => "x");
+        try {
+          await pipeline.generate(testCtx, undefined, {
+            onCheckpoint: () => { throw new Error("ckpt-fail"); },
+            checkpointEvery: 1,
+          });
+        } catch {
+          // expected
+        }
+        expect(errors).toContainEqual({ stepId: CHECKPOINT_STEP_ID, type: "step" });
+      });
+    });
+
+    describe("skip-checked nodes emit nothing (except finally)", () => {
+      it("step after a gate suspension does NOT fire onStepStart", async () => {
+        const starts: string[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId }) => { starts.push(stepId); },
+          },
+        })
+          .step("before-gate", () => "x")
+          .gate("review")
+          .step("after-gate", ({ input }) => input);
+        await pipeline.generate(testCtx);
+        expect(starts).toContain("before-gate");
+        expect(starts).toContain("review");
+        expect(starts).not.toContain("after-gate");
+      });
+
+      it(".finally() fires onStepStart EVEN after gate suspension", async () => {
+        const starts: string[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepStart: ({ stepId }) => { starts.push(stepId); },
+          },
+        })
+          .step("s", () => "x")
+          .gate("review")
+          .finally("cleanup", () => {});
+        await pipeline.generate(testCtx);
+        expect(starts).toContain("cleanup");
+      });
+    });
+
+    describe("concurrent runs use per-runId keying (OTel example)", () => {
+      it("two concurrent runs with different runId on the ctx don't interleave spans", async () => {
+        type Ctx = { runId: string };
+        const spans = new Map<string, { stepId: string; ended: boolean }>();
+        const obs: WorkflowObservability = {
+          onStepStart: ({ stepId, ctx }) => {
+            spans.set(`${(ctx as Ctx).runId}:${stepId}`, { stepId, ended: false });
+          },
+          onStepFinish: ({ stepId, ctx }) => {
+            const span = spans.get(`${(ctx as Ctx).runId}:${stepId}`);
+            if (span) span.ended = true;
+          },
+        };
+        const pipeline = Workflow.create<Ctx>({ observability: obs })
+          .step("s1", () => "a")
+          .step("s2", ({ input }) => input);
+        await Promise.all([
+          pipeline.generate({ runId: "run-A" }),
+          pipeline.generate({ runId: "run-B" }),
+        ]);
+        expect(spans.size).toBe(4);
+        for (const span of spans.values()) expect(span.ended).toBe(true);
+      });
+    });
+  });
+
+  // ── F4: graph-pattern smoke tests ─────────────────────────────────
+  // F4 is docs-only — these tests just verify the patterns from the README
+  // compile and run end-to-end.
+  describe("F4: graph patterns", () => {
+    it("cycle via repeat(subWorkflow)", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const executor = new Agent<TestCtx, any, any>({
+        id: "exec", model: createMockModel("done"),
+        prompt: (_ctx, input) => `plan: ${input}`,
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const critic = new Agent<TestCtx, any, any>({
+        id: "critic", model: createMockModel("ok"),
+        prompt: () => "judge",
+      });
+      const cycle = Workflow.create<TestCtx, string>()
+        .step(executor)
+        .step(critic);
+      const agent = Workflow.create<TestCtx, string>()
+        .step("init", ({ input }) => input)
+        .repeat(cycle, { until: ({ iterations }) => iterations >= 2, maxIterations: 3 });
+      const { output } = expectComplete(await agent.generate(testCtx, "draft"));
+      expect(typeof output).toBe("string");
+    });
+
+    it("multi-path branch + rejoin via .branch().step()", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step("classify", () => "bug")
+        .branch({
+          select: ({ input }) => input as "bug" | "feature",
+          agents: {
+            bug: createPassthroughAgent("bug-a", "fixed"),
+            feature: createPassthroughAgent("feat-a", "filed"),
+          },
+        })
+        .step("rejoin", ({ input }) => `done: ${input}`);
+      const { output } = expectComplete(await pipeline.generate(testCtx));
+      expect(output).toBe("done: fixed");
+    });
+
+    it("fan-out + fan-in via .parallel().step()", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("init", ({ input }) => input)
+        .parallel({
+          a: createPassthroughAgent("a", "from-a"),
+          b: createPassthroughAgent("b", "from-b"),
+        })
+        .step("combine", ({ input }) => `${input.a}+${input.b}`);
+      const { output } = expectComplete(await pipeline.generate(testCtx, "x"));
+      expect(output).toBe("from-a+from-b");
+    });
+  });
 });
