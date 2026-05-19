@@ -4,7 +4,7 @@ import {
   type ToolSet,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
-import { extractOutput, runWithWriter, Semaphore, type MaybePromise } from "./utils";
+import { extractOutput, runWithWriter, type MaybePromise } from "./utils";
 
 // ── Error Types ─────────────────────────────────────────────────────
 
@@ -851,23 +851,31 @@ export class Workflow<
             }
           }
         } else {
-          // Bounded concurrency via semaphore: at most `concurrency` items run
-          // simultaneously; the next one starts as soon as one releases.
-          // Failures are buffered and processed in index order AFTER all items
-          // settle so onError invocations remain deterministic.
-          const sem = new Semaphore(concurrency);
           const failures: Array<{ index: number; error: unknown }> = [];
+          let nextIndex = 0;
 
-          await Promise.all(items.map(async (item, i) => {
-            await sem.acquire();
-            try {
-              await executeItem(item, i);
-            } catch (error) {
-              failures.push({ index: i, error });
-            } finally {
-              sem.release();
+          // Worker-pool: spawn at most `concurrency` workers, each pulls the next
+          // index from a shared counter. Memory is O(concurrency), not
+          // O(items.length), because we don't pre-allocate one async closure per
+          // item. Failures are buffered and processed in index order AFTER all
+          // workers settle so onError invocations remain deterministic.
+          const worker = async () => {
+            while (true) {
+              const i = nextIndex++;
+              if (i >= items.length) return;
+              try {
+                await executeItem(items[i], i);
+              } catch (error) {
+                failures.push({ index: i, error });
+              }
             }
-          }));
+          };
+
+          const workers = Array.from(
+            { length: Math.min(concurrency, items.length) },
+            () => worker(),
+          );
+          await Promise.all(workers);
 
           failures.sort((a, b) => a.index - b.index);
 

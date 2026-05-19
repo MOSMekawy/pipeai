@@ -1061,6 +1061,32 @@ describe("Workflow", () => {
     });
 
     describe("bounded concurrency", () => {
+      it("foreach with high item count does not blow past concurrency bound", async () => {
+        const items = Array.from({ length: 10000 }, (_, i) => `item-${i}`);
+        let maxInFlight = 0;
+        let inFlight = 0;
+
+        const agent = new Agent<TestCtx, string, string>({
+          id: "fast",
+          model: createMockModel("ok"),
+          prompt: async (_ctx, input) => {
+            inFlight++;
+            maxInFlight = Math.max(maxInFlight, inFlight);
+            await new Promise(r => setImmediate(r));
+            inFlight--;
+            return input;
+          },
+        });
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => items)
+          .foreach(agent, { concurrency: 4 });
+
+        const { output } = await pipeline.generate(testCtx);
+        expect((output as string[]).length).toBe(10000);
+        expect(maxInFlight).toBeLessThanOrEqual(4);
+      });
+
       it("runs at most `concurrency` items in flight at any time", async () => {
         let inFlight = 0;
         let maxInFlight = 0;
