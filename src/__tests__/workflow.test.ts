@@ -355,6 +355,57 @@ describe("Workflow", () => {
       await expect(pipeline.generate(testCtx)).rejects.toThrow("boom");
       expect(finallySpy).toHaveBeenCalledOnce();
     });
+
+    it("preserves the original step error as .cause when finally throws", async () => {
+      const originalError = new Error("step failed");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const failingAgent = new Agent<TestCtx, any, any>({
+        id: "a1",
+        model: createMockModel("ok"),
+        prompt: () => { throw originalError; },
+      });
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => "input")
+        .step(failingAgent)
+        .finally("cleanup", () => { throw new Error("cleanup failed"); });
+
+      try {
+        await pipeline.generate(testCtx);
+        throw new Error("expected reject");
+      } catch (error) {
+        expect((error as Error).message).toBe("cleanup failed");
+        expect((error as Error).cause).toBeInstanceOf(Error);
+        // Identity check: .cause MUST be the same instance, not a clone or message-only wrapper.
+        expect((error as Error).cause).toBe(originalError);
+        expect(((error as Error).cause as Error).message).toMatch(/step failed/);
+      }
+    });
+
+    it("preserves the original error as .cause when catch handler itself throws", async () => {
+      const originalError = new Error("original");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const failingAgent = new Agent<TestCtx, any, any>({
+        id: "a1",
+        model: createMockModel("ok"),
+        prompt: () => { throw originalError; },
+      });
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => "input")
+        .step(failingAgent)
+        .catch("on-error", () => { throw new Error("catch-also-failed"); });
+
+      try {
+        await pipeline.generate(testCtx);
+        throw new Error("expected reject");
+      } catch (error) {
+        expect((error as Error).message).toBe("catch-also-failed");
+        // Identity check: .cause MUST be the same instance, not a clone or message-only wrapper.
+        expect((error as Error).cause).toBe(originalError);
+        expect(((error as Error).cause as Error).message).toMatch(/original/);
+      }
+    });
   });
 
   describe("immutability", () => {
@@ -452,6 +503,79 @@ describe("Workflow", () => {
 
       const result = await output;
       expect(result).toBe("streamed");
+    });
+
+    it("surfaces stream errors via the stream's onError when output is never awaited", async () => {
+      const onErrorCalls: unknown[] = [];
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => "input")
+        .step(createFailingAgent("a1", () => true, "boom"));
+
+      const { stream } = pipeline.stream(testCtx, undefined, {
+        onError: (err) => {
+          onErrorCalls.push(err);
+          return String(err);
+        },
+      });
+
+      // Consume the stream but never await output.
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      expect(onErrorCalls).toHaveLength(1);
+      expect(String(onErrorCalls[0])).toMatch(/boom/);
+    });
+
+    it("does not suppress output rejection when onError is omitted", async () => {
+      const unhandled: unknown[] = [];
+      const listener = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", listener);
+
+      try {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("seed", () => "input")
+          .step(createFailingAgent("a1", () => true, "boom"));
+
+        // Don't pass onError. Consume the stream but never await output.
+        const { stream } = pipeline.stream(testCtx);
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) { /* drain */ }
+
+        // Allow microtasks and unhandled-rejection events to propagate.
+        await new Promise<void>(r => setImmediate(r));
+        await new Promise<void>(r => setImmediate(r));
+
+        expect(unhandled.length).toBeGreaterThan(0);
+        expect(String(unhandled[0])).toMatch(/boom/);
+      } finally {
+        process.off("unhandledRejection", listener);
+      }
+    });
+
+    it("suppresses output rejection when onError is provided", async () => {
+      const unhandled: unknown[] = [];
+      const listener = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", listener);
+
+      try {
+        const pipeline = Workflow.create<TestCtx>()
+          .step("seed", () => "input")
+          .step(createFailingAgent("a1", () => true, "boom"));
+
+        const { stream } = pipeline.stream(testCtx, undefined, {
+          onError: (e) => String(e),
+        });
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) { /* drain */ }
+
+        // Allow microtasks and unhandled-rejection events to propagate.
+        await new Promise<void>(r => setImmediate(r));
+        await new Promise<void>(r => setImmediate(r));
+
+        expect(unhandled).toHaveLength(0);
+      } finally {
+        process.off("unhandledRejection", listener);
+      }
     });
   });
 
@@ -855,6 +979,42 @@ describe("Workflow", () => {
 
         const { output } = await pipeline.generate(testCtx);
         expect(output).toEqual(["ok", "r:b", "ok"]);
+      });
+
+      it("aggregates all failures when concurrency > 1 and no onError is provided", async () => {
+        // Three items fail; today only the first reaches the caller.
+        const failingAgent = createFailingAgent("fail", (input: string) => input !== "ok");
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["bad-1", "bad-2", "bad-3"])
+          .foreach(failingAgent, { concurrency: 3 });
+
+        try {
+          await pipeline.generate(testCtx);
+          throw new Error("expected to reject");
+        } catch (error) {
+          expect(error).toBeInstanceOf(AggregateError);
+          expect((error as AggregateError).errors).toHaveLength(3);
+        }
+      });
+
+      it("invokes onError for every failure even when an earlier onError throws", async () => {
+        const onErrorCalls: number[] = [];
+        const failingAgent = createFailingAgent("fail", () => true);
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => ["a", "b", "c"])
+          .foreach(failingAgent, {
+            concurrency: 3,
+            onError: ({ index }) => {
+              onErrorCalls.push(index);
+              if (index === 0) throw new Error("first handler threw");
+              return "recovered" as never; // satisfy type
+            },
+          });
+
+        await expect(pipeline.generate(testCtx)).rejects.toThrow();
+        expect(onErrorCalls.sort()).toEqual([0, 1, 2]);
       });
     });
 
@@ -1682,6 +1842,34 @@ describe("Workflow", () => {
       const resumed2 = pipeline.loadState("gate-2", snap2);
       const { output } = await resumed2.generate(testCtx, "response-2");
       expect(output).toBe("done: response-2");
+    });
+
+    it("captures errors from gate.condition into the workflow's catch pipeline", async () => {
+      const caught = vi.fn(() => "recovered");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "hello"))
+        .gate("review", {
+          condition: () => { throw new Error("condition boom"); },
+        })
+        .catch("on-condition-error", caught);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(caught).toHaveBeenCalledOnce();
+      expect(output).toBe("recovered");
+    });
+
+    it("captures errors from gate.payload into the workflow's catch pipeline", async () => {
+      const caught = vi.fn(() => "recovered");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "hello"))
+        .gate("review", {
+          payload: () => { throw new Error("payload boom"); },
+        })
+        .catch("on-payload-error", caught);
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(caught).toHaveBeenCalledOnce();
+      expect(output).toBe("recovered");
     });
   });
 

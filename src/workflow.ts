@@ -183,9 +183,15 @@ export class SealedWorkflow<
       rejectOutput = rej;
     });
 
-    // Prevent unhandled rejection warning if the consumer never awaits `output`.
-    // The original promise still rejects normally when awaited.
-    outputPromise.catch(() => {});
+    // Only suppress unhandled-rejection on `output` when the consumer has
+    // attached `onError` to the stream — they're already observing through
+    // that surface, so suppressing avoids a redundant warning. When no
+    // `onError` is provided, we let `output`'s rejection surface as an
+    // unhandled rejection rather than silently dropping it. Consumers who
+    // ignore `output` should provide an `onError`.
+    if (options?.onError) {
+      outputPromise.catch(() => {});
+    }
 
     const stream = createUIMessageStream({
       execute: async ({ writer }) => {
@@ -227,12 +233,24 @@ export class SealedWorkflow<
       const node = this.steps[i];
 
       if (node.type === "finally") {
-        await node.execute(state);
+        try {
+          await node.execute(state);
+        } catch (finallyError) {
+          if (pendingError) {
+            // Preserve the original error chain by attaching as .cause so
+            // diagnostics aren't lost when cleanup itself fails.
+            if (finallyError instanceof Error && finallyError.cause === undefined) {
+              (finallyError as { cause?: unknown }).cause = pendingError.error;
+            }
+          }
+          pendingError = { error: finallyError, stepId: node.id };
+        }
         continue;
       }
 
       if (node.type === "catch") {
         if (!pendingError) continue;
+        const priorError = pendingError.error;
         try {
           state.output = await node.catchFn({
             error: pendingError.error,
@@ -242,6 +260,11 @@ export class SealedWorkflow<
           });
           pendingError = null;
         } catch (catchError) {
+          // Preserve the original error chain via .cause when the catch
+          // handler itself throws.
+          if (catchError instanceof Error && catchError.cause === undefined) {
+            (catchError as { cause?: unknown }).cause = priorError;
+          }
           pendingError = { error: catchError, stepId: node.id };
         }
         continue;
@@ -249,19 +272,29 @@ export class SealedWorkflow<
 
       if (node.type === "gate") {
         if (pendingError) continue; // skip gates while in error state
-        // Conditional gate: if condition returns false, skip (passthrough)
-        if (node.condition) {
-          const shouldSuspend = await node.condition(state);
-          if (!shouldSuspend) continue;
+        try {
+          // Conditional gate: if condition returns false, skip (passthrough)
+          if (node.condition) {
+            const shouldSuspend = await node.condition(state);
+            if (!shouldSuspend) continue;
+          }
+          const gatePayload = await node.payload(state);
+          throw new WorkflowSuspended({
+            version: 1,
+            resumeFromIndex: i,
+            output: state.output,
+            gateId: node.id,
+            gatePayload,
+          });
+        } catch (error) {
+          // WorkflowSuspended is the gate's own suspension signal — re-throw so
+          // callers can capture the snapshot. User-callback errors (from
+          // `condition` or `payload`) are captured into the workflow's
+          // error pipeline so downstream `.catch()` handlers can recover.
+          if (error instanceof WorkflowSuspended) throw error;
+          pendingError = { error, stepId: node.id };
+          continue;
         }
-        const gatePayload = await node.payload(state);
-        throw new WorkflowSuspended({
-          version: 1,
-          resumeFromIndex: i,
-          output: state.output,
-          gateId: node.id,
-          gatePayload,
-        });
       }
 
       // type === "step" — skip while in error state
@@ -466,7 +499,11 @@ export class ResumedWorkflow<
       resolveOutput = res;
       rejectOutput = rej;
     });
-    outputPromise.catch(() => {});
+    // See SealedWorkflow.stream: only suppress unhandled-rejection when the
+    // consumer is observing errors through `onError`.
+    if (options?.onError) {
+      outputPromise.catch(() => {});
+    }
 
     const mergeFn = this.mergeFn;
     const priorOutput = this.priorOutput;
@@ -741,6 +778,13 @@ export class Workflow<
    *   to abort the foreach step (the thrown error is caught by any downstream
    *   `.catch()`). When omitted, the existing fail-fast behavior is preserved.
    *   `onError` is invoked sequentially in index order after all items settle.
+   *
+   *   **All-or-nothing recovery under `concurrency > 1`:** when `concurrency > 1`
+   *   and any `onError` handler throws, the entire foreach aborts — any
+   *   successful recoveries from other items are NOT preserved (results are
+   *   discarded with the thrown `AggregateError`). Use `concurrency: 1` if you
+   *   need partial-recovery semantics where a handler-failure on item N
+   *   doesn't discard recoveries on items 0..N-1.
    */
   foreach<TNextOutput>(
     target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput>,
@@ -828,8 +872,34 @@ export class Workflow<
           }));
 
           failures.sort((a, b) => a.index - b.index);
-          for (const { index, error } of failures) {
-            await handleRejection(error, items[index], index);
+
+          if (!onError) {
+            // No recovery handler: aggregate all failures so none are silently dropped.
+            if (failures.length === 1) throw failures[0].error;
+            if (failures.length > 1) {
+              throw new AggregateError(
+                failures.map(f => f.error),
+                `foreach "${id}": ${failures.length} of ${items.length} items failed`,
+              );
+            }
+          } else {
+            // With onError: invoke for every failure, collecting any onError-throws
+            // as a secondary AggregateError so no handler error is silently dropped.
+            const handlerErrors: unknown[] = [];
+            for (const { index, error } of failures) {
+              try {
+                await handleRejection(error, items[index], index);
+              } catch (handlerError) {
+                handlerErrors.push(handlerError);
+              }
+            }
+            if (handlerErrors.length === 1) throw handlerErrors[0];
+            if (handlerErrors.length > 1) {
+              throw new AggregateError(
+                handlerErrors,
+                `foreach "${id}": ${handlerErrors.length} onError handlers threw (all results discarded)`,
+              );
+            }
           }
         }
 
