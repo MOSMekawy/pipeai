@@ -30,17 +30,17 @@ export class WorkflowLoopError extends Error {
 
 // ── Gate / Snapshot Types ─────────────────────────────────────────────
 
-export interface WorkflowSnapshot {
+export interface WorkflowSnapshot<TPayload = unknown> {
   readonly version: 1;
   readonly resumeFromIndex: number;
   readonly output: unknown;
   readonly gateId: string;
-  readonly gatePayload: unknown;
+  readonly gatePayload: TPayload;
 }
 
-export class WorkflowSuspended extends Error {
-  readonly snapshot: WorkflowSnapshot;
-  constructor(snapshot: WorkflowSnapshot) {
+export class WorkflowSuspended<TPayload = unknown> extends Error {
+  readonly snapshot: WorkflowSnapshot<TPayload>;
+  constructor(snapshot: WorkflowSnapshot<TPayload>) {
     super(`Workflow suspended at gate "${snapshot.gateId}"`);
     this.name = "WorkflowSuspended";
     this.snapshot = snapshot;
@@ -74,10 +74,8 @@ export interface BranchCase<TContext, TOutput, TNextOutput> extends AgentStepHoo
 
 export interface BranchSelect<TContext, TOutput, TKeys extends string, TNextOutput> extends AgentStepHooks<TContext, TOutput, TNextOutput> {
   select: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TKeys>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  agents: Record<TKeys, Agent<TContext, any, TNextOutput>>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  fallback?: Agent<TContext, any, TNextOutput>;
+  agents: Record<TKeys, Agent<TContext, TOutput, TNextOutput>>;
+  fallback?: Agent<TContext, TOutput, TNextOutput>;
 }
 
 // ── Result Types ────────────────────────────────────────────────────
@@ -645,15 +643,15 @@ export class Workflow<
 
   // ── gate: human-in-the-loop suspension point ────────────────
 
-  gate<TResponse = TOutput, Id extends string = string>(
+  gate<TResponse = TOutput, Id extends string = string, TMerged = TResponse>(
     id: Id & (Id extends keyof TGates ? never : Id),
     options?: {
       payload?: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<unknown>;
       schema?: SchemaWithParse<TResponse>;
       condition?: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<boolean>;
-      merge?: (params: { priorOutput: TOutput; response: TResponse }) => MaybePromise<TResponse>;
+      merge?: (params: { priorOutput: TOutput; response: TResponse }) => MaybePromise<TMerged>;
     }
-  ): Workflow<TContext, TInput, TResponse, TGates & Record<Id, TResponse>> {
+  ): Workflow<TContext, TInput, TMerged, TGates & Record<Id, TResponse>> {
     if (this.steps.some(s => s.type === "gate" && s.id === id)) {
       throw new Error(`Workflow: duplicate gate ID "${id}". Each gate must have a unique identifier.`);
     }
@@ -668,7 +666,7 @@ export class Workflow<
           })
         : undefined,
       merge: options?.merge
-        ? (params) => options.merge!(params as { priorOutput: TOutput; response: TResponse })
+        ? (params) => options.merge!(params as { priorOutput: TOutput; response: TResponse }) as MaybePromise<unknown>
         : undefined,
       payload: async (state) => {
         if (options?.payload) {
@@ -681,7 +679,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TResponse, TGates & Record<Id, TResponse>>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TMerged, TGates & Record<Id, TResponse>>([...this.steps, node] as any, this.id);
   }
 
   // ── branch: predicate routing (array) ─────────────────────────

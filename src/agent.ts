@@ -122,8 +122,7 @@ export class Agent<
   private readonly config: AgentConfig<TContext, TInput, TOutput>;
   private readonly _hasDynamicConfig: boolean;
   private readonly _resolvedStaticTools: Record<string, Tool> | null = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private readonly _passthrough: Record<string, any>;
+  private readonly _passthrough: Record<string, unknown>;
   private readonly _onStepFinish: AgentConfig<TContext, TInput, TOutput>['onStepFinish'];
   private readonly _onFinish: AgentConfig<TContext, TInput, TOutput>['onFinish'];
 
@@ -239,8 +238,10 @@ export class Agent<
     const resolved = await this.resolveConfig(ctx, input);
     const options = this.buildCallOptions(resolved, ctx, input);
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (await generateText({ ...options, ...extra } as any)) as GenerateTextResult<ToolSet, OutputType<TOutput>>;
+      // The SDK's `Output.object<T>` return type doesn't simplify generically
+      // — cast through `unknown` rather than `any` so we keep the boundary
+      // narrow without forcing the call site to know SDK option internals.
+      return (await generateText({ ...options, ...extra } as unknown as Parameters<typeof generateText>[0])) as GenerateTextResult<ToolSet, OutputType<TOutput>>;
     } catch (error: unknown) {
       if (this.config.onError) {
         await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
@@ -257,14 +258,13 @@ export class Agent<
     const resolved = await this.resolveConfig(ctx, input);
     const options = this.buildCallOptions(resolved, ctx, input);
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return streamText({
         ...options,
         ...extra,
         onError: this.config.onError
           ? ({ error }: { error: unknown }) => this.config.onError!({ error, ctx, input, writer: getActiveWriter() })
           : undefined,
-      } as any) as StreamTextResult<ToolSet, OutputType<TOutput>>;
+      } as unknown as Parameters<typeof streamText>[0]) as StreamTextResult<ToolSet, OutputType<TOutput>>;
     } catch (error: unknown) {
       // streamText typically defers errors to the returned stream, but a
       // synchronous throw (e.g., invalid options) would otherwise bypass
@@ -276,8 +276,7 @@ export class Agent<
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private buildCallOptions(resolved: ResolvedAgentConfig, ctx: TContext, input: TInput): Record<string, any> {
+  private buildCallOptions(resolved: ResolvedAgentConfig, ctx: TContext, input: TInput): Record<string, unknown> {
     return {
       ...this._passthrough,
       model: resolved.model,

@@ -187,6 +187,48 @@ describe("Workflow", () => {
         'No agent found for key "missing" and no fallback provided'
       );
     });
+
+    it("BranchSelect.agents rejects agents whose input type doesn't match TOutput", () => {
+      // Compile-time guard: providing an agent whose input type doesn't match
+      // the workflow's current TOutput must fail to typecheck. We invoke
+      // `.branch<...>` with explicit type arguments so TypeScript can pick the
+      // select overload deterministically, then mark the mismatched-agent
+      // properties with @ts-expect-error.
+      type SpecialInput = { kind: "bug" | "feature" };
+      const correct = new Agent<TestCtx, SpecialInput, string>({
+        id: "ok",
+        model: createMockModel("ok"),
+        prompt: () => "go",
+      });
+      const wrongInput = new Agent<TestCtx, { unrelated: string }, string>({
+        id: "wrong",
+        model: createMockModel("ok"),
+        prompt: () => "go",
+      });
+
+      const _pipeline = Workflow.create<TestCtx, SpecialInput>()
+        .step("identity", ({ input }) => input)
+        .branch<"bug" | "feature", string>({
+          select: ({ input }) => input.kind,
+          agents: {
+            // correct match — no @ts-expect-error so the overload is picked.
+            bug: correct,
+            // @ts-expect-error — wrongInput expects `{ unrelated: string }`, not SpecialInput
+            feature: wrongInput,
+          },
+        });
+      expect(typeof _pipeline).toBe("object");
+    });
+
+    it("Workflow.create<Ctx, Input>() threads Input into the first step", () => {
+      type In = { user: string };
+      const _ = Workflow.create<TestCtx, In>()
+        .step("first", ({ input }) => {
+          const _check: In = input;
+          return _check.user;
+        });
+      expect(true).toBe(true);
+    });
   });
 
   describe("error handling", () => {
@@ -1870,6 +1912,46 @@ describe("Workflow", () => {
       const { output } = await pipeline.generate(testCtx);
       expect(caught).toHaveBeenCalledOnce();
       expect(output).toBe("recovered");
+    });
+
+    it("gate.merge can return a new shape that becomes the workflow output type", async () => {
+      type Draft = { draft: string };
+      type Approval = { approved: boolean; comment: string };
+      type Merged = { draft: string; approval: Approval };
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("draft", () => ({ draft: "v1" } as Draft))
+        .gate<Approval, "review", Merged>("review", {
+          schema: { parse: (v) => v as Approval },
+          merge: ({ priorOutput, response }) => ({
+            draft: priorOutput.draft,
+            approval: response,
+          }),
+        })
+        .step("finalize", ({ input }) => `${input.draft}|${input.approval.approved}`);
+
+      // First execution — suspends at the gate
+      let snapshot: WorkflowSnapshot | null = null;
+      try {
+        await pipeline.generate(testCtx);
+      } catch (e) {
+        if (e instanceof WorkflowSuspended) snapshot = e.snapshot;
+      }
+      expect(snapshot).not.toBeNull();
+
+      const { output } = await pipeline
+        .loadState("review", snapshot!)
+        .generate(testCtx, { approved: true, comment: "ok" });
+      expect(output).toBe("v1|true");
+    });
+
+    it("WorkflowSnapshot is generic in the payload type", () => {
+      type Payload = { user: string; reason: string };
+      // Pure type-level test — no runtime assertion needed beyond that this compiles.
+      const _checkSnapshot = (s: WorkflowSnapshot<Payload>) => s.gatePayload.user;
+      const _checkSuspended = (e: WorkflowSuspended<Payload>) => e.snapshot.gatePayload.reason;
+      expect(typeof _checkSnapshot).toBe("function");
+      expect(typeof _checkSuspended).toBe("function");
     });
   });
 
