@@ -76,6 +76,13 @@ export interface BranchSelect<TContext, TOutput, TKeys extends string, TNextOutp
   select: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TKeys>;
   agents: Record<TKeys, Agent<TContext, TOutput, TNextOutput>>;
   fallback?: Agent<TContext, TOutput, TNextOutput>;
+  /**
+   * Diagnostic hook invoked when `select` returns a key that has no matching
+   * entry in `agents`. Fires BEFORE `fallback` is applied or
+   * `WorkflowBranchError` is thrown, regardless of whether a `fallback` is
+   * configured. Useful for logging typos / unexpected classifier output.
+   */
+  onUnknownKey?: (params: { key: string; availableKeys: TKeys[]; ctx: Readonly<TContext> }) => void;
 }
 
 // ── Result Types ────────────────────────────────────────────────────
@@ -579,6 +586,13 @@ export class Workflow<
     workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
+  // ── step: nested workflow with explicit id overload ───────────
+
+  step<TNextOutput>(
+    id: string,
+    workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
+  ): Workflow<TContext, TInput, TNextOutput, TGates>;
+
   // ── step: transform overload (replaces map + tap) ─────────────
 
   step<TNextOutput>(
@@ -590,7 +604,10 @@ export class Workflow<
 
   step<TNextOutput>(
     target: Agent<TContext, TOutput, TNextOutput> | SealedWorkflow<TContext, TOutput, TNextOutput> | string,
-    optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>)
+    optionsOrFnOrWorkflow?:
+      | StepOptions<TContext, TOutput, TNextOutput>
+      | ((params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>)
+      | SealedWorkflow<TContext, TOutput, TNextOutput>
   ): Workflow<TContext, TInput, TNextOutput, TGates> {
     // Nested workflow overload: step(workflow)
     if (target instanceof SealedWorkflow) {
@@ -606,12 +623,26 @@ export class Workflow<
       return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
     }
 
-    // Transform overload: step(id, fn)
     if (typeof target === "string") {
-      if (typeof optionsOrFn !== "function") {
-        throw new Error(`Workflow step("${target}"): second argument must be a function`);
+      // Nested workflow with explicit id overload: step(id, workflow)
+      if (optionsOrFnOrWorkflow instanceof SealedWorkflow) {
+        const workflow = optionsOrFnOrWorkflow;
+        const node: StepNode = {
+          type: "step",
+          id: target,
+          execute: async (state) => {
+            await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
+          },
+        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
       }
-      const fn = optionsOrFn as (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
+
+      // Transform overload: step(id, fn)
+      if (typeof optionsOrFnOrWorkflow !== "function") {
+        throw new Error(`Workflow step("${target}"): second argument must be a function or SealedWorkflow`);
+      }
+      const fn = optionsOrFnOrWorkflow as (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
       const node: StepNode = {
         type: "step",
         id: target,
@@ -628,7 +659,7 @@ export class Workflow<
 
     // Agent overload: step(agent, options?)
     const agent = target;
-    const options = optionsOrFn as StepOptions<TContext, TOutput, TNextOutput> | undefined;
+    const options = optionsOrFnOrWorkflow as StepOptions<TContext, TOutput, TNextOutput> | undefined;
     const node: StepNode = {
       type: "step",
       id: agent.id,
@@ -746,6 +777,13 @@ export class Workflow<
 
         let agent = config.agents[key];
         if (!agent) {
+          if (config.onUnknownKey) {
+            config.onUnknownKey({
+              key,
+              availableKeys: Object.keys(config.agents) as TKeys[],
+              ctx: ctx as Readonly<TContext>,
+            });
+          }
           if (config.fallback) {
             agent = config.fallback;
           } else {
@@ -920,6 +958,18 @@ export class Workflow<
 
   // ── repeat: conditional loop ─────────────────────────────────
 
+  /**
+   * Iterates `target` until/while a predicate. Predicate runs AFTER each
+   * iteration, so `repeat(agent, { while: () => false })` still executes once
+   * (do-while semantics, not while semantics). The body runs at minimum once.
+   *
+   * @param target Agent or SealedWorkflow whose output type matches its input type.
+   * @param options.until Stop when predicate returns true. The predicate sees
+   *   the iteration count starting at 1 (after the first run).
+   * @param options.while Continue while predicate returns true. Same semantics —
+   *   evaluated AFTER the body, so this is do-while, not while.
+   * @param options.maxIterations Safety cap (default 10). Throws WorkflowLoopError.
+   */
   repeat(
     target: Agent<TContext, TOutput, TOutput> | SealedWorkflow<TContext, TOutput, TOutput>,
     options: RepeatOptions<TContext, TOutput>,

@@ -188,6 +188,23 @@ describe("Workflow", () => {
       );
     });
 
+    it("invokes onUnknownKey when select returns a typo'd key", async () => {
+      const onUnknownKey = vi.fn();
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .branch({
+          select: () => "typo" as "bug",
+          agents: { bug: createPassthroughAgent("bug", "ok") },
+          fallback: createPassthroughAgent("fb", "fallback"),
+          onUnknownKey,
+        });
+
+      await pipeline.generate(testCtx);
+      expect(onUnknownKey).toHaveBeenCalledWith(
+        expect.objectContaining({ key: "typo", availableKeys: ["bug"] }),
+      );
+    });
+
     it("BranchSelect.agents rejects agents whose input type doesn't match TOutput", () => {
       // Compile-time guard: providing an agent whose input type doesn't match
       // the workflow's current TOutput must fail to typecheck. We invoke
@@ -780,6 +797,21 @@ describe("Workflow", () => {
 
       const { output } = await level1.generate(testCtx);
       expect(output).toBe("deep-l2-l1");
+    });
+
+    it("step(id, nestedWorkflow) uses the supplied id in catch handlers", async () => {
+      const errors: Array<{ stepId: string }> = [];
+      const inner = Workflow.create<TestCtx, string>()
+        .step("inner-identity", ({ input }) => input)
+        .step(createFailingAgent("inner-step", () => true));
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => "input")
+        .step("outer-nested", inner)
+        .catch("err", ({ stepId }) => { errors.push({ stepId }); return "ok"; });
+
+      await pipeline.generate(testCtx);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].stepId).toBe("outer-nested");
     });
   });
 

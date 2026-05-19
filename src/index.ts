@@ -20,7 +20,7 @@ export type {
   WorkflowSnapshot,
 } from "./workflow";
 
-export { defineTool } from "./tool-provider";
+export { defineTool, ToolProvider, isToolProvider } from "./tool-provider";
 export type { ToolProviderConfig, ToolExecuteOptions, IToolProvider } from "./tool-provider";
 
 export type { MaybePromise, Resolvable } from "./utils";
