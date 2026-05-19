@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-20
+
+A correctness, types, and ergonomics release addressing the 30 findings from a multi-agent review of the 0.3.0 codebase. See `docs/superpowers/plans/2026-05-20-review-fixes.md` for the full plan.
+
+### Breaking changes
+
+- **`gate()` now has a third generic `TMerged`.** When you supply a `merge` callback, its return type becomes the workflow's downstream `TOutput`. Previously `merge` was forced to return `TResponse`, which contradicted the documented use case of combining pre-gate output with the human response into a new shape. Existing code without `merge` is unaffected (default `TMerged = TResponse`). Code that relied on the old constraint may need to tighten or loosen the downstream step's input annotation.
+- **`BranchSelect.agents` is now typed `Record<TKeys, Agent<TContext, TOutput, TNextOutput>>`** (was `Agent<TContext, any, TNextOutput>`). Mismatched-input agents that previously compiled silently now fail at compile time — this is the intended catch. Update the agent or the `select` return type.
+- **`WorkflowSnapshot` and `WorkflowSuspended` are now generic in `TPayload`** (default `unknown`, so existing references compile unchanged). New: cast the caught error to `WorkflowSnapshot<MyPayload>` to narrow `gatePayload` without losing type safety.
+- **`extractOutput` (via Agent behavior) now throws** when an `output` schema is declared but the model returned no structured value. Previously it silently fell back to raw text — typed agents acting as tools would receive unstructured strings where typed objects were expected. Catch via the agent's `onError` or wrap the call site.
+
+### Added
+
+- **`AgentConfig.validateOutput?: ZodType<TOutput>`** — optional Zod schema for runtime validation of the model's structured output. Distinct from `tool.outputSchema` (which validates tool execution output).
+- **`Agent.generate(ctx, input, options?)` and `Agent.stream(...)` accept `{ abortSignal }`** as an optional second arg. Threads through to the AI SDK and to sub-agents invoked via `asTool`.
+- **`Agent.asTool` and `asToolProvider` now forward `ToolExecutionOptions.abortSignal`** from the parent SDK loop to the sub-agent. Parent timeouts and user-driven aborts now correctly cancel sub-agents.
+- **`AggregateError` from concurrent `foreach`** — when `concurrency > 1` and multiple items fail, all failures are surfaced via `AggregateError` instead of only the first. When `onError` is set, every failure's handler is invoked; handler throws are collected into a secondary `AggregateError`.
+- **`BranchSelect.onUnknownKey?: (params: { key, availableKeys, ctx }) => void`** — diagnostic hook fired when `select` returns a key not in `agents`. Runs even when a `fallback` exists.
+- **`Workflow.step(id, nestedWorkflow)` overload** — give nested workflows explicit IDs instead of collapsing to `"nested-workflow"`. Multiple anonymous nested workflows are now distinguishable in catch handlers.
+- **`ToolProvider` and `isToolProvider` exported** from `pipeai` (was: only `defineTool`). Enables `instanceof` checks and typed variable declarations.
+- **`defer<T>()` and `createToolCallingMockModel`** added to test helpers — deterministic concurrency barriers and tool-call streaming simulation.
+- New tests covering abort signal forwarding, tool-call finish reasons, stream-mode hooks (`onStreamResult`, `mapStreamResult`), gate schema validation in stream resumption, and the `validateOutput` end-to-end pipeline.
+
+### Changed
+
+- **`foreach` concurrent path is now a worker pool** (`O(concurrency)` memory) instead of pre-allocating one async closure per item (`O(N)` memory). For 100k-item arrays, memory usage no longer grows with input size.
+- **`finally` and `catch` handlers that themselves throw now preserve the original error as `.cause`** instead of silently shadowing it. Both errors are observable; debugging is no longer destructive.
+- **`outputPromise.catch(() => {})` suppression in workflow streams is now conditional on `options.onError`** — consumers who provide an error sink keep the silent suppression; consumers who omit both `output` await and `onError` now see the unhandled rejection (no more silent error drops).
+- **SDK boundary casts in `Agent`** replaced `as any` with `as unknown as Parameters<typeof generateText>[0]` (and `streamText`). The cast is genuinely narrower than `any`; future SDK option changes will surface at compile time instead of being silently `any`-tainted.
+- Five timing-fragile tests refactored to use deferred-promise barriers instead of `setTimeout`-coordinated state machines. Test suite is now deterministic across multiple runs.
+- The README sections on gate `merge` and snapshot shape now document the new generics and merge return-shape semantics.
+
+### Fixed
+
+- `Agent.stream()` now wraps synchronous SDK throws so the user's `onError` is invoked. Previously only async errors during streaming flowed through `onError`; immediate provider rejections bypassed it.
+- Gate `condition` and `payload` callbacks are now captured by the workflow's `pendingError` plumbing, so a throwing gate routes through `.catch()` like any other step (`WorkflowSuspended` still re-throws normally).
+- `WorkflowSuspended` is no longer caught and re-classified as a "step error" when thrown from inside the new gate try/catch.
+
+### Removed
+
+- The internal `Semaphore` import from `src/workflow.ts` (no longer used by the new worker-pool `foreach`). `Semaphore` remains exported from `src/utils.ts` as public API.
+
 ## [0.2.1] - 2026-04-27
 
 ### Fixed

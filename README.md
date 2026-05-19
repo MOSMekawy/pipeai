@@ -754,9 +754,9 @@ const resumed2 = pipeline.loadState("final-approval", snapshot);
 const { output } = await resumed2.generate(ctx, "final approval");
 ```
 
-### Merging pre-gate output with response
+### Manual merge at the call site
 
-The `snapshot.output` field contains the pre-gate output. Use it to merge with the human response:
+The `snapshot.output` field contains the pre-gate output. Merge it with the human response at the call site:
 
 ```ts
 // The step after the gate needs both the draft and the approval
@@ -766,6 +766,8 @@ await resumed.generate(ctx, {
   approval: humanResponse,      // human's response
 });
 ```
+
+For automatic merging without exposing `snapshot.output` to the caller, see the `merge` option below.
 
 ### Injecting updated context on resume
 
@@ -794,33 +796,48 @@ const pipeline = Workflow.create<Ctx>()
   .step(publishAgent);
 ```
 
-### Merging pre-gate output with response
+### Merging pre-gate output with response via `merge`
 
-Use `merge` to combine the pre-gate output with the human response into a single value for the next step. Without `merge`, only the human response is forwarded:
+Use `merge` to combine the pre-gate output with the human response into a single value for the next step. Without `merge`, only the human response is forwarded.
+
+`merge` may return any shape — its return type becomes the input type of the next step. The gate's third generic `TMerged` is inferred from the merge return type, so downstream steps type-check against the merged shape:
 
 ```ts
 const pipeline = Workflow.create<Ctx>()
   .step(draftAgent)
   .gate("review", {
+    schema: approvalSchema,
     merge: ({ priorOutput, response }) => ({
-      draft: priorOutput,
-      approval: response,
+      draft: priorOutput,        // pre-gate output (TOutput)
+      approval: response,        // validated human response (TResponse)
     }),
   })
   .step("publish", ({ input }) => {
-    // input is { draft, approval }
+    // input is { draft, approval } — the TMerged shape
   });
 ```
 
 ### Snapshot shape
 
+`WorkflowSnapshot<TPayload>` is generic so consumers (HTTP handlers, queue workers) can annotate the payload shape per gate. The default is `unknown` — existing code that uses the bare `WorkflowSnapshot` keeps working.
+
 ```ts
-interface WorkflowSnapshot {
+interface WorkflowSnapshot<TPayload = unknown> {
   version: 1;
   resumeFromIndex: number;  // step index of the gate
   output: unknown;          // pre-gate output
   gateId: string;           // gate identifier
-  gatePayload: unknown;     // data for the human
+  gatePayload: TPayload;    // data for the human (typed per gate)
+}
+
+// Narrow at the catch site when you know which gate fired:
+type ReviewPayload = { draft: string; reviewer: string };
+try { await pipeline.generate(ctx); }
+catch (e) {
+  if (e instanceof WorkflowSuspended) {
+    const snap = e.snapshot as WorkflowSnapshot<ReviewPayload>;
+    // snap.gatePayload.draft is typed
+  }
 }
 ```
 
