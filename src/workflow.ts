@@ -336,7 +336,7 @@ export class SealedWorkflow<
         if (options?.mapStreamResult) {
           state.output = await options.mapStreamResult({ result, ctx, input });
         } else {
-          state.output = await extractOutput(result, hasStructuredOutput);
+          state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
         }
       });
     } else {
@@ -349,7 +349,7 @@ export class SealedWorkflow<
       if (options?.mapGenerateResult) {
         state.output = await options.mapGenerateResult({ result, ctx, input });
       } else {
-        state.output = await extractOutput(result, hasStructuredOutput);
+        state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
       }
     }
   }

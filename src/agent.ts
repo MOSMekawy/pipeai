@@ -76,6 +76,13 @@ export interface AgentConfig<
   description?: string;
   input?: ZodType<TInput>;
   output?: OutputType<TOutput>;
+  /**
+   * Zod schema used to validate `output` after the AI SDK returns. Distinct
+   * from `tool.outputSchema` (AI SDK's tool-execution output schema): this
+   * runs **after** the SDK has parsed structured output, as a runtime guard
+   * against parse drift. If omitted, the parsed output is trusted as-is.
+   */
+  validateOutput?: ZodType<TOutput>;
 
   // ── Resolvable (our versions of AI SDK properties) ──
   model: Resolvable<TContext, TInput, LanguageModel>;
@@ -104,6 +111,14 @@ export class Agent<
   readonly id: string;
   readonly description: string;
   readonly hasOutput: boolean;
+  /**
+   * Zod schema used to validate the agent's structured `output` after the AI
+   * SDK returns. Distinct from `tool.outputSchema` (which validates tool
+   * execution output). Exposed (readonly) so external runners — notably the
+   * workflow runtime — can pass it through to `extractOutput` without
+   * re-plumbing it.
+   */
+  readonly validateOutput: ZodType<TOutput> | undefined;
   private readonly config: AgentConfig<TContext, TInput, TOutput>;
   private readonly _hasDynamicConfig: boolean;
   private readonly _resolvedStaticTools: Record<string, Tool> | null = null;
@@ -116,6 +131,7 @@ export class Agent<
     this.id = config.id;
     this.description = config.description ?? "";
     this.hasOutput = config.output !== undefined;
+    this.validateOutput = config.validateOutput;
     this.config = config;
     this._hasDynamicConfig = [
       config.model, config.system, config.prompt,
@@ -136,7 +152,7 @@ export class Agent<
     // Pre-compute the passthrough (AI SDK options we don't manage) once,
     // rather than destructuring on every generate()/stream() call.
     const {
-      id: _id, description: _desc, input: _inputSchema, output: _output,
+      id: _id, description: _desc, input: _inputSchema, output: _output, validateOutput: _validateOutput,
       model: _m, system: _s, prompt: _p, messages: _msg,
       tools: _t, activeTools: _at, toolChoice: _tc, stopWhen: _sw,
       onStepFinish, onFinish, onError: _onError,
@@ -149,32 +165,12 @@ export class Agent<
 
   async generate(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
-    const resolved = await this.resolveConfig(ctx, input);
-    const options = this.buildCallOptions(resolved, ctx, input);
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return await generateText(options as any);
-    } catch (error: unknown) {
-      if (this.config.onError) {
-        await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
-      }
-      throw error;
-    }
+    return this.generateWithOptions(ctx, input, {});
   }
 
   async stream(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
-    const resolved = await this.resolveConfig(ctx, input);
-    const options = this.buildCallOptions(resolved, ctx, input);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return streamText({
-      ...options,
-      onError: this.config.onError
-        ? ({ error }: { error: unknown }) => this.config.onError!({ error, ctx, input, writer: getActiveWriter() })
-        : undefined,
-    } as any);
+    return this.streamWithOptions(ctx, input, {});
   }
 
   asTool(ctx: TContext, options?: {
@@ -206,23 +202,78 @@ export class Agent<
     return tool<TInput, TOutput>({
       description: this.description,
       inputSchema: this.config.input,
-      execute: async (toolInput: TInput) => {
+      // The AI SDK passes a `ToolExecutionOptions` argument that carries
+      // `abortSignal`, `toolCallId`, `messages`, etc. Forward `abortSignal` so
+      // a parent agent's abort cancels in-flight sub-agent calls instead of
+      // leaving them running and producing detached output.
+      execute: async (toolInput: TInput, execOptions?: { abortSignal?: AbortSignal }) => {
+        const abortSignal = execOptions?.abortSignal;
         // When inside a streaming workflow, automatically use stream() and merge to the active writer.
         // Otherwise fall back to generate().
         const writer = getActiveWriter();
         if (writer) {
-          const result = await (this.stream as (ctx: TContext, input: TInput) => Promise<StreamTextResult>)(ctx, toolInput);
+          const result = await this.streamWithOptions(ctx, toolInput, { abortSignal });
           writer.merge(result.toUIMessageStream());
           if (options?.mapOutput) return options.mapOutput(result as unknown as GenerateTextResult);
-          return extractOutput(result, this.hasOutput);
+          return extractOutput(result, this.hasOutput, this.validateOutput);
         }
-        const result = await (this.generate as (ctx: TContext, input: TInput) => Promise<GenerateTextResult>)(ctx, toolInput);
+        const result = await this.generateWithOptions(ctx, toolInput, { abortSignal });
         if (options?.mapOutput) return options.mapOutput(result);
-        return extractOutput(result, this.hasOutput);
+        return extractOutput(result, this.hasOutput, this.validateOutput);
       },
       // TS cannot simplify the SDK's `NeverOptional<TOutput, ...>` conditional in a
       // generic context, so we cast through `unknown` instead of `any`.
     } as unknown as Tool<TInput, TOutput>);
+  }
+
+  // ── Internal: shared call helpers ─────────────────────────────
+  // `generate()` / `stream()` and the `asTool()` wrapper all funnel through
+  // these so the abortSignal-forwarding and onError-wrapping logic stays in
+  // one place. `extra` carries per-call overrides (currently `abortSignal`).
+
+  private async generateWithOptions(
+    ctx: TContext,
+    input: TInput,
+    extra: { abortSignal?: AbortSignal },
+  ): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>> {
+    const resolved = await this.resolveConfig(ctx, input);
+    const options = this.buildCallOptions(resolved, ctx, input);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (await generateText({ ...options, ...extra } as any)) as GenerateTextResult<ToolSet, OutputType<TOutput>>;
+    } catch (error: unknown) {
+      if (this.config.onError) {
+        await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
+      }
+      throw error;
+    }
+  }
+
+  private async streamWithOptions(
+    ctx: TContext,
+    input: TInput,
+    extra: { abortSignal?: AbortSignal },
+  ): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>> {
+    const resolved = await this.resolveConfig(ctx, input);
+    const options = this.buildCallOptions(resolved, ctx, input);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return streamText({
+        ...options,
+        ...extra,
+        onError: this.config.onError
+          ? ({ error }: { error: unknown }) => this.config.onError!({ error, ctx, input, writer: getActiveWriter() })
+          : undefined,
+      } as any) as StreamTextResult<ToolSet, OutputType<TOutput>>;
+    } catch (error: unknown) {
+      // streamText typically defers errors to the returned stream, but a
+      // synchronous throw (e.g., invalid options) would otherwise bypass
+      // onError entirely.
+      if (this.config.onError) {
+        await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
+      }
+      throw error;
+    }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

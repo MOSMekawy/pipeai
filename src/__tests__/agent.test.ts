@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
+import { Output } from "ai";
 import { Agent } from "../agent";
 import { defineTool } from "../tool-provider";
+import { extractOutput } from "../utils";
 import { z } from "zod";
 import { createMockModel, testCtx, type TestCtx } from "./helpers";
 
@@ -180,6 +182,120 @@ describe("Agent", () => {
 
       const toolResult = await agentTool.execute!({ task: "test" }, {} as never);
       expect(toolResult).toEqual({ processed: "raw output" });
+    });
+
+    it("forwards abortSignal from ToolExecutionOptions to the sub-agent's generate call", async () => {
+      const seenAbortSignals: Array<AbortSignal | undefined> = [];
+      const model = createMockModel("ok");
+      const originalDoGenerate = model.doGenerate;
+      model.doGenerate = async (options) => {
+        seenAbortSignals.push(options.abortSignal);
+        return originalDoGenerate(options);
+      };
+
+      const subagent = new Agent<TestCtx, { task: string }>({
+        id: "sub",
+        model,
+        input: z.object({ task: z.string() }),
+        prompt: (_ctx, input) => input.task,
+      });
+
+      const controller = new AbortController();
+      const agentTool = subagent.asTool(testCtx);
+      await agentTool.execute!(
+        { task: "go" },
+        { abortSignal: controller.signal, toolCallId: "t1", messages: [] } as never,
+      );
+
+      expect(seenAbortSignals).toHaveLength(1);
+      expect(seenAbortSignals[0]).toBe(controller.signal);
+    });
+  });
+
+  describe("structured output", () => {
+    it("throws when output schema is declared but the model returned no structured output", async () => {
+      // Simulate the SDK returning `undefined` for the parsed output (e.g.,
+      // the model produced text that didn't match the declared schema and the
+      // SDK chose to surface it as undefined rather than throw).
+      const fakeResult = {
+        text: "irrelevant",
+        output: Promise.resolve(undefined),
+      };
+      await expect(extractOutput(fakeResult, true)).rejects.toThrow(
+        /structured output was declared but the model returned none/,
+      );
+    });
+
+    it("validates output against the declared Zod schema at runtime", async () => {
+      // Simulate the SDK returning an object that doesn't match the declared schema.
+      // We do this by stubbing the result's `output` property.
+      const fakeResult = {
+        text: "irrelevant",
+        output: Promise.resolve({ answer: 42 }), // wrong type — schema expects string
+      };
+      const schema = z.object({ answer: z.string() });
+      // Zod v4 phrases this as "expected string, received number".
+      await expect(extractOutput(fakeResult, true, schema)).rejects.toThrow(/expected string/i);
+    });
+
+    it("returns output unchanged when schema is omitted", async () => {
+      const fakeResult = { output: Promise.resolve({ answer: 42 }), text: "" };
+      await expect(extractOutput(fakeResult, true)).resolves.toEqual({ answer: 42 });
+    });
+
+    it("validateOutput rejects parsed output end-to-end through asTool()", async () => {
+      // Build a real Agent with `output` (so the AI SDK parses structured output)
+      // AND `validateOutput` (so we get a stricter post-hoc check). The model
+      // returns JSON that satisfies the loose `output` schema but fails the
+      // stricter `validateOutput` schema. The error must surface from
+      // `asTool().execute()`, proving the validateOutput field is wired through
+      // the Agent → extractOutput pipeline (agent.ts:218).
+      const looseSchema = z.object({ answer: z.string() });
+      const strictSchema = z.object({ answer: z.string().min(10) });
+
+      // Mock model emits JSON text that the SDK's Output.object can parse:
+      // matches looseSchema but the "answer" is only 2 chars, so strictSchema rejects it.
+      const model = createMockModel('{"answer":"hi"}');
+
+      const agent = new Agent<TestCtx, { task: string }, { answer: string }>({
+        id: "structured-sub",
+        description: "structured sub-agent",
+        model,
+        input: z.object({ task: z.string() }),
+        output: Output.object({ schema: looseSchema }),
+        validateOutput: strictSchema,
+        prompt: (_ctx, input) => input.task,
+      });
+
+      const agentTool = agent.asTool(testCtx);
+      // Zod v4 phrases this as something like "too small: expected string to have >=10 characters".
+      await expect(
+        agentTool.execute!({ task: "go" }, { toolCallId: "t1", messages: [] } as never),
+      ).rejects.toThrow(/at least 10|>=\s*10|too[_ ]small/i);
+    });
+  });
+
+  describe("stream() error handling", () => {
+    // This case is handled by the `onError` config wired into streamText, not
+    // by the synchronous try/catch around the `streamText(...)` call itself.
+    // The sync-throw case (try/catch around the call) is covered by
+    // agent.stream-sync-throw.test.ts via a module mock of `ai`.
+    it("invokes onError when the model stream rejects asynchronously", async () => {
+      const onError = vi.fn();
+      const model = createMockModel("x");
+      model.doStream = async () => {
+        throw new Error("stream init failure");
+      };
+
+      const agent = new Agent<TestCtx, string>({
+        id: "test",
+        model,
+        prompt: (_ctx, input) => input,
+        onError,
+      });
+
+      await expect(agent.stream(testCtx, "go").then(r => r.text)).rejects.toThrow();
+      expect(onError).toHaveBeenCalled();
     });
   });
 
