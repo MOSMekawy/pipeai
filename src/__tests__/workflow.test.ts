@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
 import { Workflow, WorkflowLoopError, WorkflowSuspended, type WorkflowSnapshot } from "../workflow";
-import { createMockModel, testCtx, type TestCtx } from "./helpers";
+import { createMockModel, defer, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
 function createTextAgent(id: string, text: string): Agent<TestCtx, void, string> {
@@ -238,6 +238,11 @@ describe("Workflow", () => {
         throw new Error("agent failed");
       };
 
+      // Capture the error outside the catch handler so the assertion fires
+      // even if the catch never runs. (expect() inside a handler that never
+      // executes silently passes.)
+      const caughtErrors: unknown[] = [];
+
       const pipeline = Workflow.create<TestCtx>()
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         .step(new Agent<TestCtx, any, any>({
@@ -246,12 +251,14 @@ describe("Workflow", () => {
           prompt: () => "go",
         }))
         .catch("fallback", ({ error }) => {
-          expect(error).toBeInstanceOf(Error);
+          caughtErrors.push(error);
           return "recovered";
         });
 
       const { output } = await pipeline.generate(testCtx);
       expect(output).toBe("recovered");
+      expect(caughtErrors).toHaveLength(1);
+      expect(caughtErrors[0]).toBeInstanceOf(Error);
     });
 
     it("catch receives stepId and input of the failing step", async () => {
@@ -619,6 +626,66 @@ describe("Workflow", () => {
         process.off("unhandledRejection", listener);
       }
     });
+
+    describe("stream-mode hooks", () => {
+      it("invokes onStreamResult and threads through mapStreamResult", async () => {
+        const onStream = vi.fn();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = createTextAgent("a1", "raw") as Agent<TestCtx, any, any>;
+
+        const pipeline = Workflow.create<TestCtx>()
+          .step(agent, {
+            onStreamResult: onStream,
+            mapStreamResult: async ({ result }) => `mapped:${await result.text}`,
+          });
+
+        const { stream, output } = pipeline.stream(testCtx);
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) { /* drain */ }
+        const finalOutput = await output;
+
+        expect(onStream).toHaveBeenCalledOnce();
+        expect(finalOutput).toBe("mapped:raw");
+      });
+
+      it("validates response schema in stream-mode resumption", async () => {
+        const { z } = await import("zod");
+        const schema = z.object({ approved: z.boolean() });
+        const pipeline = Workflow.create<TestCtx>()
+          .step(createTextAgent("a1", "draft"))
+          .gate("review", { schema });
+
+        // Suspend at the gate via generate().
+        let snapshot: WorkflowSnapshot | null = null;
+        try {
+          await pipeline.generate(testCtx);
+        } catch (e) {
+          if (e instanceof WorkflowSuspended) snapshot = e.snapshot;
+        }
+        expect(snapshot).not.toBeNull();
+
+        // Resume in stream mode with a wrong-shape payload. The gate's schema
+        // is parsed synchronously inside `.stream(...)`, so the rejection
+        // surfaces as a thrown ZodError from the call itself (not as an
+        // `output` rejection). Either path proves the schema runs in stream
+        // mode — we accept both.
+        const resumed = pipeline.loadState("review", snapshot!);
+        let validationError: unknown;
+        try {
+          const { stream, output } = resumed.stream(
+            testCtx,
+            { wrongShape: true } as never,
+          );
+          const reader = stream.getReader();
+          while (!(await reader.read()).done) { /* drain */ }
+          await output;
+        } catch (e) {
+          validationError = e;
+        }
+        expect(validationError).toBeDefined();
+        expect(String(validationError)).toMatch(/expected boolean|invalid_type/i);
+      });
+    });
   });
 
   describe("step() with nested workflow", () => {
@@ -751,24 +818,30 @@ describe("Workflow", () => {
     it("processes concurrently in batches", async () => {
       let maxConcurrent = 0;
       let current = 0;
+      const items = ["a", "b", "c", "d"];
+      // Per-item release barrier — held until the test resolves it.
+      const releases = new Map(items.map(i => [i, defer<void>()]));
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const agent = new Agent<TestCtx, any, any>({
         id: "concurrent",
         model: createMockModel("done"),
-        prompt: async () => {
+        prompt: async (_ctx: TestCtx, input: string) => {
           current++;
           if (current > maxConcurrent) maxConcurrent = current;
-          await new Promise(r => setTimeout(r, 10));
+          await releases.get(input)!.promise;
           current--;
           return "go";
         },
       });
 
       const pipeline = Workflow.create<TestCtx>()
-        .step("items", () => ["a", "b", "c", "d"])
+        .step("items", () => items)
         .foreach(agent, { concurrency: 2 });
 
-      await pipeline.generate(testCtx);
+      const resultPromise = pipeline.generate(testCtx);
+      // Release all items; the semaphore bound (2) caps maxConcurrent.
+      for (const r of releases.values()) r.resolve();
+      await resultPromise;
       expect(maxConcurrent).toBe(2);
     });
 
@@ -858,6 +931,8 @@ describe("Workflow", () => {
 
       it("aborts foreach when onError rethrows; outer .catch() recovers", async () => {
         const agent = createFailingAgent("proc", input => input === "b", "agent boom");
+        // Capture outside the catch so the assertion always fires.
+        const caughtErrors: unknown[] = [];
 
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => ["a", "b", "c"])
@@ -865,12 +940,14 @@ describe("Workflow", () => {
             onError: ({ error }) => { throw error; },
           })
           .catch("recover", ({ error }) => {
-            expect((error as Error).message).toContain("agent boom");
+            caughtErrors.push(error);
             return ["caught"];
           });
 
         const { output } = await pipeline.generate(testCtx);
         expect(output).toEqual(["caught"]);
+        expect(caughtErrors).toHaveLength(1);
+        expect((caughtErrors[0] as Error).message).toContain("agent boom");
       });
 
       it("Workflow.SKIP omits the failed index", async () => {
@@ -924,14 +1001,21 @@ describe("Workflow", () => {
 
       it("invokes onError in index order, not completion order", async () => {
         const calls: number[] = [];
+        // index 0 (`first`) must finish AFTER index 1 (`second`) but onError
+        // should still see them in index order. Use deferred barriers so we
+        // can sequence the failures deterministically.
+        const firstFail = defer<void>();
+        const secondFail = defer<void>();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const agent = new Agent<TestCtx, any, any>({
           id: "ordering",
           model: createMockModel("ok"),
           prompt: async (_ctx: TestCtx, input: string) => {
-            // index 0 finishes slower than index 1, both fail
-            const delay = input === "first" ? 20 : 1;
-            await new Promise(r => setTimeout(r, delay));
+            if (input === "first") {
+              await firstFail.promise;
+            } else {
+              await secondFail.promise;
+            }
             throw new Error(`boom: ${input}`);
           },
         });
@@ -946,7 +1030,15 @@ describe("Workflow", () => {
             },
           });
 
-        await pipeline.generate(testCtx);
+        const resultPromise = pipeline.generate(testCtx);
+        // Release "second" (index 1) BEFORE "first" (index 0). If onError ran
+        // in completion order, calls would be [1, 0]. Index-order semantics
+        // require [0, 1] regardless of which task finished first.
+        secondFail.resolve();
+        // Let the runtime observe second's rejection.
+        await new Promise<void>(r => setImmediate(r));
+        firstFail.resolve();
+        await resultPromise;
         expect(calls).toEqual([0, 1]);
       });
 
@@ -991,17 +1083,24 @@ describe("Workflow", () => {
 
       it("awaits an async onError handler", async () => {
         const agent = createFailingAgent("proc", input => input === "b");
+        // Deferred barrier instead of setTimeout: the handler awaits this,
+        // proving the runtime waits for the async onError to resolve.
+        const handlerRelease = defer<void>();
 
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => ["a", "b", "c"])
           .foreach(agent, {
             onError: async ({ item }) => {
-              await new Promise(r => setTimeout(r, 5));
+              await handlerRelease.promise;
               return `async:${item}`;
             },
           });
 
-        const { output } = await pipeline.generate(testCtx);
+        const resultPromise = pipeline.generate(testCtx);
+        // Let the runtime reach the onError handler before releasing it.
+        await new Promise<void>(r => setImmediate(r));
+        handlerRelease.resolve();
+        const { output } = await resultPromise;
         expect(output).toEqual(["ok", "async:b", "ok"]);
       });
 
@@ -1088,8 +1187,13 @@ describe("Workflow", () => {
       });
 
       it("runs at most `concurrency` items in flight at any time", async () => {
+        const concurrency = 3;
         let inFlight = 0;
         let maxInFlight = 0;
+        const itemCount = 12;
+        // Per-index deferred releases — let the test hold every task at the
+        // "in-flight" point and observe the semaphore's actual ceiling.
+        const releases = Array.from({ length: itemCount }, () => defer<void>());
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const agent = new Agent<TestCtx, any, any>({
           id: "tracker",
@@ -1097,50 +1201,76 @@ describe("Workflow", () => {
           prompt: async (_ctx: TestCtx, input: string) => {
             inFlight++;
             if (inFlight > maxInFlight) maxInFlight = inFlight;
-            await new Promise(r => setTimeout(r, 5));
+            await releases[Number(input)].promise;
             inFlight--;
             return input;
           },
         });
 
-        const items = Array.from({ length: 12 }, (_, i) => String(i));
+        const items = Array.from({ length: itemCount }, (_, i) => String(i));
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => items)
-          .foreach(agent, { concurrency: 3 });
+          .foreach(agent, { concurrency });
 
-        await pipeline.generate(testCtx);
-        expect(maxInFlight).toBeLessThanOrEqual(3);
-        expect(maxInFlight).toBe(3);
+        const resultPromise = pipeline.generate(testCtx);
+        // Let the first wave grab the semaphore slots, then release everyone.
+        // Two microtask flushes are enough for the runner to spin up workers.
+        await new Promise<void>(r => setImmediate(r));
+        await new Promise<void>(r => setImmediate(r));
+        expect(maxInFlight).toBe(concurrency);
+        for (const d of releases) d.resolve();
+        await resultPromise;
+        expect(maxInFlight).toBe(concurrency);
       });
 
       it("launches the next item as soon as one completes (no lockstep)", async () => {
-        // 8 items, concurrency 4. Item 0 takes 50ms; items 1..7 take 5ms.
-        // Lockstep batches would force every item in batch 0 to wait for
-        // item 0, total ≥ 50ms + 50ms = 100ms (item 0 in batch 0, then batch 1).
-        // Sliding semaphore: items 1..3 finish quickly, items 4..7 launch
-        // immediately as 1..3 release, total ≈ ~50ms (gated by item 0).
+        // 8 items, concurrency 4. We assert behaviorally — not via wall clock —
+        // that "fast" items get launched while "slow" is still in flight, by
+        // tracking which items started before `slow` releases.
+        const concurrency = 4;
+        const items = ["slow", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
+        const slowRelease = defer<void>();
+        const started = new Set<string>();
+        let resolvedSlow = false;
+        const startedAfterSlowReleased: string[] = [];
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const agent = new Agent<TestCtx, any, any>({
           id: "timing",
           model: createMockModel("ok"),
           prompt: async (_ctx: TestCtx, input: string) => {
-            const delay = input === "slow" ? 50 : 5;
-            await new Promise(r => setTimeout(r, delay));
+            started.add(input);
+            if (resolvedSlow) startedAfterSlowReleased.push(input);
+            if (input === "slow") {
+              await slowRelease.promise;
+              return input;
+            }
+            // "fast" items complete on the next microtask; under lockstep
+            // semantics only items 1..3 (the rest of batch 0) would start.
             return input;
           },
         });
 
-        const items = ["slow", "f", "f", "f", "f", "f", "f", "f"];
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => items)
-          .foreach(agent, { concurrency: 4 });
+          .foreach(agent, { concurrency });
 
-        const start = Date.now();
-        await pipeline.generate(testCtx);
-        const elapsed = Date.now() - start;
+        const resultPromise = pipeline.generate(testCtx);
+        // Let the first wave start (slow + 3 fast) and let the fast ones
+        // complete + spawn replacements — all without slow finishing.
+        for (let i = 0; i < 20; i++) await new Promise<void>(r => setImmediate(r));
 
-        // Generous bound: well under the 100ms+ lockstep would require.
-        expect(elapsed).toBeLessThan(85);
+        // Sliding-window semantics: all 8 items must have started before slow
+        // releases. Under lockstep, only 4 items would have started so far.
+        expect(started.size).toBe(items.length);
+
+        resolvedSlow = true;
+        slowRelease.resolve();
+        await resultPromise;
+
+        // Sanity: no items started AFTER slow released — they all started
+        // before. This is what differentiates sliding from lockstep.
+        expect(startedAfterSlowReleased).toEqual([]);
       });
 
       it("discards in-flight successes after onError rethrow", async () => {
@@ -1312,16 +1442,20 @@ describe("Workflow", () => {
         prompt: () => "go",
       });
 
+      // Capture outside the catch so the assertion always fires.
+      const caughtErrors: unknown[] = [];
       const pipeline = Workflow.create<TestCtx>()
         .step("init", () => "start")
         .repeat(agent, { until: () => false, maxIterations: 2 })
         .catch("handle-loop", ({ error }) => {
-          expect(error).toBeInstanceOf(WorkflowLoopError);
+          caughtErrors.push(error);
           return "loop-recovered";
         });
 
       const { output } = await pipeline.generate(testCtx);
       expect(output).toBe("loop-recovered");
+      expect(caughtErrors).toHaveLength(1);
+      expect(caughtErrors[0]).toBeInstanceOf(WorkflowLoopError);
     });
 
     it("iterations count is 1-indexed", async () => {
@@ -1758,9 +1892,11 @@ describe("Workflow", () => {
       }
 
       const resumed = pipeline.loadState("review", snapshot);
+      // Zod v4 wording: "expected boolean, received string". Match loosely
+      // across phrasings so we don't pin to the exact error string.
       await expect(
         resumed.generate(testCtx, { approved: "not-a-boolean" } as never)
-      ).rejects.toThrow();
+      ).rejects.toThrow(/expected boolean|invalid_type/i);
     });
 
     it("resume with fresh context (updated chat history)", async () => {

@@ -4,7 +4,7 @@ import { Agent } from "../agent";
 import { defineTool } from "../tool-provider";
 import { extractOutput } from "../utils";
 import { z } from "zod";
-import { createMockModel, testCtx, type TestCtx } from "./helpers";
+import { createMockModel, createToolCallingMockModel, testCtx, type TestCtx } from "./helpers";
 
 describe("Agent", () => {
   describe("generate()", () => {
@@ -80,11 +80,19 @@ describe("Agent", () => {
 
       expect(stepFinishSpy).toHaveBeenCalledOnce();
       expect(stepFinishSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ ctx: testCtx, input: "go", result: expect.any(Object) })
+        expect.objectContaining({
+          ctx: testCtx,
+          input: "go",
+          result: expect.objectContaining({ text: "done", finishReason: "stop" }),
+        })
       );
       expect(finishSpy).toHaveBeenCalledOnce();
       expect(finishSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ ctx: testCtx, input: "go", result: expect.any(Object) })
+        expect.objectContaining({
+          ctx: testCtx,
+          input: "go",
+          result: expect.objectContaining({ text: "done", finishReason: "stop" }),
+        })
       );
     });
 
@@ -395,6 +403,77 @@ describe("Agent", () => {
       expect(capturedInputSchema).toBeDefined();
       expect(capturedInputSchema!.type).toBe("object");
       expect(capturedInputSchema!.properties).toMatchObject({ query: { type: "string" } });
+    });
+  });
+
+  describe("abortSignal", () => {
+    it("Agent.generate forwards abortSignal to the SDK", async () => {
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const model = createMockModel("ok");
+      const original = model.doGenerate;
+      model.doGenerate = async (opts) => {
+        seenSignals.push(opts.abortSignal);
+        return original(opts);
+      };
+
+      const agent = new Agent<TestCtx, string>({
+        id: "test",
+        model,
+        prompt: (_, i) => i,
+      });
+
+      const controller = new AbortController();
+      await agent.generate(testCtx, "go", { abortSignal: controller.signal });
+      expect(seenSignals[0]).toBe(controller.signal);
+    });
+
+    it("Agent.stream forwards abortSignal to the SDK", async () => {
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const model = createMockModel("ok");
+      const original = model.doStream;
+      model.doStream = async (opts) => {
+        seenSignals.push(opts.abortSignal);
+        return original(opts);
+      };
+
+      const agent = new Agent<TestCtx, string>({
+        id: "test",
+        model,
+        prompt: (_, i) => i,
+      });
+
+      const controller = new AbortController();
+      const result = await agent.stream(testCtx, "go", { abortSignal: controller.signal });
+      await result.text; // ensure stream initializes
+      expect(seenSignals[0]).toBe(controller.signal);
+    });
+  });
+
+  describe("tool-call finish reason", () => {
+    it("flows through onFinish when the model returns finishReason 'tool-calls'", async () => {
+      const finishSpy = vi.fn();
+      const define = defineTool<TestCtx>();
+      const echoTool = define({
+        description: "echo",
+        input: z.object({ msg: z.string() }),
+        execute: async ({ msg }) => msg,
+      });
+
+      const agent = new Agent<TestCtx>({
+        id: "tc",
+        model: createToolCallingMockModel({
+          toolName: "echoTool",
+          toolInput: { msg: "hi" },
+        }),
+        prompt: () => "go",
+        tools: { echoTool },
+        onFinish: finishSpy,
+      });
+
+      await agent.generate(testCtx);
+      expect(finishSpy).toHaveBeenCalled();
+      const callArg = finishSpy.mock.calls[0][0];
+      expect(callArg.result.finishReason).toBe("tool-calls");
     });
   });
 });

@@ -162,14 +162,26 @@ export class Agent<
     this._onFinish = onFinish;
   }
 
-  async generate(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>> {
+  async generate(
+    ctx: TContext,
+    ...args: TInput extends void
+      ? [input?: TInput, options?: { abortSignal?: AbortSignal }]
+      : [input: TInput, options?: { abortSignal?: AbortSignal }]
+  ): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
-    return this.generateWithOptions(ctx, input, {});
+    const callOptions = args[1] as { abortSignal?: AbortSignal } | undefined;
+    return this.generateWithOptions(ctx, input, callOptions ?? {});
   }
 
-  async stream(ctx: TContext, ...args: TInput extends void ? [input?: TInput] : [input: TInput]): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>> {
+  async stream(
+    ctx: TContext,
+    ...args: TInput extends void
+      ? [input?: TInput, options?: { abortSignal?: AbortSignal }]
+      : [input: TInput, options?: { abortSignal?: AbortSignal }]
+  ): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>> {
     const input = args[0] as TInput;
-    return this.streamWithOptions(ctx, input, {});
+    const callOptions = args[1] as { abortSignal?: AbortSignal } | undefined;
+    return this.streamWithOptions(ctx, input, callOptions ?? {});
   }
 
   asTool(ctx: TContext, options?: {
