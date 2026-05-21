@@ -187,6 +187,67 @@ describe("Workflow", () => {
         'No agent found for key "missing" and no fallback provided'
       );
     });
+
+    it("throws a clear error when a declared agent key has an undefined value", async () => {
+      // Conditional spreads (e.g. `bug: enabled ? agentA : undefined`) leave
+      // the key declared but with an undefined value. The select branch fails
+      // loud rather than silently falling back — the fallback obscures the
+      // misconfiguration.
+      const pipeline = Workflow.create<TestCtx>()
+        .step("emit-key", () => ({ agent: "bug" as const }))
+        .branch({
+          select: ({ input }) => input.agent,
+          agents: {
+            // Key declared but value is undefined (the bug case).
+            bug: undefined as unknown as Agent<TestCtx, { agent: "bug" }, string>,
+          },
+        });
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(
+        /declared but the value is undefined/,
+      );
+    });
+
+    it("invokes onUnknownKey when select returns a typo'd key", async () => {
+      const onUnknownKey = vi.fn();
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .branch({
+          select: () => "typo" as "bug",
+          agents: { bug: createPassthroughAgent("bug", "ok") },
+          fallback: createPassthroughAgent("fb", "fallback"),
+          onUnknownKey,
+        });
+
+      await pipeline.generate(testCtx);
+      expect(onUnknownKey).toHaveBeenCalledWith(
+        expect.objectContaining({ key: "typo", availableKeys: ["bug"] }),
+      );
+    });
+
+    it("treats Object.prototype keys (toString, constructor, ...) as unknown, not as a matched agent", async () => {
+      // Untrusted classifier output can return strings that happen to match
+      // `Object.prototype` properties. Without an own-property check,
+      // `agents["toString"]` would resolve to the inherited Object.prototype
+      // method — executeAgent would then crash with an opaque
+      // "agent.generate is not a function".
+      const onUnknownKey = vi.fn();
+      const fallbackAgent = createPassthroughAgent("fb", "fb response");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .branch({
+          select: () => "toString" as "bug",
+          agents: { bug: createPassthroughAgent("bug", "bug response") },
+          fallback: fallbackAgent,
+          onUnknownKey,
+        });
+
+      const { output } = expectComplete(await pipeline.generate(testCtx));
+      expect(output).toBe("fb response");
+      expect(onUnknownKey).toHaveBeenCalledWith(
+        expect.objectContaining({ key: "toString", availableKeys: ["bug"] }),
+      );
+    });
   });
 
   describe("error handling", () => {
@@ -1452,6 +1513,87 @@ describe("Workflow", () => {
       await expect(
         resumed.generate(testCtx, { approved: "not-a-boolean" } as never)
       ).rejects.toThrow();
+    });
+
+    it("generate-mode: schema parse rejection on resume flows through .catch() pipeline", async () => {
+      // Without the schema-into-catch fix, validateResponse throws synchronously
+      // from .generate(...) before execute() runs, so any downstream `.catch()`
+      // is bypassed.
+      const schema = {
+        parse: (value: unknown): string => {
+          if (typeof value !== "number") throw new Error("schema-rejected");
+          return String(value);
+        },
+      };
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("draft", "first draft"))
+        .gate("review", { schema })
+        .catch("recovery", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+
+      const resumed = pipeline.loadState("review", snapshot);
+      const { output } = expectComplete(
+        await resumed.generate(testCtx, "not-a-number" as unknown as string),
+      );
+      expect(output).toBe("recovered:schema-rejected");
+    });
+
+    it("gate.condition that throws routes through the catch pipeline", async () => {
+      // condition() callback throws — must be captured into pendingError so a
+      // downstream `.catch()` can recover, not escape execute() entirely.
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("draft", "x"))
+        .gate("conditional-gate", {
+          condition: () => { throw new Error("condition-boom"); },
+        })
+        .catch("recover", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const { output } = expectComplete(await pipeline.generate(testCtx));
+      expect(output).toBe("recovered:condition-boom");
+    });
+
+    it("gate.payload that throws routes through the catch pipeline", async () => {
+      // payload() callback throws — must route through catch, not escape.
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("draft", "x"))
+        .gate("payload-gate", {
+          payload: () => { throw new Error("payload-boom"); },
+        })
+        .catch("recover", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const { output } = expectComplete(await pipeline.generate(testCtx));
+      expect(output).toBe("recovered:payload-boom");
+    });
+
+    it("stream-mode: schema parse rejection on resume flows through .catch() pipeline", async () => {
+      // Stream-mode parity with the generate-mode catch test above.
+      // Previously validateResponse ran synchronously inside .stream(...) before
+      // the stream-internal try/catch, so a schema rejection on resume escaped
+      // as a sync throw and bypassed any downstream .catch().
+      const schema = {
+        parse: (value: unknown): string => {
+          if (typeof value !== "number") throw new Error("schema-rejected");
+          return String(value);
+        },
+      };
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("draft", "first draft"))
+        .gate("review", { schema })
+        .catch("recovery", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+
+      const resumed = pipeline.loadState("review", snapshot);
+      // .stream() must NOT throw synchronously — the rejection has to flow
+      // through the catch pipeline.
+      const { stream, output } = resumed.stream(
+        testCtx,
+        "not-a-number" as unknown as string,
+      );
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expect(expectComplete(await output).output).toBe("recovered:schema-rejected");
     });
 
     it("resume with fresh context (updated chat history)", async () => {
