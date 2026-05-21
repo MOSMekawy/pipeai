@@ -303,14 +303,23 @@ const pipeline = Workflow.create<Ctx>()
 
 ```ts
 // Non-streaming — calls agent.generate() at each step
-const { output } = await pipeline.generate(ctx, initialInput);
+const result = await pipeline.generate(ctx, initialInput);
+if (result.status === "complete") {
+  console.log(result.output);
+} else {
+  // result.status === "suspended" — see Human-in-the-Loop section
+  await db.saveSnapshot(result.snapshot);
+}
 
 // Streaming — calls agent.stream() at each step, merges into a single ReadableStream
 const { stream, output } = pipeline.stream(ctx, initialInput);
 return new Response(stream);
 
-const finalOutput = await output;  // resolves when pipeline completes
+// output resolves to WorkflowResult<T> — never rejects on suspension
+const final = await output;
 ```
+
+The return value is a `WorkflowResult<T>` discriminated union — either `{ status: "complete", output, warnings }` or `{ status: "suspended", snapshot, warnings }`. `warnings` is always present on both branches (`readonly WorkflowWarning[]`, possibly empty).
 
 ### Nested workflows
 
@@ -621,9 +630,9 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
 | `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: 1). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
 | `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
-| `.gate(id, opts?)`        | Human-in-the-loop suspension point. Throws `WorkflowSuspended` with a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
-| `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. |
-| `.finally(id, fn)`        | Always runs. `fn` receives `{ ctx }`.                                      |
+| `.gate(id, opts?)`        | Human-in-the-loop suspension point. Returns a result with `status: "suspended"` carrying a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
+| `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. Bypassed on suspension. |
+| `.finally(id, fn)`        | Always runs — including after a gate suspends. `fn` receives `{ ctx }`. Throwing finallys no longer abort subsequent ones; errors aggregate into `AggregateError` on the completion path and into `result.warnings` on the suspension path. |
 
 ### Output flow
 
@@ -648,10 +657,12 @@ Auto-extraction priority for `step()` with an agent:
 
 `gate()` suspends a workflow at a designated point, producing a JSON-serializable snapshot. The consumer persists the snapshot, collects human input out-of-band (HTTP, WebSocket, CLI, queue — any transport), then resumes the workflow from where it left off.
 
+> **0.4.0 breaking change:** suspension is a return value, not a thrown error. `generate()` and `stream()` resolve with `WorkflowResult<T>` — a discriminated union of `{ status: "complete", output, warnings }` and `{ status: "suspended", snapshot, warnings }`. `WorkflowSuspended` has been removed. See [Migration from 0.3.x](#migration-from-03x).
+
 ### Basic gate
 
 ```ts
-import { Workflow, WorkflowSuspended } from "pipeai";
+import { Workflow } from "pipeai";
 
 const pipeline = Workflow.create<Ctx>()
   .step(draftAgent)
@@ -661,22 +672,26 @@ const pipeline = Workflow.create<Ctx>()
   .step(publishAgent);
 
 // Run — suspends at gate
-try {
-  await pipeline.generate(ctx, input);
-} catch (e) {
-  if (e instanceof WorkflowSuspended) {
-    await db.saveSnapshot(e.snapshot);
-    return res.status(202).json(e.snapshot.gatePayload);
-  }
+const result = await pipeline.generate(ctx, input);
+if (result.status === "suspended") {
+  await db.saveSnapshot(result.snapshot);
+  return res.status(202).json(result.snapshot.gatePayload);
 }
+// result.status === "complete" here — TS narrows `output` automatically
+return res.json({ output: result.output });
 
 // Resume — load state, pass gate ID + snapshot to generate or stream
 const snapshot = await db.loadSnapshot(id);
 const resumed = pipeline.loadState("review", snapshot);
-const { output } = await resumed.generate(ctx, humanResponse);
+const resumeResult = await resumed.generate(ctx, humanResponse);
+if (resumeResult.status === "complete") {
+  console.log(resumeResult.output);
+}
 ```
 
 The `snapshot` is plain JSON — it survives `JSON.parse(JSON.stringify())`, database storage, and process restarts. The workflow definition (code) stays in the process; only the data is serialized.
+
+`result.warnings` is **always** present on both branches — an array of non-fatal errors (a throwing `.finally()`, a misbehaving observer). It's `readonly WorkflowWarning[]`, never `undefined`. If you don't care about non-fatal failures, ignore it.
 
 ### Resuming with streaming
 
@@ -692,20 +707,22 @@ The previous stream is gone — the library only streams forward from the resume
 
 ### Streaming suspension
 
-When `stream()` hits a gate, the stream closes cleanly (partial content from steps before the gate is delivered). The `output` promise rejects with `WorkflowSuspended`:
+When `stream()` hits a gate, the stream closes cleanly (partial content from steps before the gate is delivered). The `output` Promise **resolves** with `{ status: "suspended", snapshot, warnings }` — it does **not** reject:
 
 ```ts
 const { stream, output } = pipeline.stream(ctx, input);
 pipeStreamToResponse(res, stream); // partial content delivered normally
 
-try {
-  await output;
-} catch (e) {
-  if (e instanceof WorkflowSuspended) {
-    await db.saveSnapshot(e.snapshot);
-  }
+const result = await output;
+if (result.status === "suspended") {
+  await db.saveSnapshot(result.snapshot);
 }
+// Real errors (a step throws something other than a gate suspension) still
+// reject the output Promise — keep your try/catch for those, but
+// `WorkflowStreamOptions.onError` is NOT invoked for suspension.
 ```
+
+> **Stream-mode dead-air warning:** the stream stays open while `.finally()` bodies run after a gate suspends. Long-running cleanup work causes proportional dead air. If your HTTP read timeout is shorter than your worst-case finally I/O, the connection can disconnect spuriously.
 
 ### Schema validation
 
@@ -741,18 +758,20 @@ const pipeline = Workflow.create<Ctx>()
   .step("publish", ({ input }) => `published: ${input}`);
 
 // First gate
-let snapshot: WorkflowSnapshot;
-try { await pipeline.generate(ctx, input); }
-catch (e) { snapshot = (e as WorkflowSuspended).snapshot; }
+const r1 = await pipeline.generate(ctx, input);
+if (r1.status !== "suspended") throw new Error("expected suspension at review");
+let snapshot = r1.snapshot;
 
 // Second gate
 const resumed1 = pipeline.loadState("review", snapshot);
-try { await resumed1.generate(ctx, "first approval"); }
-catch (e) { snapshot = (e as WorkflowSuspended).snapshot; }
+const r2 = await resumed1.generate(ctx, "first approval");
+if (r2.status !== "suspended") throw new Error("expected suspension at final-approval");
+snapshot = r2.snapshot;
 
 // Complete
 const resumed2 = pipeline.loadState("final-approval", snapshot);
-const { output } = await resumed2.generate(ctx, "final approval");
+const r3 = await resumed2.generate(ctx, "final approval");
+if (r3.status === "complete") console.log(r3.output);
 ```
 
 ### Manual merge at the call site
@@ -844,7 +863,77 @@ catch (e) {
 
 ### Limitations
 
-Gates inside nested workflows, `foreach()`, and `repeat()` are not yet supported — a descriptive error is thrown at runtime. Gates at the top level of a workflow work in all cases.
+Gates inside nested workflows, `foreach()`, and `repeat()` are not yet supported — `NestedGateUnsupportedError` is thrown at runtime. Gates at the top level of a workflow work in all cases.
+
+```ts
+import { NestedGateUnsupportedError } from "pipeai";
+
+try {
+  await pipeline.generate(ctx, input);
+} catch (e) {
+  if (e instanceof NestedGateUnsupportedError) {
+    console.log(`gate "${e.gateId}" in nested workflow "${e.workflowId}"`);
+    // e.siblingErrors — non-gate rejections from concurrent foreach siblings
+    // e.siblingSuspensions — other items in concurrent foreach that also suspended
+  }
+}
+```
+
+> **Middleware-wrapping caveat:** `NestedGateUnsupportedError` `instanceof` is only stable when caught close to the call site. App-specific error wrappers that re-throw as their own types defeat the check. Preserve `cause` if you wrap.
+
+> **Foreach concurrency hazard:** a nested gate inside concurrent `foreach` waits for siblings to complete — sibling LLM calls bill, sibling DB writes commit. Either use `concurrency: 1` or move the gate above the `foreach`. Sibling-side non-gate errors are preserved in `result.warnings` (`source: "foreach-sibling"`) and attached to the marker via `siblingErrors`. The lowest-index suspending item wins the marker; the rest contribute to `siblingSuspensions`.
+
+### Snapshot immutability (opt-in)
+
+By default snapshots and `result.warnings` are mutable. Pass `freezeSnapshots: true` in `RunOptions` to recursively `Object.freeze` them — useful when you serialize through an in-memory queue and want to catch accidental mutation:
+
+```ts
+const result = await pipeline.generate(ctx, input, { freezeSnapshots: true });
+```
+
+The same flag governs gate snapshots, F1's checkpoint snapshots (when shipped), and the warnings array. **For serializing consumers, leave it `false`** — `JSON.stringify` already copies, and freezing every step is wasted work. `runOptions` does **not** propagate into nested workflows.
+
+Caveat: `Object.freeze(new Map())` doesn't prevent `.set()`. Maps and Sets inside payloads lose immutability.
+
+## Migration from 0.3.x
+
+0.4.0 makes suspension a return value instead of a thrown error, plus seven smaller behavior changes. The full list:
+
+1. **`.finally()` runs after a gate suspends.** Code that assumed `finally` ran only on completion must now check `result.status === "complete"`.
+2. **Nested-workflow `.finally()` bodies run before `NestedGateUnsupportedError` fires.** Inner finallys see `state.suspension` truthy while running — don't branch on it. Side-effecting inner finallys execute on a path the user perceives as a thrown error.
+3. **A throwing `.finally()` no longer aborts subsequent `.finally()` bodies.** All finallys run; their errors accumulate.
+4. **`WorkflowSuspended` is deleted.** Migrate `try / catch (e instanceof WorkflowSuspended)` → `if (result.status === "suspended")`.
+5. **`WorkflowResult<T>` shape changed.** `const { output } = await pipeline.generate(...)` is now a strict-mode compile error. Use `if (result.status !== "complete") throw …; const { output } = result`.
+6. **`stream()` on suspension closes cleanly.** `WorkflowStreamOptions.onError` is **not** invoked for suspension — discriminate via the resolved `output` Promise. Real errors still flow through `onError`. F0 emits a one-time `console.warn` per process when a gate fires in stream mode with `onError` set.
+7. **Any** `.finally()` body that throws on the completion path produces `AggregateError` — stable contract once any finally is added, including the single-error case.
+8. **Duplicate `(type, id)` pairs in the same workflow throw at builder finalization.** `foreach(agentX).foreach(agentX)` and back-to-back default-id `branch(...)` callers must pass an explicit `{ id }`. The same applies to `step(agent, { id })` when reusing an agent in two steps.
+
+Before:
+
+```ts
+import { WorkflowSuspended } from "pipeai";
+try {
+  const { output } = await pipeline.generate(ctx, input);
+  return output;
+} catch (e) {
+  if (e instanceof WorkflowSuspended) {
+    await db.saveSnapshot(e.snapshot);
+    return null;
+  }
+  throw e;
+}
+```
+
+After:
+
+```ts
+const result = await pipeline.generate(ctx, input);
+if (result.status === "suspended") {
+  await db.saveSnapshot(result.snapshot);
+  return null;
+}
+return result.output;
+```
 
 ## Full Example
 

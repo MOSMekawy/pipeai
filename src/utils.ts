@@ -47,6 +47,36 @@ export function resolveValue<TCtx, TInput, TValue>(
 }
 
 /**
+ * Minimal counting semaphore. Up to `permits` callers can hold a permit
+ * concurrently; further `acquire()` calls queue FIFO until one is released.
+ */
+export class Semaphore {
+  private available: number;
+  private waiters: Array<() => void> = [];
+
+  constructor(permits: number) {
+    if (!Number.isInteger(permits) || permits < 1) {
+      throw new Error(`Semaphore: permits must be a positive integer, got ${permits}`);
+    }
+    this.available = permits;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available--;
+      return;
+    }
+    await new Promise<void>(resolve => this.waiters.push(resolve));
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    if (next) next();
+    else this.available++;
+  }
+}
+
+/**
  * Extract structured output from an AI SDK result.
  *
  * - When `hasStructuredOutput` is `true`, awaits `result.output`. If the SDK
@@ -81,4 +111,20 @@ export async function extractOutput(
     return output;
   }
   return await result.text;
+}
+
+/**
+ * Recursively freeze an object graph. Cycles are tracked via a WeakSet so we
+ * never recurse into the same node twice. Maps/Sets stay structurally frozen
+ * but `.set()`/`.add()` still mutate them — Object.freeze doesn't cover those.
+ */
+export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+  if (value === null || typeof value !== "object" || seen.has(value as object)) return value;
+  seen.add(value as object);
+  Object.freeze(value);
+  for (const key of Reflect.ownKeys(value as object)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    deepFreeze((value as any)[key], seen);
+  }
+  return value;
 }

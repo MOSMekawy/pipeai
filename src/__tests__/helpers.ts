@@ -5,6 +5,7 @@ import type {
   LanguageModelV3FinishReason,
   LanguageModelV3GenerateResult,
 } from "@ai-sdk/provider";
+import type { WorkflowResult, WorkflowSnapshot, WorkflowWarning } from "../workflow";
 
 const mockUsage: LanguageModelV3Usage = {
   inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
@@ -105,4 +106,31 @@ export function createToolCallingMockModel(opts: {
       ]),
     },
   }) as unknown as MockLanguageModelV3;
+}
+
+// ── WorkflowResult discriminant helpers (F0) ────────────────────────
+
+/**
+ * Narrow a `WorkflowResult` to its `complete` variant for tests that expect
+ * normal completion. Throws with a useful message when the workflow suspended
+ * — much louder than a silent narrowing failure.
+ */
+export function expectComplete<T>(result: WorkflowResult<T>): { output: T; warnings: readonly WorkflowWarning[] } {
+  if (result.status !== "complete") {
+    throw new Error(
+      `expectComplete: workflow suspended at gate "${result.snapshot.gateId}" instead of completing`
+    );
+  }
+  return { output: result.output, warnings: result.warnings };
+}
+
+/**
+ * Narrow to the `suspended` variant; returns the snapshot. Throws if the
+ * workflow completed without suspending.
+ */
+export function expectSuspended<T>(result: WorkflowResult<T>): { snapshot: WorkflowSnapshot; warnings: readonly WorkflowWarning[] } {
+  if (result.status !== "suspended") {
+    throw new Error(`expectSuspended: workflow completed without suspending`);
+  }
+  return { snapshot: result.snapshot, warnings: result.warnings };
 }

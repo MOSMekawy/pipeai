@@ -7,7 +7,12 @@ export type {
   AsToolMapOutput,
 } from "./agent";
 
-export { Workflow, WorkflowBranchError, WorkflowLoopError, WorkflowSuspended } from "./workflow";
+export {
+  Workflow,
+  WorkflowBranchError,
+  WorkflowLoopError,
+  NestedGateUnsupportedError,
+} from "./workflow";
 
 // `SKIP` is a unique-symbol sentinel returned from `foreach`'s `onError` to
 // omit an item from the output array. It mirrors `Workflow.SKIP` and is
@@ -26,6 +31,10 @@ export type {
   WorkflowStreamResult,
   WorkflowStreamOptions,
   WorkflowSnapshot,
+  WorkflowWarning,
+  WorkflowStepType,
+  WorkflowObservability,
+  RunOptions,
 } from "./workflow";
 
 export { defineTool, ToolProvider, isToolProvider } from "./tool-provider";
