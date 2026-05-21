@@ -1038,6 +1038,158 @@ The same flag governs gate snapshots, F1's checkpoint snapshots (when shipped), 
 
 Caveat: `Object.freeze(new Map())` doesn't prevent `.set()`. Maps and Sets inside payloads lose immutability.
 
+## Observability via `Workflow.create({ observability })`
+
+Pass an `observability` object to `Workflow.create()` to receive lifecycle events for every node in the workflow:
+
+```ts
+import { Workflow, type WorkflowObservability } from "pipeai";
+
+const obs: WorkflowObservability = {
+  onStepStart: ({ stepId, type, ctx, input }) => {
+    console.log(`step ${stepId} (${type}) starting`);
+  },
+  onStepFinish: ({ stepId, type, output, durationMs, suspended }) => {
+    console.log(`step ${stepId} (${type}) finished in ${durationMs}ms, suspended=${suspended}`);
+  },
+  onStepError: ({ stepId, type, error, durationMs }) => {
+    console.error(`step ${stepId} (${type}) threw after ${durationMs}ms`, error);
+  },
+};
+
+const pipeline = Workflow.create<Ctx, string>({ observability: obs })
+  .step("classify", classifier)
+  .step("respond", responder);
+```
+
+The hooks are threaded through every builder return, so any chain following `Workflow.create({ observability })` keeps the same hooks. `ResumedWorkflow` (gate resume via `loadState`) and `CheckpointResumedWorkflow` (checkpoint resume via `resumeFrom`) ALSO inherit it — events fire on resumed runs without re-wiring.
+
+### Per-node firing rules
+
+| Node | `onStepStart` | `onStepFinish` (`suspended`) | `onStepError` |
+|---|---|---|---|
+| step / nested / branch / foreach / parallel / repeat | always | when body returns (`false`) | on body throw |
+| gate (suspends) | always | `suspended: true` | never |
+| gate (cond false → skip) | always | `suspended: false` | never |
+| catch | only when `pendingError` set | when `catchFn` returns | when `catchFn` throws |
+| finally | always (runs even after suspension) | always (`suspended: false`) | when body throws |
+
+Skip-checked nodes (suspension or error state already set on entry) emit **nothing** — `.finally()` is the exception.
+
+### Per-item events for `foreach` and `parallel`
+
+`foreach` and `parallel` ALSO fire per-item events:
+
+```ts
+const obs: WorkflowObservability = {
+  onItemStart: ({ stepId, type, itemIndex, input }) => { /* ... */ },
+  onItemFinish: ({ stepId, type, itemIndex, output, durationMs }) => { /* ... */ },
+  onItemError: ({ stepId, type, itemIndex, error, durationMs }) => { /* ... */ },
+};
+```
+
+- For `foreach`: `itemIndex` is the item's numeric index.
+- For `parallel` record form: `itemIndex` is the branch's string key.
+- For `parallel` tuple form: `itemIndex` is the branch's numeric index.
+- `repeat` does **NOT** emit per-item events. Its iteration count is data-dependent — per-item would mislead.
+
+### Error semantics inside hooks
+
+- Errors thrown inside `onStepStart`, `onStepFinish`, `onItemStart`, `onItemFinish`, `onItemError` are captured into `result.warnings` with the matching `source` tag and mirrored to `console.error`. The workflow continues.
+- Errors thrown inside `onStepError` on the normal path cause the ORIGINAL step error to reach the caller with `error.cause = obsError`. The `instanceof` of the original error is preserved.
+- `onCheckpoint` failures fire `onStepError({ stepId: CHECKPOINT_STEP_ID, type: "step", ... })`.
+
+### Concurrent-run-safe OTel pattern
+
+Don't key observability state on `ctx` alone — concurrent runs share it. Use a per-`runId` key:
+
+```ts
+type Ctx = { userId: string; runId: string };
+const spans = new Map<string, ReturnType<typeof tracer.startSpan>>();
+
+const pipeline = Workflow.create<Ctx>({
+  observability: {
+    onStepStart: ({ stepId, type, ctx }) => {
+      const c = ctx as Ctx;
+      spans.set(`${c.runId}:${stepId}`, tracer.startSpan(`${type}:${stepId}`, {
+        attributes: { userId: c.userId },
+      }));
+    },
+    onStepFinish: ({ stepId, ctx, durationMs, suspended }) => {
+      const c = ctx as Ctx; const key = `${c.runId}:${stepId}`;
+      const span = spans.get(key);
+      span?.setAttribute("duration_ms", durationMs);
+      span?.setAttribute("suspended", suspended);
+      span?.end(); spans.delete(key);
+    },
+    onStepError: ({ stepId, ctx, error }) => {
+      const c = ctx as Ctx; const key = `${c.runId}:${stepId}`;
+      const span = spans.get(key);
+      span?.recordException(error as Error);
+      span?.setStatus({ code: SpanStatusCode.ERROR });
+      span?.end(); spans.delete(key);
+    },
+  },
+}).step(classifier).step(supportAgent);
+```
+
+## Graph patterns
+
+The existing combinators compose into common workflow graph shapes — no new primitives needed.
+
+### Cycles via `repeat(subWorkflow, { until })`
+
+Re-run a sub-workflow until a predicate is satisfied:
+
+```ts
+const cycle = Workflow.create<Ctx, Plan>().step(executor).step(critic);
+
+const agent = Workflow.create<Ctx, string>()
+  .step(planner)
+  .repeat(cycle, { until: ({ output }) => output.satisfied, maxIterations: 5 });
+```
+
+`repeat` runs its body as a sub-workflow; the body's output feeds back as input.
+
+### Multi-path branching with rejoin via `.branch(...).step(...)`
+
+The first step AFTER a `branch` is the rejoin point — the chosen branch's output flows in regardless of which case fired:
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step("classify", classifier)
+  .branch({
+    select: ({ input }) => input as "bug" | "feature",
+    agents: { bug: bugAgent, feature: featureAgent },
+  })
+  .step("persist", ({ input, ctx }) => db.save(ctx.userId, input));
+```
+
+### Fan-out / fan-in via `.parallel({...}).step(...)`
+
+`parallel` produces a record/tuple; the next step consumes the combined shape:
+
+```ts
+const pipeline = Workflow.create<Ctx, string>()
+  .step("init", ({ input }) => input)
+  .parallel({ researcher, critic })
+  .step("synthesize", ({ input }) => `${input.researcher} + ${input.critic}`);
+```
+
+Pair with the [rate-limit and ctx-mutation hazards](#fan-out-via-parallel) above.
+
+### Self-recursion is NOT supported
+
+```ts
+// Doesn't work — `recur` is undefined at evaluation.
+let recur;
+recur = Workflow.create<Ctx, string>()
+  .step(executor)
+  .repeat(recur, { until: () => false });   // ← recur is undefined here
+```
+
+A future `repeat(thunk)` overload (F4.5 candidate) could enable this — the cycle guard inside `stepShapeHash` is already prepared for it.
+
 ## Migration from 0.3.x
 
 0.4.0 makes suspension a return value instead of a thrown error, plus seven smaller behavior changes. The full list:

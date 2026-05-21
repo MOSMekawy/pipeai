@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-08
+
+**Additive. Workflow observability hooks (`Workflow.create({ observability })`) plus the F4 graph-pattern docs (no code).**
+
+### Added — F3: workflow observability
+
+- `Workflow.create({ id?, observability? })` — pass a `WorkflowObservability` object to receive lifecycle events. Threaded through every builder return so all subsequent `.step()`/`.gate()`/`.foreach()`/`.parallel()`/`.repeat()`/`.branch()`/`.catch()`/`.finally()` instances inherit it. `ResumedWorkflow` (gate resume) and `CheckpointResumedWorkflow` (checkpoint resume) inherit it through their resume constructors.
+- `WorkflowObservability` interface — six optional hooks: `onStepStart`, `onStepFinish`, `onStepError`, `onItemStart`, `onItemFinish`, `onItemError`. All async-friendly (`MaybePromise<void>`).
+- `WorkflowStepType` exported as the discriminant type on hook events: `"step" | "nested" | "gate" | "catch" | "finally" | "branch" | "foreach" | "repeat" | "parallel"`.
+
+### Firing rules
+
+| Node | `onStepStart` | `onStepFinish` (`suspended`) | `onStepError` |
+|---|---|---|---|
+| step / nested / branch / foreach / parallel / repeat | always | when body returns (`false`) | on body throw |
+| gate (suspends) | always | `suspended: true` | never |
+| gate (cond false → skip) | always | `suspended: false` | never |
+| catch | only when `pendingError` set | when `catchFn` returns | when `catchFn` throws |
+| finally | always (runs even after suspension) | always (`suspended: false`) | when body throws |
+
+Skip-checked nodes (`state.suspension || pendingError` set on entry) emit nothing — `.finally()` is the exception.
+
+`foreach` and `parallel` ALSO emit per-item events (`onItemStart` / `onItemFinish` / `onItemError`). `repeat` does NOT — its iteration count is data-dependent and per-item would mislead. The `itemIndex` is a number for `foreach` and `parallel` tuple form, a string for `parallel` record form.
+
+### Error semantics
+
+- Errors thrown inside `onStepStart`, `onStepFinish`, `onItemStart`, `onItemFinish`, `onItemError` → captured into `result.warnings` with the matching `source` tag + mirror to `console.error`.
+- Errors thrown inside `onStepError` on the normal path → the ORIGINAL step error reaches the caller, with `error.cause = obsError` (preserves `instanceof` on the original).
+- `onCheckpoint` failures (F1) fire `onStepError({ stepId: CHECKPOINT_STEP_ID, type: "step", ... })`.
+
+### Concurrency
+
+For concurrent runs of the same workflow against the same `ctx`, the OTel example in the README uses a per-`runId` key. Don't key observability state on `ctx` alone — concurrent runs share it.
+
+### Added — F4: graph patterns (docs only)
+
+The README's new "Graph patterns" section documents how to express:
+- **Cycles** → `.repeat(subWorkflow, { until })`.
+- **Multi-path branching with rejoin** → `.branch(...).step(...)`.
+- **Fan-out / fan-in** → `.parallel({...}).step(...)`.
+
+Self-recursion via `let recur; .repeat(recur, ...)` is NOT documented — `recur` is `undefined` at evaluation. A future F4.5 may add a `repeat(thunk)` overload.
+
+### Verification
+
+- 221 tests pass (`npm test`). 19 new F3 tests + 3 F4 smoke tests covering: per-step events fire with `durationMs >= 0`, onStepError attaches `cause`, onStepStart/Finish throws → warnings, gate suspends → `suspended: true`, gate cond-false → `suspended: false`, foreach/parallel emit per-item events, repeat does NOT emit per-item events, `step(workflow)` reports `type: "nested"`, `ResumedWorkflow` and `CheckpointResumedWorkflow` inherit observability, onCheckpoint failure routes to onStepError, skip-checked nodes emit nothing (except finally), per-runId concurrent OTel pattern doesn't interleave.
+
 ## [0.6.0] - 2026-05-08
 
 **Additive. New `.parallel()` fan-out combinator. Contrast with `foreach`: parallel defaults to `min(N, 5)` concurrency (most users want fan-out), foreach defaults to `1` (most users want lockstep). Read on for the rate-limit hazard.**

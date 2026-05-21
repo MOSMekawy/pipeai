@@ -121,12 +121,70 @@ export type WorkflowStepType =
   | "repeat"
   | "parallel";
 
-// Forward-compat: F0 only consumes `onStepError` for the suspension-wins path
-// (when a step body throws but the gate already won the run). F3 widens.
+/**
+ * Workflow observability hooks (F3). All optional. Errors thrown inside hooks
+ * are captured into `result.warnings` with a matching `source` tag, except
+ * `onStepError`, which causes the run to throw the ORIGINAL step error with
+ * `error.cause = obsError` (preserving `instanceof` on the original).
+ *
+ * Per-node firing rules (where "step-like" = step / nested / branch /
+ * foreach / parallel / repeat):
+ *   - step-like / gate (cond-true → suspends): onStepStart always; onStepFinish
+ *     when body returns (suspended: true for gate, false otherwise); onStepError
+ *     on body throw.
+ *   - gate (cond false → skip): onStepStart, onStepFinish({ suspended: false }).
+ *   - catch: onStepStart only when pendingError set; onStepFinish when catchFn
+ *     returns; onStepError when catchFn throws.
+ *   - finally: onStepStart always (runs even after suspension); onStepFinish
+ *     always; onStepError when body throws.
+ *   - foreach / parallel: emit ALSO per-item events (onItemStart/Finish/Error).
+ *   - repeat: emit ONLY combinator-level events (no per-iteration events —
+ *     iteration count is data-dependent and per-item would be misleading).
+ *
+ * Skip-checked nodes (`state.suspension || pendingError` already set on entry)
+ * emit nothing — `.finally()` is the exception.
+ */
 export interface WorkflowObservability {
+  onStepStart?: (event: {
+    stepId: string;
+    type: WorkflowStepType;
+    ctx: unknown;
+    input: unknown;
+  }) => MaybePromise<void>;
+  onStepFinish?: (event: {
+    stepId: string;
+    type: WorkflowStepType;
+    ctx: unknown;
+    output: unknown;
+    durationMs: number;
+    suspended: boolean;
+  }) => MaybePromise<void>;
   onStepError?: (event: {
     stepId: string;
     type: WorkflowStepType;
+    ctx: unknown;
+    error: unknown;
+    durationMs: number;
+  }) => MaybePromise<void>;
+  onItemStart?: (event: {
+    stepId: string;
+    type: "foreach" | "parallel";
+    itemIndex: number | string;
+    ctx: unknown;
+    input: unknown;
+  }) => MaybePromise<void>;
+  onItemFinish?: (event: {
+    stepId: string;
+    type: "foreach" | "parallel";
+    itemIndex: number | string;
+    ctx: unknown;
+    output: unknown;
+    durationMs: number;
+  }) => MaybePromise<void>;
+  onItemError?: (event: {
+    stepId: string;
+    type: "foreach" | "parallel";
+    itemIndex: number | string;
     ctx: unknown;
     error: unknown;
     durationMs: number;
@@ -347,10 +405,13 @@ interface SchemaWithParse<T = unknown> {
 
 // ── Step Node ───────────────────────────────────────────────────────
 
-// The "step" variant gains an optional `nestedWorkflow` field in F1.
-// It's used ONLY by the recursive `stepShapeHash` walk — runtime execution
-// still goes through the closure inside `execute`. F3 splits this into
-// discrete `nested`/`foreach`/`repeat` variants.
+// The "step" variant gains an optional `nestedWorkflow` field in F1 (used by
+// the recursive `stepShapeHash` walk; runtime execution goes through the
+// `execute` closure) and a `category` tag in F3 that drives observability
+// firing — distinguishes a plain agent/transform step from branch/foreach/
+// repeat/parallel/nested without splitting the union into separate variants.
+type StepCategory = "step" | "nested" | "branch" | "foreach" | "repeat" | "parallel";
+
 type StepNode =
   | {
       readonly type: "step";
@@ -358,10 +419,21 @@ type StepNode =
       readonly execute: (state: RuntimeState) => MaybePromise<void>;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       readonly nestedWorkflow?: SealedWorkflow<any, any, any, any>;
+      /** F3 — disambiguates observability events. Default `"step"`. */
+      readonly category?: StepCategory;
     }
   | { readonly type: "catch"; readonly id: string; readonly catchFn: (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown> }
   | { readonly type: "finally"; readonly id: string; readonly execute: (state: RuntimeState) => MaybePromise<void> }
   | { readonly type: "gate"; readonly id: string; readonly payload: (state: RuntimeState) => MaybePromise<unknown>; readonly schema?: SchemaWithParse; readonly condition?: (state: RuntimeState) => MaybePromise<boolean>; readonly merge?: (params: { priorOutput: unknown; response: unknown }) => MaybePromise<unknown> };
+
+/**
+ * Maps a step node's category (or non-step type) to the observability event
+ * `type` field. Drives `WorkflowStepType` reporting.
+ */
+function getObservabilityType(node: StepNode): WorkflowStepType {
+  if (node.type !== "step") return node.type;
+  return (node.category ?? "step") as WorkflowStepType;
+}
 
 /**
  * Sidecar dispatch map used by the recursive `stepShapeHash` walk.
@@ -632,6 +704,48 @@ export class SealedWorkflow<
     }
   }
 
+  // ── F3 observability helpers ──────────────────────────────────
+
+  /**
+   * Fire an observability hook safely. On hook throw:
+   *   - `onStepStart`/`onStepFinish`/`onItemStart`/`onItemFinish`/`onItemError`:
+   *     push a `WorkflowWarning` with the matching source tag and mirror to
+   *     `console.error`. Returns the thrown error so callers can decide.
+   *   - `onStepError`: returns the thrown error WITHOUT pushing a warning.
+   *     The run loop handles `onStepError` specially — attaches the obsError
+   *     as `cause` on the original step error so it reaches the caller.
+   *
+   * Returns the hook's thrown error if any; undefined otherwise.
+   */
+  protected async fireHook<
+    K extends keyof WorkflowObservability,
+    E extends Parameters<NonNullable<WorkflowObservability[K]>>[0],
+  >(
+    state: RuntimeState,
+    name: K,
+    event: E,
+  ): Promise<unknown> {
+    const hook = this.observability?.[name];
+    if (!hook) return undefined;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (hook as any)(event);
+      return undefined;
+    } catch (e) {
+      if (name !== "onStepError") {
+        const stepId = (event as { stepId: string }).stepId;
+        (state.warnings ??= []).push({
+          source: name as WorkflowWarning["source"],
+          stepId,
+          error: e,
+        });
+        // eslint-disable-next-line no-console
+        console.error(`pipeai: ${name} hook threw for stepId "${stepId}":`, e);
+      }
+      return e;
+    }
+  }
+
   // ── Execution ─────────────────────────────────────────────────
 
   async generate(
@@ -744,9 +858,20 @@ export class SealedWorkflow<
       const node = this.steps[i];
 
       if (node.type === "finally") {
+        const stepId = node.id;
+        const finStart = performance.now();
+        await this.fireHook(state, "onStepStart", { stepId, type: "finally", ctx: state.ctx, input: state.output });
         try {
           await node.execute(state);
+          await this.fireHook(state, "onStepFinish", {
+            stepId, type: "finally", ctx: state.ctx, output: state.output,
+            durationMs: performance.now() - finStart, suspended: false,
+          });
         } catch (e) {
+          await this.fireHook(state, "onStepError", {
+            stepId, type: "finally", ctx: state.ctx, error: e,
+            durationMs: performance.now() - finStart,
+          });
           // Multi-error preservation: never silently overwrite a prior pendingError —
           // push it to warnings before promoting this finally error.
           if (pendingError) {
@@ -756,7 +881,7 @@ export class SealedWorkflow<
               error: pendingError.error,
             });
           }
-          pendingError = { error: e, stepId: node.id, source: "finally" };
+          pendingError = { error: e, stepId, source: "finally" };
         }
         continue;
       }
@@ -764,6 +889,9 @@ export class SealedWorkflow<
       if (node.type === "catch") {
         // .catch() bypassed on suspension AND on checkpoint failure (F1 — propagates to caller).
         if (state.suspension || !pendingError || state.checkpointFailed) continue;
+        const stepId = node.id;
+        const cStart = performance.now();
+        await this.fireHook(state, "onStepStart", { stepId, type: "catch", ctx: state.ctx, input: state.output });
         try {
           state.output = await node.catchFn({
             error: pendingError.error,
@@ -772,7 +900,15 @@ export class SealedWorkflow<
             stepId: pendingError.stepId,
           });
           pendingError = null;
+          await this.fireHook(state, "onStepFinish", {
+            stepId, type: "catch", ctx: state.ctx, output: state.output,
+            durationMs: performance.now() - cStart, suspended: false,
+          });
         } catch (e) {
+          await this.fireHook(state, "onStepError", {
+            stepId, type: "catch", ctx: state.ctx, error: e,
+            durationMs: performance.now() - cStart,
+          });
           if (pendingError) {
             (state.warnings ??= []).push({
               source: pendingError.source,
@@ -780,7 +916,7 @@ export class SealedWorkflow<
               error: pendingError.error,
             });
           }
-          pendingError = { error: e, stepId: node.id, source: "catch" };
+          pendingError = { error: e, stepId, source: "catch" };
         }
         continue;
       }
@@ -789,7 +925,17 @@ export class SealedWorkflow<
       if (state.suspension || pendingError) continue;
 
       if (node.type === "gate") {
-        if (node.condition && !(await node.condition(state))) continue;
+        const stepId = node.id;
+        const gStart = performance.now();
+        await this.fireHook(state, "onStepStart", { stepId, type: "gate", ctx: state.ctx, input: state.output });
+        if (node.condition && !(await node.condition(state))) {
+          // Cond returned false — skip the gate. Fire onStepFinish({ suspended: false }).
+          await this.fireHook(state, "onStepFinish", {
+            stepId, type: "gate", ctx: state.ctx, output: state.output,
+            durationMs: performance.now() - gStart, suspended: false,
+          });
+          continue;
+        }
         const snapshot: GateSnapshot = {
           version: 2,
           kind: "gate",
@@ -799,16 +945,43 @@ export class SealedWorkflow<
           gatePayload: await node.payload(state),
         };
         state.suspension = snapshot;
-        state.observabilityEmitGate = true;   // F3 forward-compat
+        state.observabilityEmitGate = true;
         if (resolveFreezeSnapshots(state)) deepFreeze(snapshot);
+        await this.fireHook(state, "onStepFinish", {
+          stepId, type: "gate", ctx: state.ctx, output: state.output,
+          durationMs: performance.now() - gStart, suspended: true,
+        });
         continue;
       }
 
-      // type === "step"
+      // type === "step" — driven by `category` for observability type reporting.
+      const obsType = getObservabilityType(node);
+      const stepId = node.id;
+      const sStart = performance.now();
+      const stepInput = state.output;
+      await this.fireHook(state, "onStepStart", { stepId, type: obsType, ctx: state.ctx, input: stepInput });
       try {
         await node.execute(state);
+        await this.fireHook(state, "onStepFinish", {
+          stepId, type: obsType, ctx: state.ctx, output: state.output,
+          durationMs: performance.now() - sStart, suspended: false,
+        });
       } catch (e) {
         pendingError = { error: e, stepId: node.id, source: "step" };
+        // onStepError special-cases: if the hook throws, attach the obsError as
+        // `cause` on the original step error so the original reaches the caller
+        // with the failure trail attached. Other hooks' throws become warnings.
+        const obsError = await this.fireHook(state, "onStepError", {
+          stepId, type: obsType, ctx: state.ctx, error: e,
+          durationMs: performance.now() - sStart,
+        });
+        if (obsError !== undefined && typeof e === "object" && e !== null) {
+          try {
+            (e as { cause?: unknown }).cause = obsError;
+          } catch {
+            // Some objects are frozen / non-extensible — ignore.
+          }
+        }
       }
 
       // Defensive invariant — by this point node.type === "step" (gate/finally/catch
@@ -840,6 +1013,7 @@ export class SealedWorkflow<
           ? opts.checkpointWhen({ stepIndex: i, stepId: node.id, ctx: state.ctx })
           : (i + 1) % cadence === 0;
         if (shouldCheckpoint) {
+          const ckptStart = performance.now();
           try {
             await emitCheckpoint(
               state,
@@ -850,6 +1024,12 @@ export class SealedWorkflow<
           } catch (e) {
             pendingError = { error: e, stepId: CHECKPOINT_STEP_ID, source: "onCheckpoint" };
             state.checkpointFailed = true;
+            // F3: route through onStepError with the synthetic CHECKPOINT_STEP_ID
+            // and type: "step" (matches pendingErrorSourceToStepType("onCheckpoint")).
+            await this.fireHook(state, "onStepError", {
+              stepId: CHECKPOINT_STEP_ID, type: "step", ctx: state.ctx, error: e,
+              durationMs: performance.now() - ckptStart,
+            });
           }
         }
       }
@@ -1358,12 +1538,14 @@ export class Workflow<
    */
   static readonly SKIP: unique symbol = Symbol("pipeai.foreach.skip");
 
-  private constructor(steps: ReadonlyArray<StepNode> = [], id?: string) {
-    super(steps, id);
+  private constructor(steps: ReadonlyArray<StepNode> = [], id?: string, observability?: WorkflowObservability) {
+    super(steps, id, observability);
   }
 
-  static create<TContext, TInput = void>(options?: { id?: string }): Workflow<TContext, TInput, TInput> {
-    return new Workflow<TContext, TInput, TInput>([], options?.id);
+  static create<TContext, TInput = void>(
+    options?: { id?: string; observability?: WorkflowObservability },
+  ): Workflow<TContext, TInput, TInput> {
+    return new Workflow<TContext, TInput, TInput>([], options?.id, options?.observability);
   }
 
   static from<TContext, TInput, TOutput>(
@@ -1407,12 +1589,13 @@ export class Workflow<
         type: "step",
         id: workflow.id ?? "nested-workflow",
         nestedWorkflow: workflow,   // F1: feeds the recursive stepShapeHash walk
+        category: "nested",          // F3: observability `type: "nested"`
         execute: async (state) => {
           await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
         },
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
     }
 
     // Transform overload: step(id, fn)
@@ -1432,7 +1615,7 @@ export class Workflow<
         },
       };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
     }
 
     // Agent overload: step(agent, options?)
@@ -1447,7 +1630,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── gate: human-in-the-loop suspension point ────────────────
@@ -1488,7 +1671,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TResponse, TGates & Record<Id, TResponse>>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TResponse, TGates & Record<Id, TResponse>>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── branch: predicate routing (array) ─────────────────────────
@@ -1524,6 +1707,7 @@ export class Workflow<
     const node: StepNode = {
       type: "step",
       id: explicitId ?? "branch:predicate",
+      category: "branch",
       execute: async (state) => {
         const ctx = state.ctx as TContext;
         const input = state.output as TOutput;
@@ -1543,7 +1727,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   private branchSelect<TKeys extends string, TNextOutput>(
@@ -1553,6 +1737,7 @@ export class Workflow<
     const node: StepNode = {
       type: "step",
       id: explicitId ?? "branch:select",
+      category: "branch",
       execute: async (state) => {
         const ctx = state.ctx as TContext;
         const input = state.output as TOutput;
@@ -1571,7 +1756,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── foreach: array iteration ─────────────────────────────────
@@ -1618,6 +1803,7 @@ export class Workflow<
       id,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       nestedWorkflow: isWorkflow ? (target as SealedWorkflow<any, any, any, any>) : undefined,
+      category: "foreach",
       execute: async (state) => {
         const items = state.output;
         if (!Array.isArray(items)) {
@@ -1634,12 +1820,28 @@ export class Workflow<
           // the foreach boundary.
           const itemState: RuntimeState = { ctx: state.ctx, output: item, mode: "generate" };
           itemStates[index] = itemState;
-          if (isWorkflow) {
-            await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
-          } else {
-            await this.executeAgent(itemState, target as Agent<TContext, unknown, TNextOutput>, ctx);
+          const itemStart = performance.now();
+          await this.fireHook(state, "onItemStart", {
+            stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, input: item,
+          });
+          try {
+            if (isWorkflow) {
+              await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
+            } else {
+              await this.executeAgent(itemState, target as Agent<TContext, unknown, TNextOutput>, ctx);
+            }
+            results[index] = itemState.output;
+            await this.fireHook(state, "onItemFinish", {
+              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, output: itemState.output,
+              durationMs: performance.now() - itemStart,
+            });
+          } catch (error) {
+            await this.fireHook(state, "onItemError", {
+              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, error,
+              durationMs: performance.now() - itemStart,
+            });
+            throw error;
           }
-          results[index] = itemState.output;
         };
 
         // Merge per-item warnings into the parent state, namespaced.
@@ -1750,7 +1952,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput[], TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput[], TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── parallel: fan-out combinator (F2) ───────────────────────────
@@ -1807,6 +2009,7 @@ export class Workflow<
     const node: StepNode = {
       type: "step",
       id,
+      category: "parallel",
       execute: async (state) => {
         const ctx = state.ctx as TContext;
         const input = state.output;
@@ -1817,12 +2020,30 @@ export class Workflow<
           // Per-branch itemState — same isolation as foreach (no runOptions).
           const branchState: RuntimeState = { ctx: state.ctx, output: input, mode: "generate" };
           branchStates[index] = branchState;
-          if (target instanceof SealedWorkflow) {
-            await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
-          } else {
-            await this.executeAgent(branchState, target as Agent<TContext, unknown, unknown>, ctx);
+          const branchStart = performance.now();
+          // itemIndex is the key for record form, numeric index for tuple form.
+          const itemIndex: string | number = isTuple ? index : (key as string);
+          await this.fireHook(state, "onItemStart", {
+            stepId: id, type: "parallel", itemIndex, ctx: state.ctx, input,
+          });
+          try {
+            if (target instanceof SealedWorkflow) {
+              await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
+            } else {
+              await this.executeAgent(branchState, target as Agent<TContext, unknown, unknown>, ctx);
+            }
+            results[key] = branchState.output;
+            await this.fireHook(state, "onItemFinish", {
+              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, output: branchState.output,
+              durationMs: performance.now() - branchStart,
+            });
+          } catch (error) {
+            await this.fireHook(state, "onItemError", {
+              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, error,
+              durationMs: performance.now() - branchStart,
+            });
+            throw error;
           }
-          results[key] = branchState.output;
         };
 
         // Same partition + suspension contract as foreach concurrent.
@@ -1918,7 +2139,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, any, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, any, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── repeat: conditional loop ─────────────────────────────────
@@ -1941,6 +2162,7 @@ export class Workflow<
       id,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       nestedWorkflow: isWorkflow ? (target as SealedWorkflow<any, any, any, any>) : undefined,
+      category: "repeat",
       execute: async (state) => {
         const ctx = state.ctx as TContext;
 
@@ -1963,7 +2185,7 @@ export class Workflow<
       },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // ── catch ─────────────────────────────────────────────────────
@@ -1981,7 +2203,7 @@ export class Workflow<
       catchFn: fn as (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown>,
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
 
   // `.finally()` is inherited from SealedWorkflow now (it lives there so
