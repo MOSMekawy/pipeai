@@ -6,7 +6,12 @@ export type {
   OutputType,
 } from "./agent";
 
-export { Workflow, WorkflowBranchError, WorkflowLoopError, WorkflowSuspended } from "./workflow";
+export {
+  Workflow,
+  WorkflowBranchError,
+  WorkflowLoopError,
+  NestedGateUnsupportedError,
+} from "./workflow";
 export type { SealedWorkflow, ResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
@@ -18,6 +23,10 @@ export type {
   WorkflowStreamResult,
   WorkflowStreamOptions,
   WorkflowSnapshot,
+  WorkflowWarning,
+  WorkflowStepType,
+  WorkflowObservability,
+  RunOptions,
 } from "./workflow";
 
 export { defineTool } from "./tool-provider";
