@@ -2757,4 +2757,257 @@ describe("Workflow", () => {
       });
     });
   });
+
+  // ── F2 verification tests ─────────────────────────────────────────
+  describe("F2: parallel() combinator", () => {
+    describe("record form", () => {
+      it("returns a record keyed by branch names", async () => {
+        const a = createPassthroughAgent("a-agent", "from-a");
+        const b = createPassthroughAgent("b-agent", "from-b");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a, b });
+        const result = expectComplete(await pipeline.generate(testCtx, "shared-input"));
+        // Both branches receive "shared-input"; both produce their fixed text.
+        expect(result.output).toEqual({ a: "from-a", b: "from-b" });
+      });
+
+      it("feeds the same input to each branch", async () => {
+        const seen: string[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const witness = (id: string) => new Agent<TestCtx, any, any>({
+          id,
+          model: createMockModel("ok"),
+          prompt: (_ctx: TestCtx, input: string) => { seen.push(`${id}:${input}`); return input; },
+        });
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: witness("a"), b: witness("b"), c: witness("c") });
+        await pipeline.generate(testCtx, "same-input");
+        expect(seen.sort()).toEqual(["a:same-input", "b:same-input", "c:same-input"]);
+      });
+    });
+
+    describe("tuple form", () => {
+      it("returns an array in declaration order", async () => {
+        const a = createPassthroughAgent("a", "from-a");
+        const b = createPassthroughAgent("b", "from-b");
+        const c = createPassthroughAgent("c", "from-c");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel([a, b, c] as const);
+        const result = expectComplete(await pipeline.generate(testCtx, "in"));
+        expect(result.output).toEqual(["from-a", "from-b", "from-c"]);
+      });
+    });
+
+    describe("concurrency", () => {
+      it("default concurrency is min(branches.length, 5) — 3 branches → 3 in flight", async () => {
+        let maxConcurrent = 0;
+        let current = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const slow = (id: string) => new Agent<TestCtx, any, any>({
+          id,
+          model: createMockModel("ok"),
+          prompt: async () => {
+            current++;
+            if (current > maxConcurrent) maxConcurrent = current;
+            await new Promise(r => setTimeout(r, 30));
+            current--;
+            return "go";
+          },
+        });
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: slow("a"), b: slow("b"), c: slow("c") });
+        await pipeline.generate(testCtx, "x");
+        expect(maxConcurrent).toBe(3);
+      });
+
+      it("> 5 branches without explicit concurrency caps at 5 and warn-once fires", async () => {
+        const { __resetWarnOnceForTests } = await import("../utils");
+        __resetWarnOnceForTests();
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          let maxConcurrent = 0;
+          let current = 0;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const slow = (id: string) => new Agent<TestCtx, any, any>({
+            id, model: createMockModel("ok"),
+            prompt: async () => {
+              current++;
+              if (current > maxConcurrent) maxConcurrent = current;
+              await new Promise(r => setTimeout(r, 20));
+              current--;
+              return "go";
+            },
+          });
+          const branches: Record<string, ReturnType<typeof slow>> = {};
+          for (let i = 0; i < 8; i++) branches[`b${i}`] = slow(`b${i}`);
+          const pipeline = Workflow.create<TestCtx, string>().step("init", ({ input }) => input).parallel(branches);
+          await pipeline.generate(testCtx, "x");
+          expect(maxConcurrent).toBe(5);
+          expect(warnSpy).toHaveBeenCalled();
+          expect((warnSpy.mock.calls[0][0] as string)).toMatch(/parallel\(\) with 8 branches capped at concurrency 5/);
+        } finally {
+          warnSpy.mockRestore();
+        }
+      });
+
+      it("concurrency: 1 serializes", async () => {
+        let maxConcurrent = 0;
+        let current = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const slow = (id: string) => new Agent<TestCtx, any, any>({
+          id, model: createMockModel("ok"),
+          prompt: async () => {
+            current++;
+            if (current > maxConcurrent) maxConcurrent = current;
+            await new Promise(r => setTimeout(r, 20));
+            current--;
+            return "go";
+          },
+        });
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: slow("a"), b: slow("b"), c: slow("c") }, { concurrency: 1 });
+        await pipeline.generate(testCtx, "x");
+        expect(maxConcurrent).toBe(1);
+      });
+
+      it("concurrency: Infinity allows full fan-out on >5-branch calls", async () => {
+        let maxConcurrent = 0;
+        let current = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const slow = (id: string) => new Agent<TestCtx, any, any>({
+          id, model: createMockModel("ok"),
+          prompt: async () => {
+            current++;
+            if (current > maxConcurrent) maxConcurrent = current;
+            await new Promise(r => setTimeout(r, 20));
+            current--;
+            return "go";
+          },
+        });
+        const branches: Record<string, ReturnType<typeof slow>> = {};
+        for (let i = 0; i < 7; i++) branches[`b${i}`] = slow(`b${i}`);
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel(branches, { concurrency: Infinity });
+        await pipeline.generate(testCtx, "x");
+        expect(maxConcurrent).toBe(7);
+      });
+    });
+
+    describe("onError + Workflow.SKIP", () => {
+      it("record form: onError substitutes a value", async () => {
+        const failing = createMockModel("x");
+        failing.doGenerate = async () => { throw new Error("a-fail"); };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const failAgent = new Agent<TestCtx, any, any>({ id: "fail-a", model: failing, prompt: () => "go" });
+        const okAgent = createPassthroughAgent("ok-b", "from-b");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: failAgent, b: okAgent }, {
+            onError: ({ key, error }) => {
+              if (key === "a") return "fallback-a";
+              throw error;
+            },
+          });
+        const result = expectComplete(await pipeline.generate(testCtx, "in"));
+        expect(result.output).toEqual({ a: "fallback-a", b: "from-b" });
+      });
+
+      it("record form: onError returning SKIP leaves the key undefined", async () => {
+        const failing = createMockModel("x");
+        failing.doGenerate = async () => { throw new Error("a-fail"); };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const failAgent = new Agent<TestCtx, any, any>({ id: "fail-a", model: failing, prompt: () => "go" });
+        const okAgent = createPassthroughAgent("ok-b", "from-b");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: failAgent, b: okAgent }, {
+            onError: () => Workflow.SKIP,
+          });
+        const result = expectComplete(await pipeline.generate(testCtx, "in"));
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect((result.output as any).a).toBeUndefined();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect((result.output as any).b).toBe("from-b");
+      });
+
+      it("no onError + branch throws → whole parallel fails", async () => {
+        const failing = createMockModel("x");
+        failing.doGenerate = async () => { throw new Error("branch-fail"); };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const failAgent = new Agent<TestCtx, any, any>({ id: "fail", model: failing, prompt: () => "go" });
+        const okAgent = createPassthroughAgent("ok", "from-ok");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: failAgent, b: okAgent });
+        await expect(pipeline.generate(testCtx, "x")).rejects.toThrow("branch-fail");
+      });
+
+      it("onError rethrowing → whole parallel fails", async () => {
+        const failing = createMockModel("x");
+        failing.doGenerate = async () => { throw new Error("branch-fail"); };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const failAgent = new Agent<TestCtx, any, any>({ id: "fail", model: failing, prompt: () => "go" });
+        const okAgent = createPassthroughAgent("ok", "from-ok");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: failAgent, b: okAgent }, {
+            onError: ({ error }) => { throw error; },
+          });
+        await expect(pipeline.generate(testCtx, "x")).rejects.toThrow("branch-fail");
+      });
+    });
+
+    describe("suspension under parallel (reuses NestedGateUnsupportedError)", () => {
+      it("gate inside a parallel branch throws NestedGateUnsupportedError", async () => {
+        const sub = Workflow.create<TestCtx, string>()
+          .step(createPassthroughAgent("inner", "x"))
+          .gate("inner-gate");
+        const ok = createPassthroughAgent("ok", "from-ok");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: sub, b: ok });
+        await expect(pipeline.generate(testCtx, "x")).rejects.toThrow(NestedGateUnsupportedError);
+      });
+
+      it("multi-branch suspension: lowest-index marker wins; others in siblingSuspensions", async () => {
+        const sub = (gateId: string) => Workflow.create<TestCtx, string>()
+          .step(createPassthroughAgent(`inner-${gateId}`, "x"))
+          .gate(gateId);
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel([sub("g1"), sub("g2"), sub("g3")] as const, { concurrency: 3 });
+        try {
+          await pipeline.generate(testCtx, "x");
+        } catch (e) {
+          expect(e).toBeInstanceOf(NestedGateUnsupportedError);
+          const err = e as NestedGateUnsupportedError;
+          expect(err.gateId).toBe("g1");   // lowest index wins
+          expect(err.siblingSuspensions.map(s => s.gateId).sort()).toEqual(["g2", "g3"]);
+        }
+      });
+    });
+
+    describe("per-branch warnings merge", () => {
+      it("inner warnings merged into parent under namespace `${id}[key]:<inner-stepId>`", async () => {
+        const sub = Workflow.create<TestCtx, string>()
+          .step(createPassthroughAgent("inner-step", "x"))
+          .gate("inner-g")
+          .finally("inner-fin", () => { throw new Error("inner-fin-fail"); });
+        const ok = createPassthroughAgent("ok", "from-ok");
+        const pipeline = Workflow.create<TestCtx, string>()
+          .step("init", ({ input }) => input)
+          .parallel({ a: sub, b: ok }, { id: "para" })
+          .catch("rec", () => ({ a: "recovered", b: "recovered" }) as never);
+        const result = expectComplete(await pipeline.generate(testCtx, "x"));
+        const ids = result.warnings.map(w => w.stepId);
+        expect(ids).toContain("para[a]:inner-fin");
+      });
+    });
+  });
 });
