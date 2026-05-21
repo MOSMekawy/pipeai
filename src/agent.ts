@@ -257,14 +257,21 @@ export class Agent<
         if (writer) {
           const result = await this.streamWithOptions(ctx, toolInput, { abortSignal });
           writer.merge(result.toUIMessageStream());
-          // Always drain the structured-output / text side before returning.
-          // `writer.merge` consumes the UI-message side asynchronously, but
-          // does NOT settle `result.output` / `result.text`. If `mapOutput` is
-          // provided and doesn't await those, the underlying `StreamTextResult`
-          // stays anchored by a pending promise — a per-tool-invocation leak.
-          const drained = await extractOutput(result, this.hasOutput, this.validateOutput);
-          if (options?.mapOutput) return options.mapOutput(result);
-          return drained;
+          // Drain the text side to release the StreamTextResult anchor — the
+          // writer.merge above only consumes the UI-message side, leaving
+          // `result.text` pending until awaited.
+          //
+          // When mapOutput is provided, we explicitly do NOT call extractOutput
+          // here: extractOutput throws if `hasOutput` is true but the model
+          // returned no structured value, which would block any mapOutput that
+          // wanted to recover from missing/malformed structured output by
+          // reading `result.text`. mapOutput becomes the user's chance to do
+          // their own extraction.
+          if (options?.mapOutput) {
+            await result.text;
+            return options.mapOutput(result);
+          }
+          return extractOutput(result, this.hasOutput, this.validateOutput);
         }
         const result = await this.generateWithOptions(ctx, toolInput, { abortSignal });
         if (options?.mapOutput) return options.mapOutput(result);
@@ -288,10 +295,20 @@ export class Agent<
     try {
       await this.config.onError({ error, ctx, input, writer: getActiveWriter() });
     } catch (handlerError) {
-      if (handlerError instanceof Error && handlerError.cause === undefined) {
-        (handlerError as { cause?: unknown }).cause = error;
+      // Promote non-Error throws (`throw "boom"`, `throw 42`, etc.) so we
+      // can chain the original error onto a real Error and keep diagnostics
+      // intact. Re-throwing the raw non-Error value would drop the chain.
+      if (handlerError instanceof Error) {
+        if (handlerError.cause === undefined) {
+          (handlerError as { cause?: unknown }).cause = error;
+        }
+        throw handlerError;
       }
-      throw handlerError;
+      const wrapped = new Error(
+        `Agent "${this.id}": onError handler threw a non-Error value (${typeof handlerError}): ${String(handlerError)}`,
+      );
+      (wrapped as { cause?: unknown }).cause = error;
+      throw wrapped;
     }
   }
 
@@ -321,12 +338,16 @@ export class Agent<
     const resolved = await this.resolveConfig(ctx, input);
     const options = this.buildCallOptions(resolved, ctx, input);
     try {
+      // Only attach `onError` when the user supplied one. Setting it to
+      // `undefined` explicitly suppresses some SDK versions' default
+      // rethrow-on-partial-stream-error, silently swallowing stream failures.
+      const onErrorOption = this.config.onError
+        ? { onError: ({ error }: { error: unknown }) => this.invokeOnError(error, ctx, input) }
+        : {};
       return streamText({
         ...options,
         ...extra,
-        onError: this.config.onError
-          ? ({ error }: { error: unknown }) => this.invokeOnError(error, ctx, input)
-          : undefined,
+        ...onErrorOption,
       } as unknown as Parameters<typeof streamText>[0]) as StreamTextResult<ToolSet, OutputType<TOutput>>;
     } catch (error: unknown) {
       // streamText typically defers errors to the returned stream, but a
@@ -338,6 +359,12 @@ export class Agent<
   }
 
   private buildCallOptions(resolved: ResolvedAgentConfig, ctx: TContext, input: TInput): Record<string, unknown> {
+    if (resolved.messages === undefined && resolved.prompt === undefined) {
+      throw new Error(
+        `Agent "${this.id}": neither \`prompt\` nor \`messages\` was provided. ` +
+        `Configure one of them, or supply a Resolvable that returns one based on input.`,
+      );
+    }
     return {
       ...this._passthrough,
       model: resolved.model,
@@ -345,17 +372,22 @@ export class Agent<
       activeTools: resolved.activeTools,
       toolChoice: resolved.toolChoice,
       stopWhen: resolved.stopWhen,
-      ...(resolved.messages
+      ...(resolved.messages !== undefined
         ? { messages: resolved.messages }
-        : { prompt: resolved.prompt ?? "" }),
-      ...(resolved.system ? { system: resolved.system } : {}),
+        : { prompt: resolved.prompt }),
+      // Use `!== undefined` rather than truthy so an intentional empty
+      // `system: ""` survives instead of being silently dropped.
+      ...(resolved.system !== undefined ? { system: resolved.system } : {}),
       ...(this.config.output ? { output: this.config.output } : {}),
-      onStepFinish: this._onStepFinish
-        ? (event: OnStepFinishEvent) => this._onStepFinish!({ result: event, ctx, input, writer: getActiveWriter() })
-        : undefined,
-      onFinish: this._onFinish
-        ? (event: OnFinishEvent) => this._onFinish!({ result: event, ctx, input, writer: getActiveWriter() })
-        : undefined,
+      // Only attach the callback when the user supplied one. Passing
+      // `undefined` explicitly can suppress default SDK rethrow behavior in
+      // some versions.
+      ...(this._onStepFinish
+        ? { onStepFinish: (event: OnStepFinishEvent) => this._onStepFinish!({ result: event, ctx, input, writer: getActiveWriter() }) }
+        : {}),
+      ...(this._onFinish
+        ? { onFinish: (event: OnFinishEvent) => this._onFinish!({ result: event, ctx, input, writer: getActiveWriter() }) }
+        : {}),
     };
   }
 

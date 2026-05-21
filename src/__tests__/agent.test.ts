@@ -282,6 +282,116 @@ describe("Agent", () => {
       expect(merges).toHaveLength(1);
     });
 
+    it("invokeOnError wraps non-Error throws so the original error is preserved as .cause", async () => {
+      // If onError throws a non-Error (e.g. `throw "boom"`), re-throwing the
+      // raw value would drop the original model error. We promote to a real
+      // Error so .cause can carry the original.
+      const original = new Error("model failed");
+      const failingModel = createMockModel("ignored");
+      (failingModel as unknown as { doGenerate: () => Promise<never> }).doGenerate = async () => {
+        throw original;
+      };
+
+      const agent = new Agent<TestCtx, void, string>({
+        id: "a",
+        model: failingModel,
+        prompt: () => "go",
+        // non-Error throw — common footgun
+        onError: () => { throw "string boom" as unknown as Error; },
+      });
+
+      let caught: unknown;
+      try { await agent.generate(testCtx); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(Error);
+      const e = caught as Error;
+      expect(e.message).toMatch(/non-Error/);
+      expect(e.cause).toBe(original);
+    });
+
+    it("throws a clear error when neither prompt nor messages is provided", async () => {
+      // Previously the agent silently sent prompt: "" to the SDK when both
+      // prompt and messages were omitted — a silent contract violation. Now
+      // we fail loud at buildCallOptions time.
+      const agent = new Agent<TestCtx, void>({
+        id: "no-prompt",
+        model: createMockModel("never reached"),
+        // prompt and messages both omitted
+      });
+      await expect(agent.generate(testCtx)).rejects.toThrow(
+        /neither `prompt` nor `messages` was provided/,
+      );
+    });
+
+    it("preserves an intentional empty system message", async () => {
+      // Previously `system: ""` was dropped by the falsy guard. An explicit
+      // empty system message must reach the SDK (some providers / use cases
+      // rely on an empty system override of a default).
+      const model = createMockModel("ok");
+      const seenSystem: Array<unknown> = [];
+      const original = model.doGenerate;
+      model.doGenerate = async (options) => {
+        const sysMsg = options.prompt?.find((m: unknown) => (m as { role?: string }).role === "system");
+        seenSystem.push(sysMsg);
+        return original(options);
+      };
+
+      const agent = new Agent<TestCtx, void>({
+        id: "empty-system",
+        model,
+        system: "",
+        prompt: () => "hi",
+      });
+      await agent.generate(testCtx);
+
+      // The system message (with empty content) must be reachable in the
+      // SDK call — not silently omitted.
+      expect(seenSystem).toHaveLength(1);
+      expect(seenSystem[0]).toBeDefined();
+    });
+
+    it("stream-mode: mapOutput receives result even when structured output is missing", async () => {
+      // Bug: when the agent declares `output:` (hasOutput=true) but the model
+      // returns no structured value, the stream-mode asTool path called
+      // extractOutput BEFORE mapOutput. extractOutput throws on undefined
+      // structured output, so a mapOutput that wanted to recover (e.g. by
+      // reading result.text) never got the chance to run.
+      const { runWithWriter } = await import("../utils");
+      const schema = z.object({ answer: z.string() });
+      const agent = new Agent<TestCtx, { task: string }, { answer: string }>({
+        id: "sub-no-output",
+        input: z.object({ task: z.string() }),
+        // The mock model emits plain text that doesn't parse into a
+        // structured object, so result.output settles to undefined / the SDK
+        // throws while parsing.
+        output: Output.object({ schema }),
+        model: createMockModel("plain text, no JSON"),
+        prompt: (_ctx, input) => input.task,
+      });
+
+      const mapOutputCalled = vi.fn();
+      const agentTool = agent.asTool(testCtx, {
+        mapOutput: async (result) => {
+          mapOutputCalled();
+          // mapOutput's job here is to recover from missing structured output
+          // by reading the raw text. result.text is async in stream mode.
+          const t = await (result as unknown as { text: string | Promise<string> }).text;
+          return { answer: t };
+        },
+      });
+
+      const merges: unknown[] = [];
+      const fakeWriter = {
+        write: () => {},
+        merge: (s: unknown) => merges.push(s),
+      } as unknown as Parameters<typeof runWithWriter>[0];
+
+      const toolResult = await runWithWriter(fakeWriter, () =>
+        agentTool.execute!({ task: "go" }, {} as never)
+      );
+      expect(mapOutputCalled).toHaveBeenCalledOnce();
+      expect(toolResult).toEqual({ answer: "plain text, no JSON" });
+    });
+
     it("forwards abortSignal from ToolExecutionOptions to the sub-agent's generate call", async () => {
       const seenAbortSignals: Array<AbortSignal | undefined> = [];
       const model = createMockModel("ok");
