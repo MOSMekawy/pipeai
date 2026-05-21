@@ -30,6 +30,17 @@ export class WorkflowLoopError extends Error {
 
 // ── Gate / Snapshot Types ─────────────────────────────────────────────
 
+/**
+ * Snapshot of a workflow suspended at a gate.
+ *
+ * **JSON-safety contract.** The snapshot is intended to round-trip through
+ * `JSON.stringify` / `JSON.parse`. The library does not deep-clone or
+ * validate the contents of `output` or `gatePayload`. Values that aren't
+ * JSON-safe (`Date`, `Map`, `Set`, `BigInt`, functions, class instances,
+ * `undefined` in object positions) will either throw at serialize time or
+ * mutate during the round-trip — make sure your pre-gate step and your
+ * `gate.payload` callback produce plain JSON-serializable values.
+ */
 export interface WorkflowSnapshot<TPayload = unknown> {
   readonly version: 1;
   readonly resumeFromIndex: number;
@@ -124,6 +135,23 @@ interface SchemaWithParse<T = unknown> {
   parse(data: unknown): T;
 }
 
+// Wraps a user-supplied stream onError so `WorkflowSuspended` (control flow,
+// not failure) is not surfaced as an error to the UI. The `output` promise
+// still rejects with `WorkflowSuspended` so the caller can persist the
+// snapshot; only the user-facing error stream is filtered.
+function wrapStreamOnError(
+  userOnError: (error: unknown) => string,
+): (error: unknown) => string {
+  return (error: unknown) => {
+    if (error instanceof WorkflowSuspended) {
+      // Returning empty string keeps the SDK happy; the consumer never sees
+      // it because the UI message stream closes cleanly at the gate.
+      return "";
+    }
+    return userOnError(error);
+  };
+}
+
 // ── Step Node ───────────────────────────────────────────────────────
 
 type StepNode =
@@ -215,7 +243,7 @@ export class SealedWorkflow<
           throw error;
         }
       },
-      ...(options?.onError ? { onError: options.onError } : {}),
+      ...(options?.onError ? { onError: wrapStreamOnError(options.onError) } : {}),
       ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
     });
 
@@ -227,12 +255,16 @@ export class SealedWorkflow<
 
   // ── Internal: execute pipeline ────────────────────────────────
 
-  protected async execute(state: RuntimeState, startIndex: number = 0): Promise<void> {
+  protected async execute(
+    state: RuntimeState,
+    startIndex: number = 0,
+    initialError: { error: unknown; stepId: string } | null = null,
+  ): Promise<void> {
     if (this.steps.length === 0) {
       throw new Error("Workflow has no steps. Add at least one step before calling generate() or stream().");
     }
 
-    let pendingError: { error: unknown; stepId: string } | null = null;
+    let pendingError: { error: unknown; stepId: string } | null = initialError;
 
     for (let i = startIndex; i < this.steps.length; i++) {
       const node = this.steps[i];
@@ -328,12 +360,17 @@ export class SealedWorkflow<
       await workflow.execute(state);
     } catch (error) {
       if (error instanceof WorkflowSuspended) {
-        throw new Error(
+        // Preserve the original WorkflowSuspended (and its snapshot) via
+        // `.cause` so consumers who inspect the rejection can still recover
+        // the gate information for diagnostics or future support.
+        const wrapped = new Error(
           `Gates inside nested workflows are not yet supported. ` +
           `Gate "${error.snapshot.gateId}" was hit inside nested workflow "${workflow.id ?? "(anonymous)"}". ` +
           `Consider using a conditional gate with \`condition\` to skip when criteria are met, ` +
           `or restructure the workflow to use gates at the top level only.`
         );
+        (wrapped as { cause?: unknown }).cause = error;
+        throw wrapped;
       }
       throw error;
     }
@@ -480,12 +517,21 @@ export class ResumedWorkflow<
     ctx: TContext,
     ...args: TResponse extends void ? [response?: TResponse] : [response: TResponse]
   ): Promise<WorkflowResult<TOutput>> {
-    const response = this.validateResponse(args[0] as TResponse);
-    const output = this.mergeFn
-      ? await this.mergeFn({ priorOutput: this.priorOutput, response })
-      : response;
+    // Run prep (schema.parse + mergeFn) inside the workflow error pipeline so
+    // a downstream `.catch()` can observe failures here. Without this,
+    // the schema/merge throw would reject the promise raw, bypassing catch.
+    let output: unknown = this.priorOutput;
+    let initialError: { error: unknown; stepId: string } | null = null;
+    try {
+      const response = this.validateResponse(args[0] as TResponse);
+      output = this.mergeFn
+        ? await this.mergeFn({ priorOutput: this.priorOutput, response })
+        : response;
+    } catch (error) {
+      initialError = { error, stepId: "gate:resume" };
+    }
     const state: RuntimeState = { ctx, output, mode: "generate" };
-    await this.execute(state, this.startIndex);
+    await this.execute(state, this.startIndex, initialError);
     return { output: state.output as TOutput };
   }
 
@@ -495,7 +541,7 @@ export class ResumedWorkflow<
       ? [response?: TResponse, options?: WorkflowStreamOptions]
       : [response: TResponse, options?: WorkflowStreamOptions]
   ): WorkflowStreamResult<TOutput> {
-    const response = this.validateResponse(args[0] as TResponse);
+    const rawResponse = args[0] as TResponse;
     const options = args[1] as WorkflowStreamOptions | undefined;
 
     let resolveOutput: (value: TOutput) => void;
@@ -515,9 +561,19 @@ export class ResumedWorkflow<
 
     const stream = createUIMessageStream({
       execute: async ({ writer }) => {
-        const output = mergeFn
-          ? await mergeFn({ priorOutput, response })
-          : response;
+        // Run prep (schema.parse AND mergeFn) inside the workflow error
+        // pipeline so a downstream `.catch()` can observe failures here.
+        // Without this, a schema.parse throw escapes synchronously from
+        // .stream(...) and bypasses the workflow's catch nodes entirely.
+        let output: unknown = priorOutput;
+        let initialError: { error: unknown; stepId: string } | null = null;
+        try {
+          const response = this.validateResponse(rawResponse);
+          const merged = mergeFn ? await mergeFn({ priorOutput, response }) : response;
+          output = merged;
+        } catch (error) {
+          initialError = { error, stepId: "gate:resume" };
+        }
         const state: RuntimeState = {
           ctx,
           output,
@@ -526,14 +582,14 @@ export class ResumedWorkflow<
         };
 
         try {
-          await this.execute(state, this.startIndex);
+          await this.execute(state, this.startIndex, initialError);
           resolveOutput(state.output as TOutput);
         } catch (error) {
           rejectOutput!(error);
           throw error;
         }
       },
-      ...(options?.onError ? { onError: options.onError } : {}),
+      ...(options?.onError ? { onError: wrapStreamOnError(options.onError) } : {}),
       ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
     });
 
@@ -569,8 +625,9 @@ export class Workflow<
     agent: Agent<TContext, TInput, TOutput>,
     options?: StepOptions<TContext, TInput, TOutput>
   ): Workflow<TContext, TInput, TOutput> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, any>([]).step(agent, options);
+    // An empty workflow's TOutput is TInput (passthrough), and `.step` then
+    // transitions it to TOutput. No `any` needed here — the cast was a relic.
+    return new Workflow<TContext, TInput, TInput>([]).step(agent, options);
   }
 
   // ── step: agent overload ──────────────────────────────────────
@@ -619,8 +676,7 @@ export class Workflow<
           await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
         },
       };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
     }
 
     if (typeof target === "string") {
@@ -634,8 +690,7 @@ export class Workflow<
             await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
           },
         };
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+        return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
       }
 
       // Transform overload: step(id, fn)
@@ -653,8 +708,7 @@ export class Workflow<
           });
         },
       };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+      return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
     }
 
     // Agent overload: step(agent, options?)
@@ -668,8 +722,7 @@ export class Workflow<
         await this.executeAgent(state, agent, ctx, options);
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
   }
 
   // ── gate: human-in-the-loop suspension point ────────────────
@@ -709,8 +762,7 @@ export class Workflow<
         return state.output;
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TMerged, TGates & Record<Id, TResponse>>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TMerged, TGates & Record<Id, TResponse>>([...this.steps, node], this.id);
   }
 
   // ── branch: predicate routing (array) ─────────────────────────
@@ -760,8 +812,7 @@ export class Workflow<
         throw new WorkflowBranchError("predicate", `No branch matched and no default branch (a case without \`when\`) was provided. Input: ${JSON.stringify(input)}`);
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
   }
 
   private branchSelect<TKeys extends string, TNextOutput>(
@@ -775,7 +826,24 @@ export class Workflow<
         const input = state.output as TOutput;
         const key = await config.select({ ctx, input });
 
-        let agent = config.agents[key];
+        // Distinguish "key not declared at all" from "key present but value
+        // is `undefined`" (e.g. `agents: { bug: cond ? agentA : undefined }`).
+        // The latter is a user-side bug — fail loud rather than silently
+        // falling back, since the fallback obscures the misconfiguration.
+        //
+        // Use Object.hasOwn (not `in`) so untrusted classifier output like
+        // "toString" / "constructor" / "__proto__" doesn't resolve to a
+        // Object.prototype method and crash executeAgent.
+        const keyDeclared = Object.prototype.hasOwnProperty.call(config.agents, key);
+        if (keyDeclared && config.agents[key] === undefined) {
+          throw new WorkflowBranchError(
+            "select",
+            `Agent for key "${key}" was declared but the value is undefined. ` +
+            `This usually means a conditional spread set the value to undefined. ` +
+            `Available keys: ${Object.keys(config.agents).join(", ")}`,
+          );
+        }
+        let agent = keyDeclared ? config.agents[key] : undefined;
         if (!agent) {
           if (config.onUnknownKey) {
             config.onUnknownKey({
@@ -794,8 +862,7 @@ export class Workflow<
         await this.executeAgent(state, agent, ctx, config);
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput, TGates>([...this.steps, node], this.id);
   }
 
   // ── foreach: array iteration ─────────────────────────────────
@@ -835,6 +902,12 @@ export class Workflow<
     },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
     const concurrency = options?.concurrency ?? 1;
+    if (!Number.isInteger(concurrency) || concurrency < 1) {
+      throw new Error(
+        `Workflow.foreach: concurrency must be a positive finite integer (got ${concurrency}). ` +
+        `Use 1 for sequential, or a finite cap for parallelism.`,
+      );
+    }
     const onError = options?.onError;
     const isWorkflow = target instanceof SealedWorkflow;
     const id = isWorkflow ? (target.id ?? "foreach") : `foreach:${(target as Agent<TContext, ElementOf<TOutput>, TNextOutput>).id}`;
@@ -952,8 +1025,7 @@ export class Workflow<
           : results.filter((_, i) => !skipped.has(i));
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TNextOutput[], TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TNextOutput[], TGates>([...this.steps, node], this.id);
   }
 
   // ── repeat: conditional loop ─────────────────────────────────
@@ -974,7 +1046,23 @@ export class Workflow<
     target: Agent<TContext, TOutput, TOutput> | SealedWorkflow<TContext, TOutput, TOutput>,
     options: RepeatOptions<TContext, TOutput>,
   ): Workflow<TContext, TInput, TOutput, TGates> {
+    // Defensive runtime checks. TS already enforces the until-XOR-while shape,
+    // but callers using `as any` / dynamic config can still bypass it.
+    const hasUntil = typeof options.until === "function";
+    const hasWhile = typeof options.while === "function";
+    if (hasUntil === hasWhile) {
+      throw new Error(
+        `Workflow.repeat: exactly one of \`until\` or \`while\` must be provided ` +
+        `(got ${hasUntil && hasWhile ? "both" : "neither"}).`,
+      );
+    }
     const maxIterations = options.maxIterations ?? 10;
+    if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+      throw new Error(
+        `Workflow.repeat: maxIterations must be a positive finite integer (got ${maxIterations}). ` +
+        `The body always runs at least once (do-while semantics).`,
+      );
+    }
     const isWorkflow = target instanceof SealedWorkflow;
     const id = isWorkflow ? (target.id ?? "repeat") : `repeat:${(target as Agent<TContext, TOutput, TOutput>).id}`;
     const predicate: LoopPredicate<TContext, TOutput> = options.until
@@ -1004,8 +1092,7 @@ export class Workflow<
         throw new WorkflowLoopError(maxIterations, maxIterations);
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node], this.id);
   }
 
   // ── catch ─────────────────────────────────────────────────────
@@ -1014,16 +1101,20 @@ export class Workflow<
     id: string,
     fn: (params: { error: unknown; ctx: Readonly<TContext>; lastOutput: TOutput; stepId: string }) => MaybePromise<TOutput>
   ): Workflow<TContext, TInput, TOutput, TGates> {
-    if (!this.steps.some(s => s.type === "step")) {
-      throw new Error(`Workflow: catch("${id}") requires at least one preceding step.`);
+    // Anything that can throw (step OR gate) makes catch meaningful. Gates can
+    // throw from `condition`/`payload`/`merge` callbacks which the runtime
+    // routes into the catch pipeline (see SealedWorkflow.execute gate branch).
+    if (!this.steps.some(s => s.type === "step" || s.type === "gate")) {
+      throw new Error(
+        `Workflow: catch("${id}") requires at least one preceding step or gate.`,
+      );
     }
     const node: StepNode = {
       type: "catch",
       id,
       catchFn: fn as (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown>,
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id);
+    return new Workflow<TContext, TInput, TOutput, TGates>([...this.steps, node], this.id);
   }
 
   // ── finally (terminal — returns sealed workflow) ──────────────
@@ -1039,8 +1130,7 @@ export class Workflow<
         await fn({ ctx: state.ctx as Readonly<TContext> });
       },
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new SealedWorkflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id);
+    return new SealedWorkflow<TContext, TInput, TOutput, TGates>([...this.steps, node], this.id);
   }
 }
 

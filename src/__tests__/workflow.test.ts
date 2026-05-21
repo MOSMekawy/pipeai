@@ -188,6 +188,26 @@ describe("Workflow", () => {
       );
     });
 
+    it("throws a clear error when a declared agent key has an undefined value", async () => {
+      // Conditional spreads (e.g. `bug: enabled ? agentA : undefined`) leave
+      // the key declared but with an undefined value. The select branch should
+      // fail loud rather than silently falling back — the fallback obscures
+      // the misconfiguration.
+      const pipeline = Workflow.create<TestCtx>()
+        .step("emit-key", () => ({ agent: "bug" as const }))
+        .branch({
+          select: ({ input }) => input.agent,
+          agents: {
+            // Key is declared but value is undefined (the bug case).
+            bug: undefined as unknown as Agent<TestCtx, { agent: "bug" }, string>,
+          },
+        });
+
+      await expect(pipeline.generate(testCtx)).rejects.toThrow(
+        /declared but the value is undefined/,
+      );
+    });
+
     it("invokes onUnknownKey when select returns a typo'd key", async () => {
       const onUnknownKey = vi.fn();
       const pipeline = Workflow.create<TestCtx>()
@@ -202,6 +222,30 @@ describe("Workflow", () => {
       await pipeline.generate(testCtx);
       expect(onUnknownKey).toHaveBeenCalledWith(
         expect.objectContaining({ key: "typo", availableKeys: ["bug"] }),
+      );
+    });
+
+    it("treats Object.prototype keys (toString, constructor, ...) as unknown, not as a matched agent", async () => {
+      // Untrusted classifier output can return strings that happen to match
+      // `Object.prototype` properties. Without an own-property check, `"toString" in agents`
+      // would be true and `agents["toString"]` would resolve to the inherited
+      // function — falling into executeAgent with a Function as the "agent"
+      // and crashing with an opaque "agent.generate is not a function".
+      const onUnknownKey = vi.fn();
+      const fallbackAgent = createPassthroughAgent("fb", "fb response");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "x"))
+        .branch({
+          select: () => "toString" as "bug",
+          agents: { bug: createPassthroughAgent("bug", "bug response") },
+          fallback: fallbackAgent,
+          onUnknownKey,
+        });
+
+      const { output } = await pipeline.generate(testCtx);
+      expect(output).toBe("fb response");
+      expect(onUnknownKey).toHaveBeenCalledWith(
+        expect.objectContaining({ key: "toString", availableKeys: ["bug"] }),
       );
     });
 
@@ -245,6 +289,23 @@ describe("Workflow", () => {
           return _check.user;
         });
       expect(true).toBe(true);
+    });
+
+    it("foreach() is uncallable when the previous output isn't an array", () => {
+      // Concrete-input agent — input is not `void` or `never`, so the
+      // contravariance escape hatch doesn't apply. README promises this is
+      // "rejected at compile time".
+      const numAgent: Agent<TestCtx, number, string> = new Agent<TestCtx, number, string>({
+        id: "n",
+        model: createMockModel("ok"),
+        prompt: (_ctx, n) => String(n),
+      });
+      const _pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a", "ok")); // TOutput = string, NOT an array
+
+      // @ts-expect-error — foreach should be uncallable when TOutput = string
+      _pipeline.foreach(numAgent);
+      expect(typeof _pipeline).toBe("object");
     });
   });
 
@@ -681,24 +742,20 @@ describe("Workflow", () => {
         }
         expect(snapshot).not.toBeNull();
 
-        // Resume in stream mode with a wrong-shape payload. The gate's schema
-        // is parsed synchronously inside `.stream(...)`, so the rejection
-        // surfaces as a thrown ZodError from the call itself (not as an
-        // `output` rejection). Either path proves the schema runs in stream
-        // mode — we accept both.
+        // Resume in stream mode with a wrong-shape payload. Schema parse now
+        // runs inside the workflow's error pipeline, so the rejection arrives
+        // through the `output` promise (matching generate-mode behavior).
+        // `.stream(...)` itself does not throw — that would bypass any
+        // downstream `.catch()`.
         const resumed = pipeline.loadState("review", snapshot!);
+        const { stream, output } = resumed.stream(
+          testCtx,
+          { wrongShape: true } as never,
+        );
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) { /* drain */ }
         let validationError: unknown;
-        try {
-          const { stream, output } = resumed.stream(
-            testCtx,
-            { wrongShape: true } as never,
-          );
-          const reader = stream.getReader();
-          while (!(await reader.read()).done) { /* drain */ }
-          await output;
-        } catch (e) {
-          validationError = e;
-        }
+        try { await output; } catch (e) { validationError = e; }
         expect(validationError).toBeDefined();
         expect(String(validationError)).toMatch(/expected boolean|invalid_type/i);
       });
@@ -2382,6 +2439,240 @@ describe("Workflow", () => {
       await output;
 
       expect(ctxSpy).toHaveBeenCalledWith(testCtx);
+    });
+  });
+
+  describe("validation guards", () => {
+    describe("foreach concurrency", () => {
+      it.each([0, -1, 1.5, NaN, Infinity, -Infinity])(
+        "rejects concurrency=%s at definition time",
+        (concurrency) => {
+          const agent = createPassthroughAgent("a", "ok");
+          expect(() =>
+            Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency })
+          ).toThrow(/concurrency/);
+        }
+      );
+
+      it("accepts concurrency=1 (sequential)", () => {
+        const agent = createPassthroughAgent("a", "ok");
+        expect(() =>
+          Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: 1 })
+        ).not.toThrow();
+      });
+
+      it("accepts large finite concurrency", () => {
+        const agent = createPassthroughAgent("a", "ok");
+        expect(() =>
+          Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: 1000 })
+        ).not.toThrow();
+      });
+    });
+
+    describe("repeat maxIterations", () => {
+      it.each([0, -1, 1.5, NaN, Infinity, -Infinity])(
+        "rejects maxIterations=%s at definition time",
+        (maxIterations) => {
+          const agent = createPassthroughAgent("a", "ok");
+          expect(() =>
+            Workflow.create<TestCtx, string>().step(agent).repeat(agent, {
+              until: () => true,
+              maxIterations,
+            })
+          ).toThrow(/maxIterations/);
+        }
+      );
+    });
+
+    describe("repeat until/while XOR", () => {
+      it("rejects both until and while at definition time", () => {
+        const agent = createPassthroughAgent("a", "ok");
+        // Bypass compile-time XOR to test runtime guard.
+        expect(() =>
+          Workflow.create<TestCtx, string>().step(agent).repeat(agent, {
+            until: () => true,
+            while: () => true,
+          } as never)
+        ).toThrow(/until.*while|while.*until/i);
+      });
+
+      it("rejects neither until nor while at definition time", () => {
+        const agent = createPassthroughAgent("a", "ok");
+        expect(() =>
+          Workflow.create<TestCtx, string>().step(agent).repeat(agent, {} as never)
+        ).toThrow(/until.*while|while.*until/i);
+      });
+    });
+
+    describe("catch after gate-only workflow", () => {
+      it("allows catch when only a gate precedes it", () => {
+        // A workflow with only a gate can still throw from `condition`/`payload`/`merge`,
+        // so a downstream catch is meaningful — the build guard should not reject it.
+        expect(() =>
+          Workflow.create<TestCtx>()
+            .gate("g")
+            .catch("recovery", () => undefined as unknown as void)
+        ).not.toThrow();
+      });
+    });
+  });
+
+  describe("error propagation", () => {
+    it("captures errors thrown by gate.merge into the workflow's catch pipeline", async () => {
+      const draft = createTextAgent("draft", "first draft");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(draft)
+        .gate("review", {
+          merge: (): string => { throw new Error("merge boom"); },
+        })
+        .catch("recovery", ({ error }) => `recovered:${(error as Error).message}`);
+
+      let snapshot: WorkflowSnapshot | undefined;
+      try { await pipeline.generate(testCtx); }
+      catch (e) {
+        if (e instanceof WorkflowSuspended) snapshot = e.snapshot;
+        else throw e;
+      }
+      expect(snapshot).toBeDefined();
+
+      const resumed = pipeline.loadState("review", snapshot!);
+      const { output } = await resumed.generate(testCtx, "approve");
+      expect(output).toBe("recovered:merge boom");
+    });
+
+    it("captures errors thrown by gate.schema parse into the workflow's catch pipeline", async () => {
+      const draft = createTextAgent("draft", "first draft");
+      const schema = {
+        parse: (value: unknown): string => {
+          if (typeof value !== "number") throw new Error("schema-rejected");
+          return String(value);
+        },
+      };
+      const pipeline = Workflow.create<TestCtx>()
+        .step(draft)
+        .gate("review", { schema })
+        .catch("recovery", ({ error }) => `recovered:${(error as Error).message}`);
+
+      let snapshot: WorkflowSnapshot | undefined;
+      try { await pipeline.generate(testCtx); }
+      catch (e) {
+        if (e instanceof WorkflowSuspended) snapshot = e.snapshot;
+        else throw e;
+      }
+      expect(snapshot).toBeDefined();
+
+      // Pass a value that the schema rejects. The thrown parse error should
+      // be routed to the workflow's catch rather than rejecting the promise raw.
+      const resumed = pipeline.loadState("review", snapshot!);
+      const { output } = await resumed.generate(testCtx, "not-a-number" as unknown as string);
+      expect(output).toBe("recovered:schema-rejected");
+    });
+
+    it("stream-mode: captures gate.schema parse errors into the workflow's catch pipeline", async () => {
+      // Stream-mode parity with the generate-mode catch test above.
+      // Previously `validateResponse` ran synchronously inside `.stream(...)`
+      // before the stream-internal try/catch, so a schema rejection on resume
+      // surfaced as a sync throw and bypassed any downstream `.catch()`.
+      const draft = createTextAgent("draft", "first draft");
+      const schema = {
+        parse: (value: unknown): string => {
+          if (typeof value !== "number") throw new Error("schema-rejected");
+          return String(value);
+        },
+      };
+      const pipeline = Workflow.create<TestCtx>()
+        .step(draft)
+        .gate("review", { schema })
+        .catch("recovery", ({ error }) => `recovered:${(error as Error).message}`);
+
+      let snapshot: WorkflowSnapshot | undefined;
+      try { await pipeline.generate(testCtx); }
+      catch (e) {
+        if (e instanceof WorkflowSuspended) snapshot = e.snapshot;
+        else throw e;
+      }
+      expect(snapshot).toBeDefined();
+
+      const resumed = pipeline.loadState("review", snapshot!);
+      // .stream() must NOT throw synchronously — the rejection has to flow
+      // through the catch pipeline and surface as a resolved output.
+      const { stream, output } = resumed.stream(
+        testCtx,
+        "not-a-number" as unknown as string,
+      );
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expect(await output).toBe("recovered:schema-rejected");
+    });
+
+    it("Agent.onError throwing preserves the original error via .cause", async () => {
+      const original = new Error("model failed");
+      const failingModel = createMockModel("ignored");
+      // Override doGenerate to throw the original error.
+      (failingModel as unknown as { doGenerate: () => Promise<never> }).doGenerate = async () => {
+        throw original;
+      };
+
+      const agent = new Agent<TestCtx, void, string>({
+        id: "a",
+        model: failingModel,
+        prompt: () => "go",
+        onError: async () => { throw new Error("onError boom"); },
+      });
+
+      let caught: unknown = null;
+      try { await agent.generate(testCtx); }
+      catch (e) { caught = e; }
+
+      // The caller should ultimately see the original model error (or have it
+      // chained via .cause). Either way, the model error must not be lost.
+      expect(caught).toBeDefined();
+      const found =
+        caught === original ||
+        (caught instanceof Error && caught.cause === original) ||
+        (caught instanceof Error && caught.message.includes("model failed"));
+      expect(found).toBe(true);
+    });
+
+    it("executeNestedWorkflow preserves WorkflowSuspended via .cause when rewrapping", async () => {
+      const draft = createTextAgent("draft", "first draft");
+      // Nested workflow whose input matches the outer's TInput (void).
+      const inner = Workflow.create<TestCtx>()
+        .step(draft)
+        .gate("inner-gate");
+
+      const outer = Workflow.create<TestCtx>().step(inner);
+
+      let caught: unknown = null;
+      try { await outer.generate(testCtx); }
+      catch (e) { caught = e; }
+
+      expect(caught).toBeInstanceOf(Error);
+      // The error should still point at the inner WorkflowSuspended via .cause
+      // so the snapshot isn't lost.
+      const cause = (caught as Error).cause;
+      expect(cause).toBeInstanceOf(WorkflowSuspended);
+    });
+
+    it("stream() does NOT invoke user onError on gate suspension", async () => {
+      const draft = createTextAgent("draft", "first draft");
+      const pipeline = Workflow.create<TestCtx>()
+        .step(draft)
+        .gate("review");
+
+      const onError = vi.fn((_: unknown) => "user-error-msg");
+      const { stream, output } = pipeline.stream(testCtx, undefined, { onError });
+
+      // Drain the stream.
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+
+      // The output promise should reject with WorkflowSuspended.
+      await expect(output).rejects.toBeInstanceOf(WorkflowSuspended);
+
+      // But the user's onError should NOT have seen the suspension —
+      // suspension is control flow, not an error.
+      expect(onError).not.toHaveBeenCalled();
     });
   });
 });
