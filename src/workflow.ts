@@ -105,6 +105,18 @@ export interface RunOptions {
    * literal opt-in is reserved for F1's catastrophic-combo escape hatch.
    */
   readonly freezeSnapshots?: boolean | "iAcceptThePerformanceCost";
+  /**
+   * Cooperative cancellation signal. Checked at every step boundary inside
+   * `execute()` and forwarded to agent calls in `executeAgent`, foreach
+   * workers, and nested workflows. When the signal aborts, the workflow
+   * tears down to `signal.reason` via the same pending-error path as any
+   * other step failure, so `.catch()` handlers still get a chance to
+   * observe (or recover from) the abort. `.finally()` bodies still run
+   * on the abort path. Unlike `freezeSnapshots`, this option DOES
+   * propagate into nested workflows, foreach items, and repeat loops —
+   * cancellation should be transitive.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 function resolveFreezeSnapshots(state: RuntimeState): boolean {
@@ -215,6 +227,10 @@ interface RuntimeState {
   // and omitted from foreach itemState so per-run config doesn't leak into nested
   // execution.
   runOptions?: RunOptions;
+  // Cooperative cancellation. Held on state separately from runOptions because
+  // unlike freezeSnapshots, abortSignal SHOULD propagate into nested workflows
+  // and foreach items — cancellation must be transitive.
+  abortSignal?: AbortSignal;
   // F3 plumbing — set true on gate suspension so observability emit can fire
   // onStepFinish({suspended:true}) on the next pass. Unused in F0 but allocated.
   observabilityEmitGate?: boolean;
@@ -337,6 +353,7 @@ export class SealedWorkflow<
       output: input,
       mode: "generate",
       runOptions: opts,
+      abortSignal: opts?.abortSignal,
     };
 
     await this.execute(state, 0, opts);
@@ -354,6 +371,7 @@ export class SealedWorkflow<
     const input = args[0];
     const options = args[1] as WorkflowStreamOptions | undefined;
     const opts = args[2] as RunOptions | undefined;
+    const abortSignal = opts?.abortSignal;
 
     let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
     let rejectOutput!: (error: unknown) => void;
@@ -373,6 +391,7 @@ export class SealedWorkflow<
           mode: "stream",
           writer,
           runOptions: opts,
+          abortSignal,
         };
 
         try {
@@ -436,7 +455,44 @@ export class SealedWorkflow<
     // failure instead of escaping synchronously.
     let pendingError: PendingError | null = initialError;
 
+    // Tracks whether the abort signal has already been promoted into
+    // pendingError in this execute() pass. On first observation we discard
+    // any in-progress suspension (caller asked to stop) and preserve any
+    // prior step error as a warning. Subsequent iterations only re-promote
+    // if a downstream catch cleared pendingError — the platform semantics
+    // of AbortSignal.aborted (sticky once true) say the workflow shouldn't
+    // resume mid-pipeline just because a catch swallowed one observation.
+    let abortPromoted = false;
+    const makeAbortError = (signal: AbortSignal): PendingError => ({
+      error: signal.reason ?? new Error("Workflow aborted"),
+      stepId: "abort",
+      source: "step",
+    });
+
     for (let i = startIndex; i < this.steps.length; i++) {
+      // Abort checkpoint — runs at every iteration boundary, before any
+      // node dispatch, so finally/catch nodes that come AFTER the abort
+      // still get to run (cleanup + recovery contract).
+      if (state.abortSignal?.aborted) {
+        if (!abortPromoted) {
+          abortPromoted = true;
+          state.suspension = undefined;
+          if (pendingError) {
+            (state.warnings ??= []).push({
+              source: pendingError.source,
+              stepId: pendingError.stepId,
+              error: pendingError.error,
+            });
+          }
+          pendingError = makeAbortError(state.abortSignal);
+        } else if (!pendingError) {
+          // A catch handler swallowed the abort. Re-promote so downstream
+          // steps still see the signal as the "stop" condition the caller
+          // requested.
+          pendingError = makeAbortError(state.abortSignal);
+        }
+      }
+
       const node = this.steps[i];
 
       if (node.type === "finally") {
@@ -638,11 +694,17 @@ export class SealedWorkflow<
     const input = state.output as TAgentInput;
     const hasStructuredOutput = agent.hasOutput;
 
+    const abortSignal = state.abortSignal;
+    const agentCallOpts = abortSignal ? { abortSignal } : undefined;
+
     if (state.mode === "stream" && state.writer) {
       const writer = state.writer;
       // Run inside writer context so tools (asTool, defineTool) can access the writer automatically
       await runWithWriter(writer, async () => {
-        const result = await (agent.stream as (ctx: TContext, input: unknown) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output);
+        // Forward the workflow's abortSignal to the SDK so an in-flight model
+        // call cancels when the workflow is aborted, instead of running to
+        // completion and only being short-circuited at the next step boundary.
+        const result = await (agent.stream as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
 
         if (options?.handleStream) {
           await options.handleStream({ result, writer, ctx });
@@ -661,7 +723,7 @@ export class SealedWorkflow<
         }
       });
     } else {
-      const result = await (agent.generate as (ctx: TContext, input: unknown) => Promise<GenerateTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output);
+      const result = await (agent.generate as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<GenerateTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
 
       if (options?.onGenerateResult) {
         await options.onGenerateResult({ result, ctx, input });
@@ -670,7 +732,7 @@ export class SealedWorkflow<
       if (options?.mapGenerateResult) {
         state.output = await options.mapGenerateResult({ result, ctx, input });
       } else {
-        state.output = await extractOutput(result, hasStructuredOutput);
+        state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
       }
     }
   }
@@ -811,7 +873,13 @@ export class ResumedWorkflow<
     } catch (error) {
       initialError = { error, stepId: "gate:resume", source: "step" };
     }
-    const state: RuntimeState = { ctx, output, mode: "generate", runOptions: opts };
+    const state: RuntimeState = {
+      ctx,
+      output,
+      mode: "generate",
+      runOptions: opts,
+      abortSignal: opts?.abortSignal,
+    };
     await this.execute(state, this.startIndex, opts, initialError);
     return this.buildResult(state);
   }
@@ -825,6 +893,7 @@ export class ResumedWorkflow<
     const rawResponse = args[0] as TResponse;
     const options = args[1] as WorkflowStreamOptions | undefined;
     const opts = args[2] as RunOptions | undefined;
+    const abortSignal = opts?.abortSignal;
 
     let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
     let rejectOutput!: (error: unknown) => void;
@@ -859,6 +928,7 @@ export class ResumedWorkflow<
           mode: "stream",
           writer,
           runOptions: opts,
+          abortSignal,
         };
 
         try {
@@ -1205,8 +1275,14 @@ export class Workflow<
 
         const executeItem = async (item: unknown, index: number) => {
           // itemState explicitly omits runOptions — per-run config never crosses
-          // the foreach boundary.
-          const itemState: RuntimeState = { ctx: state.ctx, output: item, mode: "generate" };
+          // the foreach boundary. abortSignal IS propagated though, since
+          // cancellation must be transitive across the foreach barrier.
+          const itemState: RuntimeState = {
+            ctx: state.ctx,
+            output: item,
+            mode: "generate",
+            abortSignal: state.abortSignal,
+          };
           itemStates[index] = itemState;
           if (isWorkflow) {
             await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
@@ -1251,8 +1327,21 @@ export class Workflow<
         type Failure = { index: number; error: unknown };
         const failures: Failure[] = [];
 
+        // Cooperative cancellation: bail before launching each item so a
+        // large foreach doesn't fire off all items just because the parent's
+        // abortSignal didn't trigger until iteration 5. In-flight items
+        // already running can't be yanked back, but their executeAgent call
+        // forwarded the signal so the SDK side will tear them down.
+        const aborted = () => state.abortSignal?.aborted === true;
+        const abortReason = (): unknown =>
+          state.abortSignal?.reason ?? new Error("Workflow aborted");
+
         if (concurrency <= 1) {
           for (let i = 0; i < items.length; i++) {
+            if (aborted()) {
+              failures.push({ index: i, error: abortReason() });
+              continue;
+            }
             try {
               await executeItem(items[i], i);
             } catch (error) {
@@ -1264,6 +1353,10 @@ export class Workflow<
           await Promise.all(items.map(async (item, i) => {
             await sem.acquire();
             try {
+              if (aborted()) {
+                failures.push({ index: i, error: abortReason() });
+                return;
+              }
               await executeItem(item, i);
             } catch (error) {
               failures.push({ index: i, error });
@@ -1349,6 +1442,14 @@ export class Workflow<
         const ctx = state.ctx as TContext;
 
         for (let i = 1; i <= maxIterations; i++) {
+          // Cancellation checkpoint between iterations. The body's executeAgent
+          // already forwards the signal so an in-flight call cancels too, but
+          // the explicit check here covers SealedWorkflow bodies and transform-
+          // only loops where the signal wouldn't otherwise propagate.
+          if (state.abortSignal?.aborted) {
+            throw state.abortSignal.reason ?? new Error("Workflow aborted");
+          }
+
           if (isWorkflow) {
             await this.executeNestedWorkflow(state, target as SealedWorkflow<TContext, unknown, unknown, any>);
           } else {

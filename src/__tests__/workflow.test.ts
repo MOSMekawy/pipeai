@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
 import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type WorkflowObservability } from "../workflow";
-import { createMockModel, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
+import { createMockModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
 function createTextAgent(id: string, text: string): Agent<TestCtx, void, string> {
@@ -2469,6 +2469,231 @@ describe("Workflow", () => {
         expect(result.status).toBe("complete");
         expect(catchSpy).toHaveBeenCalledOnce();
       });
+    });
+  });
+
+  describe("abortSignal", () => {
+    it("rejects immediately when signal is already aborted on entry", async () => {
+      const controller = new AbortController();
+      controller.abort(new Error("aborted-before-start"));
+
+      const ranSpy = vi.fn();
+      const pipeline = Workflow.create<TestCtx>()
+        .step("touched", () => { ranSpy(); return "done"; });
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/aborted-before-start/);
+      expect(ranSpy).not.toHaveBeenCalled();
+    });
+
+    it("aborts mid-pipeline: subsequent steps do not run", async () => {
+      const controller = new AbortController();
+      const barrier = defer<void>();
+      const lateSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("first", async () => {
+          // Abort while this step is awaiting.
+          queueMicrotask(() => controller.abort(new Error("mid-flight")));
+          await barrier.promise;
+          return "first-out";
+        })
+        .step("second", () => { lateSpy(); return "second-out"; });
+
+      const run = pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
+      // Let the abort fire while step 1 is parked.
+      await new Promise((r) => setTimeout(r, 5));
+      barrier.resolve();
+
+      await expect(run).rejects.toThrow(/mid-flight/);
+      expect(lateSpy).not.toHaveBeenCalled();
+    });
+
+    it("forwards abortSignal to agent.generate calls", async () => {
+      // Mock model captures the signal the SDK sees, proving the workflow
+      // threaded it through executeAgent → agent.generate → SDK.
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const model = createMockModel("ok");
+      const originalDoGenerate = model.doGenerate;
+      model.doGenerate = async (options) => {
+        seenSignals.push(options.abortSignal);
+        return originalDoGenerate(options);
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const agent = new Agent<TestCtx, any, any>({
+        id: "signal-agent",
+        model,
+        prompt: () => "go",
+      });
+      const pipeline = Workflow.create<TestCtx>().step(agent);
+
+      const controller = new AbortController();
+      await pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
+
+      expect(seenSignals).toHaveLength(1);
+      expect(seenSignals[0]).toBe(controller.signal);
+    });
+
+    it(".catch() can recover from an abort error", async () => {
+      // Abort flows through pendingError like any other failure, so a
+      // downstream `.catch()` sees it. Recovery is permitted.
+      const controller = new AbortController();
+      const barrier = defer<void>();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("first", async () => {
+          queueMicrotask(() => controller.abort(new Error("kill")));
+          await barrier.promise;
+          return "ok";
+        })
+        .catch("recover", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const run = pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
+      await new Promise((r) => setTimeout(r, 5));
+      barrier.resolve();
+
+      const { output } = expectComplete(await run);
+      expect(output).toBe("recovered:kill");
+    });
+
+    it(".finally() bodies still run on the abort path", async () => {
+      // Cleanup contract: finally bodies always run on completion or failure,
+      // including aborts.
+      const finallySpy = vi.fn();
+      const controller = new AbortController();
+      controller.abort(new Error("kill"));
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("first", () => "x")
+        .finally("cleanup", () => { finallySpy(); });
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/kill/);
+      expect(finallySpy).toHaveBeenCalledOnce();
+    });
+
+    it("foreach stops launching new items after abort", async () => {
+      const controller = new AbortController();
+      const launchedIndices: number[] = [];
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const itemAgent = new Agent<TestCtx, any, any>({
+        id: "item",
+        model: createMockModel("ok"),
+        prompt: (_ctx, idx: number) => {
+          launchedIndices.push(idx);
+          // Abort after first item processed.
+          if (idx === 0) controller.abort(new Error("foreach-abort"));
+          return String(idx);
+        },
+      });
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => [0, 1, 2, 3, 4] as number[])
+        .foreach(itemAgent);
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/foreach-abort/);
+      // At minimum: first item ran, last items didn't.
+      expect(launchedIndices).toContain(0);
+      expect(launchedIndices.length).toBeLessThan(5);
+    });
+
+    it("repeat exits between iterations when aborted", async () => {
+      const controller = new AbortController();
+      let iters = 0;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body = new Agent<TestCtx, any, any>({
+        id: "body",
+        model: createMockModel("ok"),
+        prompt: () => {
+          iters++;
+          if (iters === 2) controller.abort(new Error("loop-abort"));
+          return "x";
+        },
+      });
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(body, { id: "seed" })
+        .repeat(body, { until: ({ iterations }) => iterations >= 10, maxIterations: 20 });
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/loop-abort/);
+      // Loop exited well before maxIterations.
+      expect(iters).toBeLessThan(20);
+    });
+
+    it("nested workflow honors the outer abortSignal", async () => {
+      const controller = new AbortController();
+      const innerLateSpy = vi.fn();
+
+      const inner = Workflow.create<TestCtx>()
+        .step("inner-1", async () => {
+          queueMicrotask(() => controller.abort(new Error("inner-abort")));
+          await new Promise((r) => setTimeout(r, 5));
+          return "x";
+        })
+        .step("inner-2", () => { innerLateSpy(); return "y"; });
+
+      const pipeline = Workflow.create<TestCtx>().step(inner);
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/inner-abort/);
+      expect(innerLateSpy).not.toHaveBeenCalled();
+    });
+
+    it("stream-mode: output Promise rejects with abort reason", async () => {
+      const controller = new AbortController();
+      const barrier = defer<void>();
+      const lateSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("first", async () => {
+          queueMicrotask(() => controller.abort(new Error("stream-abort")));
+          await barrier.promise;
+          return "ok";
+        })
+        .step("second", () => { lateSpy(); return "done"; });
+
+      const { output, stream } = pipeline.stream(testCtx, undefined, undefined, {
+        abortSignal: controller.signal,
+      });
+      const reader = stream.getReader();
+      // Drain whatever the writer produced (likely nothing in this synthetic flow).
+      const drain = (async () => { while (!(await reader.read()).done) { /* drain */ } })();
+      await new Promise((r) => setTimeout(r, 5));
+      barrier.resolve();
+      await drain;
+
+      await expect(output).rejects.toThrow(/stream-abort/);
+      expect(lateSpy).not.toHaveBeenCalled();
+    });
+
+    it("ResumedWorkflow.generate honors abortSignal", async () => {
+      const controller = new AbortController();
+      const lateSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("seed", () => "draft")
+        .gate("review")
+        .step("after-resume", () => { lateSpy(); return "done"; });
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+
+      const resumed = pipeline.loadState("review", snapshot);
+      controller.abort(new Error("resume-abort"));
+
+      await expect(
+        resumed.generate(testCtx, "response", { abortSignal: controller.signal })
+      ).rejects.toThrow(/resume-abort/);
+      expect(lateSpy).not.toHaveBeenCalled();
     });
   });
 });

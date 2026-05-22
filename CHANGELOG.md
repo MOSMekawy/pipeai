@@ -17,6 +17,7 @@ Combines the [fix/review-findings] correctness/ergonomics work with the [F0] sus
 
 ### Added
 
+- **`RunOptions.abortSignal?: AbortSignal`** — cooperative cancellation for `Workflow.generate` / `.stream` and `ResumedWorkflow.generate` / `.stream`. Checked at every step boundary inside `execute()`, forwarded to `Agent.generate` / `.stream` calls in `executeAgent`, propagated transitively into nested workflows and foreach items (unlike `freezeSnapshots`, which is run-scoped). `.finally()` bodies still run on the abort path; `.catch()` can observe the abort error via `state.abortSignal.reason`. The signal is sticky — a catch that swallows it gets re-aborted at the next step boundary.
 - **`AgentConfig.validateOutput?: ZodType<TOutput>`** — optional Zod schema for runtime validation of the model's structured output. Distinct from `tool.outputSchema`.
 - **`Agent.generate(ctx, input, options?)` and `Agent.stream(...)` accept `{ abortSignal }`** as an optional second arg.
 - **`Agent.asTool` / `asToolProvider` forward `ToolExecutionOptions.abortSignal`** from the parent SDK loop to the sub-agent.
