@@ -4,7 +4,7 @@ import {
   type ToolSet,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
-import { deepFreeze, extractOutput, runWithWriter, Semaphore, type MaybePromise } from "./utils";
+import { deepFreeze, extractOutput, runWithWriter, type MaybePromise } from "./utils";
 
 // ── Error Types ─────────────────────────────────────────────────────
 
@@ -1349,21 +1349,37 @@ export class Workflow<
             }
           }
         } else {
-          const sem = new Semaphore(concurrency);
-          await Promise.all(items.map(async (item, i) => {
-            await sem.acquire();
-            try {
+          // Worker pool: O(concurrency) async closures pulling from a shared
+          // index counter, instead of O(N) closures all queuing on a semaphore.
+          // For a foreach over 10k items with concurrency=4, this drops the
+          // closure-allocation cost from 10k to 4.
+          //
+          // The shared `nextIndex++` is safe because JS is single-threaded:
+          // the read+increment is synchronous within a microtask, and the
+          // following `await` yields only AFTER the index is captured. Two
+          // workers cannot grab the same index. Do not introduce an await
+          // between the read and increment.
+          let nextIndex = 0;
+          const worker = async () => {
+            while (true) {
+              const i = nextIndex++;
+              if (i >= items.length) return;
               if (aborted()) {
                 failures.push({ index: i, error: abortReason() });
-                return;
+                continue;
               }
-              await executeItem(item, i);
-            } catch (error) {
-              failures.push({ index: i, error });
-            } finally {
-              sem.release();
+              try {
+                await executeItem(items[i], i);
+              } catch (error) {
+                failures.push({ index: i, error });
+              }
             }
-          }));
+          };
+          const workers = Array.from(
+            { length: Math.min(concurrency, items.length) },
+            () => worker(),
+          );
+          await Promise.all(workers);
         }
 
         failures.sort((a, b) => a.index - b.index);

@@ -18,6 +18,7 @@ Combines the [fix/review-findings] correctness/ergonomics work with the [F0] sus
 ### Added
 
 - **`RunOptions.abortSignal?: AbortSignal`** — cooperative cancellation for `Workflow.generate` / `.stream` and `ResumedWorkflow.generate` / `.stream`. Checked at every step boundary inside `execute()`, forwarded to `Agent.generate` / `.stream` calls in `executeAgent`, propagated transitively into nested workflows and foreach items (unlike `freezeSnapshots`, which is run-scoped). `.finally()` bodies still run on the abort path; `.catch()` can observe the abort error via `state.abortSignal.reason`. The signal is sticky — a catch that swallows it gets re-aborted at the next step boundary.
+- **`getActiveWriter()` and `TOOL_PROVIDER_BRAND` exported from `pipeai`** — custom `IToolProvider` implementations (not built via `defineTool` / `ToolProvider`) previously had no sanctioned way to reach the workflow's stream writer. They had to import from internal `./utils`. Both are now part of the public surface. Call `getActiveWriter()` from inside your returned `Tool.execute` callback (not from inside `createTool` — `createTool` runs during agent setup, before the writer is live).
 - **`AgentConfig.validateOutput?: ZodType<TOutput>`** — optional Zod schema for runtime validation of the model's structured output. Distinct from `tool.outputSchema`.
 - **`Agent.generate(ctx, input, options?)` and `Agent.stream(...)` accept `{ abortSignal }`** as an optional second arg.
 - **`Agent.asTool` / `asToolProvider` forward `ToolExecutionOptions.abortSignal`** from the parent SDK loop to the sub-agent.
@@ -30,7 +31,7 @@ Combines the [fix/review-findings] correctness/ergonomics work with the [F0] sus
 
 ### Changed
 
-- **`foreach` concurrent path is a worker pool** (`O(concurrency)` memory) instead of pre-allocating one async closure per item.
+- **`foreach` concurrent path is a worker pool** (`O(concurrency)` memory). Previously the path used `items.map(async => sem.acquire/release)` which allocates O(N) async closures all queued on a `Semaphore`. The new path spawns `min(concurrency, items.length)` workers each pulling from a shared `nextIndex++` counter. For a foreach over 10k items with concurrency=4, this drops the closure-allocation cost from 10k to 4. All gate-suspension partition / failure-aggregation / per-item warning behavior is unchanged. The `Semaphore` class remains in `src/utils.ts` but is no longer used by the engine.
 - **`finally` and `catch` handlers that themselves throw now preserve the original error as `.cause`** instead of silently shadowing it.
 - **SDK boundary casts in `Agent`** replaced `as any` with `as unknown as Parameters<typeof generateText>[0]` (and `streamText`).
 - Five timing-fragile tests refactored to use deferred-promise barriers instead of `setTimeout`-coordinated state machines.

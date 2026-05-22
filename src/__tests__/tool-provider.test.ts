@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { defineTool, isToolProvider, ToolProvider, TOOL_PROVIDER_BRAND } from "../tool-provider";
+import { tool, type Tool, type UIMessageStreamWriter } from "ai";
+import { defineTool, isToolProvider, ToolProvider, TOOL_PROVIDER_BRAND, type IToolProvider } from "../tool-provider";
+import { getActiveWriter, runWithWriter } from "../utils";
 import { z } from "zod";
 import { type TestCtx, testCtx } from "./helpers";
 
@@ -76,5 +78,42 @@ describe("isToolProvider", () => {
   it("returns true for objects with the brand symbol", () => {
     const branded = { [TOOL_PROVIDER_BRAND]: true, createTool: () => ({}) };
     expect(isToolProvider(branded)).toBe(true);
+  });
+});
+
+describe("getActiveWriter (public API for custom IToolProvider)", () => {
+  it("returns undefined when not inside a streaming context", () => {
+    expect(getActiveWriter()).toBeUndefined();
+  });
+
+  it("custom IToolProvider can reach the workflow writer from inside Tool.execute", async () => {
+    // The built-in ToolProvider does this internally. This test demonstrates
+    // that a user-implemented IToolProvider (one that does NOT use defineTool/
+    // ToolProvider) can do the same via the public getActiveWriter export.
+    let seenWriter: UIMessageStreamWriter | undefined;
+    const customProvider: IToolProvider<TestCtx> = {
+      [TOOL_PROVIDER_BRAND]: true,
+      createTool(_ctx): Tool {
+        return tool({
+          description: "custom",
+          inputSchema: z.object({ q: z.string() }),
+          // CRITICAL: getActiveWriter() inside execute, not inside createTool.
+          // createTool runs at agent setup; execute runs at tool invocation
+          // when the workflow has actually entered streaming mode.
+          execute: async () => {
+            seenWriter = getActiveWriter();
+            return "ok";
+          },
+        }) as unknown as Tool;
+      },
+    };
+
+    const fakeWriter = { write: () => {}, merge: () => {} } as unknown as UIMessageStreamWriter;
+    await runWithWriter(fakeWriter, async () => {
+      const t = customProvider.createTool(testCtx);
+      await t.execute!({ q: "x" }, {} as never);
+    });
+
+    expect(seenWriter).toBe(fakeWriter);
   });
 });

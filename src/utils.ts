@@ -12,6 +12,35 @@ export function runWithWriter<T>(writer: UIMessageStreamWriter, fn: () => T): T 
   return writerStorage.run(writer, fn);
 }
 
+/**
+ * Returns the active `UIMessageStreamWriter` if the current async context is
+ * running inside a streaming workflow, or `undefined` otherwise.
+ *
+ * Use from inside a custom `IToolProvider`'s returned `Tool.execute` callback
+ * to forward incremental output to the workflow's UI message stream:
+ *
+ * ```ts
+ * import { getActiveWriter, type IToolProvider, TOOL_PROVIDER_BRAND } from "pipeai";
+ *
+ * const myProvider: IToolProvider<MyCtx> = {
+ *   [TOOL_PROVIDER_BRAND]: true,
+ *   createTool(ctx) {
+ *     return tool({
+ *       execute: async (input) => {
+ *         const writer = getActiveWriter();
+ *         // ...stream incremental progress to writer if present...
+ *         return result;
+ *       },
+ *     });
+ *   },
+ * };
+ * ```
+ *
+ * **Important timing note:** call this from *inside* the `Tool.execute`
+ * callback, not from inside `createTool` itself. `createTool` runs during
+ * agent setup (before the workflow has set the writer); `Tool.execute` runs
+ * during tool invocation (when the writer is live).
+ */
 export function getActiveWriter(): UIMessageStreamWriter | undefined {
   return writerStorage.getStore();
 }
