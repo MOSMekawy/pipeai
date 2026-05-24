@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-24
+
 Combines the [fix/review-findings] correctness/ergonomics work with the F0+F1+F2+F3+F4 feature stack from master (suspension-as-return-value, step-level checkpointing, parallel combinator, workflow observability, graph-pattern docs).
 
 ### Breaking changes (in addition to all of 0.4.0)
