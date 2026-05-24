@@ -11,8 +11,11 @@ export {
   WorkflowBranchError,
   WorkflowLoopError,
   NestedGateUnsupportedError,
+  CheckpointTimeoutError,
+  CHECKPOINT_STEP_ID,
+  migrateSnapshot,
 } from "./workflow";
-export type { SealedWorkflow, ResumedWorkflow } from "./workflow";
+export type { SealedWorkflow, ResumedWorkflow, CheckpointResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
   StepOptions,
@@ -23,10 +26,17 @@ export type {
   WorkflowStreamResult,
   WorkflowStreamOptions,
   WorkflowSnapshot,
+  GateSnapshot,
+  CheckpointSnapshot,
+  LegacyGateSnapshotV1,
   WorkflowWarning,
   WorkflowStepType,
   WorkflowObservability,
   RunOptions,
+  ParallelTarget,
+  ParallelOutputRecord,
+  ParallelOutputTuple,
+  ParallelOptions,
 } from "./workflow";
 
 export { defineTool } from "./tool-provider";
