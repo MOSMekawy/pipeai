@@ -449,33 +449,80 @@ describe("Workflow", () => {
   });
 
   describe("step options", () => {
-    it("mapGenerateResult transforms the step output", async () => {
+    it("mapResult transforms the step output in generate mode", async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const agent = createTextAgent("a1", "raw text") as Agent<TestCtx, any, any>;
       const pipeline = Workflow.create<TestCtx>()
         .step(agent, {
-          mapGenerateResult: ({ result }) => ({ wrapped: result.text }),
+          mapResult: ({ result }) => ({ wrapped: result.text }),
         });
 
       const { output } = expectComplete(await pipeline.generate(testCtx));
       expect(output).toEqual({ wrapped: "raw text" });
     });
 
-    it("onGenerateResult is called with result, ctx, and input", async () => {
-      const onGenerateResult = vi.fn();
+    it("onResult is called with discriminated mode='generate' params", async () => {
+      const onResult = vi.fn();
 
       const pipeline = Workflow.create<TestCtx>()
-        .step(createTextAgent("a1", "hello"), { onGenerateResult });
+        .step(createTextAgent("a1", "hello"), { onResult });
 
       await pipeline.generate(testCtx);
 
-      expect(onGenerateResult).toHaveBeenCalledOnce();
-      expect(onGenerateResult).toHaveBeenCalledWith(
+      expect(onResult).toHaveBeenCalledOnce();
+      expect(onResult).toHaveBeenCalledWith(
         expect.objectContaining({
+          mode: "generate",
           result: expect.objectContaining({ text: "hello" }),
           ctx: testCtx,
         })
       );
+    });
+
+    it("mapResult receives mode='stream' when the workflow runs in stream mode", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const agent = createTextAgent("a1", "streamed text") as Agent<TestCtx, any, any>;
+      let seenMode: string | undefined;
+      let seenText: string | undefined;
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(agent, {
+          mapResult: async (params) => {
+            seenMode = params.mode;
+            if (params.mode === "stream") {
+              // params.result is StreamTextResult — .text is Promise<string>.
+              seenText = await params.result.text;
+            } else {
+              seenText = params.result.text;
+            }
+            return seenText;
+          },
+        });
+
+      const { stream, output } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      const result = expectComplete(await output);
+
+      expect(seenMode).toBe("stream");
+      expect(seenText).toBe("streamed text");
+      expect(result.output).toBe("streamed text");
+    });
+
+    it("onResult fires with mode='stream' in stream mode", async () => {
+      const seen: Array<{ mode: string }> = [];
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "hi"), {
+          onResult: ({ mode }) => { seen.push({ mode }); },
+        });
+
+      const { stream, output } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      await output;
+
+      expect(seen).toEqual([{ mode: "stream" }]);
     });
   });
 

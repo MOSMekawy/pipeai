@@ -23,6 +23,7 @@ export const SKIP = _WorkflowForSkip.SKIP;
 export type { SealedWorkflow, ResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
+  AgentResultParams,
   StepOptions,
   BranchCase,
   BranchSelect,

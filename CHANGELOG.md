@@ -10,6 +10,26 @@ Combines the [fix/review-findings] correctness/ergonomics work with the [F0] sus
 
 ### Breaking changes (in addition to all of 0.4.0)
 
+- **`AgentStepHooks` collapsed from 5 mode-bifurcated callbacks to 3.** The four `mapGenerateResult` / `mapStreamResult` / `onGenerateResult` / `onStreamResult` hooks are replaced by two mode-discriminated ones: `mapResult` and `onResult`. Both receive `AgentResultParams<TContext, TOutput, TNextOutput>`, a discriminated union on `mode: "generate" | "stream"`. `handleStream` is unchanged (it's genuinely stream-only — no generate analog exists). Migration is mechanical:
+  ```ts
+  // Before:
+  .step(agent, {
+    mapGenerateResult: ({ result }) => result.text,
+    mapStreamResult:   async ({ result }) => await result.text,
+  })
+  // After (one callback handles both — result.text is string in generate,
+  // Promise<string> in stream; MaybePromise<TNextOutput> accepts either):
+  .step(agent, {
+    mapResult: ({ result }) => result.text,
+  })
+  // For mode-specific logic, discriminate:
+  .step(agent, {
+    mapResult: async (params) => {
+      if (params.mode === "stream") return await params.result.text;
+      return params.result.text;
+    },
+  })
+  ```
 - **`gate()` now has a third generic `TMerged`.** When you supply a `merge` callback, its return type becomes the workflow's downstream `TOutput`. Previously `merge` was forced to return `TResponse`, which contradicted the documented use case of combining pre-gate output with the human response into a new shape. Existing code without `merge` is unaffected (default `TMerged = TResponse`).
 - **`BranchSelect.agents` is now typed `Record<TKeys, Agent<TContext, TOutput, TNextOutput>>`** (was `Agent<TContext, any, TNextOutput>`). Mismatched-input agents that previously compiled silently now fail at compile time.
 - **`WorkflowSnapshot` is now generic in `TPayload`** (default `unknown`, so existing references compile unchanged). Narrow `gatePayload` by casting to `WorkflowSnapshot<MyPayload>`.

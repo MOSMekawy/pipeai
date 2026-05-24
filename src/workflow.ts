@@ -125,11 +125,65 @@ function resolveFreezeSnapshots(state: RuntimeState): boolean {
 
 // ── Shared Agent Step Hooks ─────────────────────────────────────────
 
+/**
+ * Discriminated union describing one agent invocation's result.
+ *
+ * - `mode: "generate"` — `result` is a `GenerateTextResult`; `.text`, `.output`,
+ *   `.usage` etc. are synchronous (already-resolved).
+ * - `mode: "stream"` — `result` is a `StreamTextResult`; the same fields are
+ *   `Promise`s that you must `await` before reading.
+ *
+ * The shared field set (`ctx`, `input`) is identical across both modes;
+ * narrowing on `mode` is only necessary when you need to touch a
+ * mode-specific shape.
+ */
+export type AgentResultParams<TContext, TOutput, TNextOutput> =
+  | {
+      readonly mode: "generate";
+      readonly result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>;
+      readonly ctx: Readonly<TContext>;
+      readonly input: TOutput;
+    }
+  | {
+      readonly mode: "stream";
+      readonly result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
+      readonly ctx: Readonly<TContext>;
+      readonly input: TOutput;
+    };
+
 export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
-  mapGenerateResult?: (params: { result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
-  mapStreamResult?: (params: { result: StreamTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
-  onGenerateResult?: (params: { result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
-  onStreamResult?: (params: { result: StreamTextResult<ToolSet, OutputType<TNextOutput>>; ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<void>;
+  /**
+   * Transform the agent's result into the next step's input. Fires once per
+   * step regardless of generate-vs-stream mode; discriminate on `mode` if you
+   * need a mode-specific field. Returning the agent's `result.text` works
+   * for both modes (string vs Promise<string>) because `MaybePromise` accepts
+   * either.
+   *
+   * If omitted, the workflow's default extraction is used:
+   *   - With `agent.output` declared → `extractOutput(result, agent.validateOutput)`
+   *   - Without `agent.output` → `result.text` (awaited if stream)
+   */
+  mapResult?: (params: AgentResultParams<TContext, TOutput, TNextOutput>) => MaybePromise<TNextOutput>;
+
+  /**
+   * Observe the agent's result without changing the step's downstream value.
+   * Fires once per step regardless of mode. Use for logging, telemetry,
+   * usage accounting, side-effects that should not affect pipeline data
+   * flow.
+   */
+  onResult?: (params: AgentResultParams<TContext, TOutput, TNextOutput>) => MaybePromise<void>;
+
+  /**
+   * **Stream-mode only.** Override the workflow's default
+   * `writer.merge(result.toUIMessageStream())` call so YOU control how the
+   * agent's stream reaches the outer workflow's UI message stream. Useful
+   * for buffering, transforming, fan-out to multiple writers, or injecting
+   * custom UI messages around the agent's output.
+   *
+   * Has no generate-mode analog because in generate mode there is no stream
+   * to merge. If both `handleStream` and `mapResult`/`onResult` are
+   * configured, `handleStream` runs first.
+   */
   handleStream?: (params: {
     result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
     writer: UIMessageStreamWriter;
@@ -712,12 +766,22 @@ export class SealedWorkflow<
           writer.merge(result.toUIMessageStream());
         }
 
-        if (options?.onStreamResult) {
-          await options.onStreamResult({ result, ctx, input });
+        // Build the discriminated-union params once so both hooks see the
+        // same readonly view of the agent result.
+        const hookParams = {
+          mode: "stream",
+          result,
+          ctx: ctx as Readonly<TContext>,
+          input,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as AgentResultParams<TContext, any, TNextOutput>;
+
+        if (options?.onResult) {
+          await options.onResult(hookParams);
         }
 
-        if (options?.mapStreamResult) {
-          state.output = await options.mapStreamResult({ result, ctx, input });
+        if (options?.mapResult) {
+          state.output = await options.mapResult(hookParams);
         } else {
           state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
         }
@@ -725,12 +789,20 @@ export class SealedWorkflow<
     } else {
       const result = await (agent.generate as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<GenerateTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
 
-      if (options?.onGenerateResult) {
-        await options.onGenerateResult({ result, ctx, input });
+      const hookParams = {
+        mode: "generate",
+        result,
+        ctx: ctx as Readonly<TContext>,
+        input,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as AgentResultParams<TContext, any, TNextOutput>;
+
+      if (options?.onResult) {
+        await options.onResult(hookParams);
       }
 
-      if (options?.mapGenerateResult) {
-        state.output = await options.mapGenerateResult({ result, ctx, input });
+      if (options?.mapResult) {
+        state.output = await options.mapResult(hookParams);
       } else {
         state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
       }
