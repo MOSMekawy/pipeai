@@ -12,6 +12,9 @@ export {
   WorkflowBranchError,
   WorkflowLoopError,
   NestedGateUnsupportedError,
+  CheckpointTimeoutError,
+  CHECKPOINT_STEP_ID,
+  migrateSnapshot,
 } from "./workflow";
 
 // `SKIP` is a unique-symbol sentinel returned from `foreach`'s `onError` to
@@ -20,7 +23,7 @@ export {
 // still reach the runtime value without importing the full `Workflow` class.
 import { Workflow as _WorkflowForSkip } from "./workflow";
 export const SKIP = _WorkflowForSkip.SKIP;
-export type { SealedWorkflow, ResumedWorkflow } from "./workflow";
+export type { SealedWorkflow, ResumedWorkflow, CheckpointResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
   AgentResultParams,
@@ -32,10 +35,17 @@ export type {
   WorkflowStreamResult,
   WorkflowStreamOptions,
   WorkflowSnapshot,
+  GateSnapshot,
+  CheckpointSnapshot,
+  LegacyGateSnapshotV1,
   WorkflowWarning,
   WorkflowStepType,
   WorkflowObservability,
   RunOptions,
+  ParallelTarget,
+  ParallelOutputRecord,
+  ParallelOutputTuple,
+  ParallelOptions,
 } from "./workflow";
 
 export { defineTool, ToolProvider, isToolProvider, TOOL_PROVIDER_BRAND } from "./tool-provider";

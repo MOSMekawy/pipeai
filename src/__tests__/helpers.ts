@@ -5,7 +5,7 @@ import type {
   LanguageModelV3FinishReason,
   LanguageModelV3GenerateResult,
 } from "@ai-sdk/provider";
-import type { WorkflowResult, WorkflowSnapshot, WorkflowWarning } from "../workflow";
+import type { WorkflowResult, GateSnapshot, WorkflowWarning } from "../workflow";
 
 const mockUsage: LanguageModelV3Usage = {
   inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
@@ -125,10 +125,11 @@ export function expectComplete<T>(result: WorkflowResult<T>): { output: T; warni
 }
 
 /**
- * Narrow to the `suspended` variant; returns the snapshot. Throws if the
- * workflow completed without suspending.
+ * Narrow to the `suspended` variant; returns the snapshot (always a
+ * `GateSnapshot` — only gates suspend). Throws if the workflow completed
+ * without suspending.
  */
-export function expectSuspended<T>(result: WorkflowResult<T>): { snapshot: WorkflowSnapshot; warnings: readonly WorkflowWarning[] } {
+export function expectSuspended<T>(result: WorkflowResult<T>): { snapshot: GateSnapshot; warnings: readonly WorkflowWarning[] } {
   if (result.status !== "suspended") {
     throw new Error(`expectSuspended: workflow completed without suspending`);
   }
