@@ -150,6 +150,9 @@ export async function extractOutput(
  */
 export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
   if (value === null || typeof value !== "object" || seen.has(value as object)) return value;
+  // Already-frozen subtree (e.g. user-passed frozen ctx) — its children are
+  // either also frozen or intentionally mutable, either way we should not recurse.
+  if (Object.isFrozen(value)) return value;
   seen.add(value as object);
   Object.freeze(value);
   for (const key of Reflect.ownKeys(value as object)) {
