@@ -6,6 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-24
+
+Combines the [fix/review-findings] correctness/ergonomics work with the F0+F1+F2+F3+F4 feature stack from master (suspension-as-return-value, step-level checkpointing, parallel combinator, workflow observability, graph-pattern docs).
+
+### Breaking changes (in addition to all of 0.4.0)
+
+- **`AgentStepHooks` collapsed from 5 mode-bifurcated callbacks to 3.** The four `mapGenerateResult` / `mapStreamResult` / `onGenerateResult` / `onStreamResult` hooks are replaced by two mode-discriminated ones: `mapResult` and `onResult`. Both receive `AgentResultParams<TContext, TOutput, TNextOutput>`, a discriminated union on `mode: "generate" | "stream"`. `handleStream` is unchanged (it's genuinely stream-only — no generate analog exists). Migration is mechanical:
+  ```ts
+  // Before:
+  .step(agent, {
+    mapGenerateResult: ({ result }) => result.text,
+    mapStreamResult:   async ({ result }) => await result.text,
+  })
+  // After (one callback handles both — result.text is string in generate,
+  // Promise<string> in stream; MaybePromise<TNextOutput> accepts either):
+  .step(agent, {
+    mapResult: ({ result }) => result.text,
+  })
+  // For mode-specific logic, discriminate:
+  .step(agent, {
+    mapResult: async (params) => {
+      if (params.mode === "stream") return await params.result.text;
+      return params.result.text;
+    },
+  })
+  ```
+- **`gate()` now has a third generic `TMerged`.** When you supply a `merge` callback, its return type becomes the workflow's downstream `TOutput`. Previously `merge` was forced to return `TResponse`, which contradicted the documented use case of combining pre-gate output with the human response into a new shape. Existing code without `merge` is unaffected (default `TMerged = TResponse`).
+- **`BranchSelect.agents` is now typed `Record<TKeys, Agent<TContext, TOutput, TNextOutput>>`** (was `Agent<TContext, any, TNextOutput>`). Mismatched-input agents that previously compiled silently now fail at compile time.
+- **`WorkflowSnapshot` is now generic in `TPayload`** (default `unknown`, so existing references compile unchanged). Narrow `gatePayload` by casting to `WorkflowSnapshot<MyPayload>`.
+- **`extractOutput` (via Agent behavior) now throws** when an `output` schema is declared but the model returned no structured value. Previously it silently fell back to raw text.
+
+### Added
+
+- **`RunOptions.abortSignal?: AbortSignal`** — cooperative cancellation for `Workflow.generate` / `.stream` and `ResumedWorkflow.generate` / `.stream`. Checked at every step boundary inside `execute()`, forwarded to `Agent.generate` / `.stream` calls in `executeAgent`, propagated transitively into nested workflows and foreach items (unlike `freezeSnapshots`, which is run-scoped). `.finally()` bodies still run on the abort path; `.catch()` can observe the abort error via `state.abortSignal.reason`. The signal is sticky — a catch that swallows it gets re-aborted at the next step boundary.
+- **`getActiveWriter()` and `TOOL_PROVIDER_BRAND` exported from `pipeai`** — custom `IToolProvider` implementations (not built via `defineTool` / `ToolProvider`) previously had no sanctioned way to reach the workflow's stream writer. They had to import from internal `./utils`. Both are now part of the public surface. Call `getActiveWriter()` from inside your returned `Tool.execute` callback (not from inside `createTool` — `createTool` runs during agent setup, before the writer is live).
+- **`AgentConfig.validateOutput?: ZodType<TOutput>`** — optional Zod schema for runtime validation of the model's structured output. Distinct from `tool.outputSchema`.
+- **`Agent.generate(ctx, input, options?)` and `Agent.stream(...)` accept `{ abortSignal }`** as an optional second arg.
+- **`Agent.asTool` / `asToolProvider` forward `ToolExecutionOptions.abortSignal`** from the parent SDK loop to the sub-agent.
+- **`AggregateError` from concurrent `foreach`** — when `concurrency > 1` and multiple items fail, all failures are surfaced via `AggregateError` instead of only the first. With `onError` set, handler throws are collected into a secondary `AggregateError`.
+- **`BranchSelect.onUnknownKey?: (params: { key, availableKeys, ctx }) => void`** — diagnostic hook fired when `select` returns a key not in `agents`.
+- **`Workflow.step(id, nestedWorkflow)` overload** — give nested workflows explicit IDs.
+- **`ToolProvider` and `isToolProvider` exported** from `pipeai` (was: only `defineTool`).
+- **Top-level `SKIP` re-export** — `import { SKIP } from "pipeai"` mirrors `Workflow.SKIP` for consumers who don't want to pull in the full `Workflow` class.
+- **`defer<T>()` and `createToolCallingMockModel`** added to test helpers — deterministic concurrency barriers and tool-call streaming simulation.
+
+### Changed
+
+- **`foreach` concurrent path is a worker pool** (`O(concurrency)` memory). Previously the path used `items.map(async => sem.acquire/release)` which allocates O(N) async closures all queued on a `Semaphore`. The new path spawns `min(concurrency, items.length)` workers each pulling from a shared `nextIndex++` counter. For a foreach over 10k items with concurrency=4, this drops the closure-allocation cost from 10k to 4. All gate-suspension partition / failure-aggregation / per-item warning behavior is unchanged. The `Semaphore` class remains in `src/utils.ts` but is no longer used by the engine.
+- **`finally` and `catch` handlers that themselves throw now preserve the original error as `.cause`** instead of silently shadowing it.
+- **SDK boundary casts in `Agent`** replaced `as any` with `as unknown as Parameters<typeof generateText>[0]` (and `streamText`).
+- Five timing-fragile tests refactored to use deferred-promise barriers instead of `setTimeout`-coordinated state machines.
+
+### Fixed
+
+- **`branchSelect`: prototype-chain keys (`"toString"`, `"constructor"`, `"__proto__"`, …) now route to `onUnknownKey`/`fallback`** instead of crashing `executeAgent` with the inherited `Object.prototype` method. Uses `Object.prototype.hasOwnProperty.call` instead of the `in` operator.
+- **`ResumedWorkflow.stream`: gate-schema parse rejections on resume now flow through the workflow's `.catch()` pipeline** instead of throwing synchronously from `.stream(...)` and bypassing catch handlers.
+- `Agent.stream()` wraps synchronous SDK throws so the user's `onError` is invoked.
+- Gate `condition` and `payload` callbacks are now captured by the workflow's `pendingError` plumbing.
+- `stopWhen` is no longer treated as a `Resolvable` — a bare `StopCondition` is itself a function, so the resolver heuristic in `resolveValue` previously misidentified it as a `(ctx, input) => StopCondition` resolver and called it with the wrong shape.
+
 ## [0.7.0] - 2026-05-08
 
 **Additive. Workflow observability hooks (`Workflow.create({ observability })`) plus the F4 graph-pattern docs (no code).**

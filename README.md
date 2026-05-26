@@ -46,7 +46,7 @@ type Ctx = {
   db: Database;
 };
 
-const assistant = new Agent<Ctx>({
+const assistant = new Agent<Ctx, string>({
   id: "assistant",
   model: openai("gpt-4o"),
   system: "You are a helpful assistant.",
@@ -84,7 +84,7 @@ const classificationSchema = z.object({
   summary: z.string(),
 });
 
-const classifier = new Agent<Ctx>({
+const classifier = new Agent<Ctx, { title: string; body: string }>({
   id: "classifier",
   input: z.object({ title: z.string(), body: z.string() }),
   output: Output.object({ schema: classificationSchema }),
@@ -102,7 +102,7 @@ result.output; // { priority: "high", category: "bug", summary: "..." }
 Most config fields accept a static value or a `(ctx, input) => value` function:
 
 ```ts
-const agent = new Agent<Ctx>({
+const agent = new Agent<Ctx, string>({
   id: "adaptive",
   model: (ctx) => ctx.isPremium ? openai("gpt-4o") : openai("gpt-4o-mini"),
   system: (ctx) => `You assist ${ctx.userName}. Role: ${ctx.role}.`,
@@ -120,7 +120,7 @@ const agent = new Agent<Ctx>({
 Same callback names as AI SDK v6, extended with `ctx`, `input`, and `writer`. The AI SDK event payload is available as `result`. When the agent runs inside a streaming workflow, `writer` is available for writing metadata or custom stream parts:
 
 ```ts
-const agent = new Agent<Ctx>({
+const agent = new Agent<Ctx, string>({
   id: "monitored",
   model: openai("gpt-4o"),
   prompt: (ctx, input) => input,
@@ -146,6 +146,7 @@ const agent = new Agent<Ctx>({
 | `description` | `string`                  | Agent description (used by `asTool()` for tool description).      |
 | `input`       | `ZodType`                 | Input schema. Required for `asTool()`. Infers `TInput`.           |
 | `output`      | `Output`                  | AI SDK Output (e.g. `Output.object({ schema })`). Infers `TOutput`. |
+| `validateOutput` | `ZodType<TOutput>`     | Optional runtime guard. Validates the structured `output` after the SDK parses it (distinct from `tool.outputSchema`). Catches SDK-side parse drift. |
 | `model`       | `Resolvable`              | Language model. Static or `(ctx, input) => model`.                |
 | `system`      | `Resolvable`              | System prompt.                                                    |
 | `prompt`      | `Resolvable`              | String prompt. Mutually exclusive with `messages`.                |
@@ -153,7 +154,7 @@ const agent = new Agent<Ctx>({
 | `tools`       | `Resolvable`              | Tool map. Supports `Tool`, `ToolProvider`, and `agent.asTool()`.  |
 | `activeTools` | `Resolvable`              | Subset of tool names to enable.                                   |
 | `toolChoice`  | `Resolvable`              | Tool choice strategy. Static or `(ctx, input) => toolChoice`.     |
-| `stopWhen`    | `Resolvable`              | Condition for stopping the tool loop. Static or `(ctx, input) => condition`. |
+| `stopWhen`    | `StopCondition` &#124; `StopCondition[]` | Condition(s) for stopping the tool loop. **Static only** — not a `Resolvable`. A bare function is ambiguous with the resolver form, so dynamic stop conditions require building the agent per call. |
 | `onStepFinish`| `({ result, ctx, input, writer? })`| Called after each step. `writer` available in streaming workflows. |
 | `onFinish`    | `({ result, ctx, input, writer? })`| Called when all steps complete.                                   |
 | `onError`     | `({ error, ctx, input, writer? })` | Called on error.                                                  |
@@ -164,7 +165,7 @@ const agent = new Agent<Ctx>({
 `asTool()` compiles an agent into a standard AI SDK `Tool`. The parent agent's LLM tool loop handles routing — no dedicated router needed.
 
 ```ts
-const codingAgent = new Agent<Ctx>({
+const codingAgent = new Agent<Ctx, { task: string; language?: string }>({
   id: "coding",
   description: "Writes and modifies code.",
   input: z.object({
@@ -176,7 +177,7 @@ const codingAgent = new Agent<Ctx>({
   tools: { writeFile, readFile },
 });
 
-const qaAgent = new Agent<Ctx>({
+const qaAgent = new Agent<Ctx, { question: string }>({
   id: "qa",
   description: "Answers technical questions.",
   input: z.object({ question: z.string() }),
@@ -186,7 +187,7 @@ const qaAgent = new Agent<Ctx>({
 });
 
 // Parent agent uses sub-agents as tools
-const orchestrator = new Agent<Ctx>({
+const orchestrator = new Agent<Ctx, string>({
   id: "orchestrator",
   model: openai("gpt-4o"),
   system: "Delegate work to the right specialist.",
@@ -221,7 +222,7 @@ codingAgent.asTool(ctx, {
 `asTool(ctx)` bakes the context in at call time. `asToolProvider()` defers context resolution — the tool is created with the correct context when another agent's tool resolution runs:
 
 ```ts
-const orchestrator = new Agent<Ctx>({
+const orchestrator = new Agent<Ctx, string>({
   id: "orchestrator",
   model: openai("gpt-4o"),
   system: "Delegate work to the right specialist.",
@@ -267,7 +268,7 @@ const cancelOrder = define({
 });
 
 // Mix with plain AI SDK tools freely
-const agent = new Agent<Ctx>({
+const agent = new Agent<Ctx, string>({
   id: "support",
   model: openai("gpt-4o"),
   prompt: (ctx, input) => input,
@@ -820,9 +821,9 @@ const r3 = await resumed2.generate(ctx, "final approval");
 if (r3.status === "complete") console.log(r3.output);
 ```
 
-### Merging pre-gate output with response
+### Manual merge at the call site
 
-The `snapshot.output` field contains the pre-gate output. Use it to merge with the human response:
+The `snapshot.output` field contains the pre-gate output. Merge it with the human response at the call site:
 
 ```ts
 // The step after the gate needs both the draft and the approval
@@ -832,6 +833,8 @@ await resumed.generate(ctx, {
   approval: humanResponse,      // human's response
 });
 ```
+
+For automatic merging without exposing `snapshot.output` to the caller, see the `merge` option below.
 
 ### Injecting updated context on resume
 
@@ -860,21 +863,24 @@ const pipeline = Workflow.create<Ctx>()
   .step(publishAgent);
 ```
 
-### Merging pre-gate output with response
+### Merging pre-gate output with response via `merge`
 
-Use `merge` to combine the pre-gate output with the human response into a single value for the next step. Without `merge`, only the human response is forwarded:
+Use `merge` to combine the pre-gate output with the human response into a single value for the next step. Without `merge`, only the human response is forwarded.
+
+`merge` may return any shape — its return type becomes the input type of the next step. The gate's third generic `TMerged` is inferred from the merge return type, so downstream steps type-check against the merged shape:
 
 ```ts
 const pipeline = Workflow.create<Ctx>()
   .step(draftAgent)
   .gate("review", {
+    schema: approvalSchema,
     merge: ({ priorOutput, response }) => ({
-      draft: priorOutput,
-      approval: response,
+      draft: priorOutput,        // pre-gate output (TOutput)
+      approval: response,        // validated human response (TResponse)
     }),
   })
   .step("publish", ({ input }) => {
-    // input is { draft, approval }
+    // input is { draft, approval } — the TMerged shape
   });
 ```
 

@@ -4,6 +4,7 @@ export type {
   GenerateTextResult,
   StreamTextResult,
   OutputType,
+  AsToolMapOutput,
 } from "./agent";
 
 export {
@@ -15,9 +16,17 @@ export {
   CHECKPOINT_STEP_ID,
   migrateSnapshot,
 } from "./workflow";
+
+// `SKIP` is a unique-symbol sentinel returned from `foreach`'s `onError` to
+// omit an item from the output array. It mirrors `Workflow.SKIP` and is
+// re-exported here so consumers who only `import type { SealedWorkflow }` can
+// still reach the runtime value without importing the full `Workflow` class.
+import { Workflow as _WorkflowForSkip } from "./workflow";
+export const SKIP = _WorkflowForSkip.SKIP;
 export type { SealedWorkflow, ResumedWorkflow, CheckpointResumedWorkflow } from "./workflow";
 export type {
   AgentStepHooks,
+  AgentResultParams,
   StepOptions,
   BranchCase,
   BranchSelect,
@@ -39,7 +48,8 @@ export type {
   ParallelOptions,
 } from "./workflow";
 
-export { defineTool } from "./tool-provider";
+export { defineTool, ToolProvider, isToolProvider, TOOL_PROVIDER_BRAND } from "./tool-provider";
 export type { ToolProviderConfig, ToolExecuteOptions, IToolProvider } from "./tool-provider";
 
+export { getActiveWriter } from "./utils";
 export type { MaybePromise, Resolvable } from "./utils";
