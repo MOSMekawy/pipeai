@@ -1,6 +1,9 @@
 import {
   createUIMessageStream,
+  type UIMessage,
   type UIMessageStreamWriter,
+  type UIMessageStreamOnFinishCallback,
+  type IdGenerator,
   type ToolSet,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
@@ -345,6 +348,7 @@ export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
     result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
     writer: UIMessageStreamWriter;
     ctx: Readonly<TContext>;
+    input: TOutput;
   }) => MaybePromise<void>;
 }
 
@@ -388,9 +392,50 @@ export interface WorkflowStreamResult<TOutput> {
   output: Promise<WorkflowResult<TOutput>>;   // never rejects on suspension; rejects on real errors
 }
 
-export interface WorkflowStreamOptions {
+/**
+ * Options for `Workflow.stream` / `ResumedWorkflow.stream` /
+ * `CheckpointResumedWorkflow.stream`. Forwarded verbatim to the AI SDK's
+ * `createUIMessageStream`.
+ *
+ * Generic over the UI message shape so consumers with a custom
+ * `UIMessage<METADATA, DATA_PARTS, TOOLS>` get their narrowed type in
+ * `onFinish` / `originalMessages` instead of the unparameterized default.
+ *
+ * Note: AI SDK's `createUIMessageStream` ALSO accepts an `onStepFinish`
+ * (per-token-step) callback. We intentionally do NOT expose it here — there
+ * are already two clearer step-finish callbacks at different granularities:
+ * - `Agent.onStepFinish` for per-model-call observation, and
+ * - `WorkflowObservability.onStepFinish` for per-workflow-step observation.
+ * Adding a third one named the same thing on `WorkflowStreamOptions` would
+ * be confusing. Reach for one of the two above instead.
+ */
+export interface WorkflowStreamOptions<UI_MESSAGE extends UIMessage = UIMessage> {
+  /**
+   * Map an unknown error into a user-visible string. Forwarded as-is to
+   * `createUIMessageStream`'s `onError`. Returning `string` is required by
+   * the AI SDK — the string is what the stream emits to clients.
+   */
   onError?: (error: unknown) => string;
-  onFinish?: () => MaybePromise<void>;
+  /**
+   * Prior `UIMessage`s the stream should continue from. When provided, the
+   * AI SDK assumes persistence mode and assigns a response-message id.
+   * Used for chat resumption / continuation flows.
+   */
+  originalMessages?: UI_MESSAGE[];
+  /**
+   * Fires once the stream finishes, with the full payload the AI SDK
+   * delivers: the updated `messages` array, the freshly-emitted
+   * `responseMessage`, `isAborted` / `isContinuation` flags, and the
+   * `finishReason`. Use this for persistence, analytics, or downstream
+   * notification.
+   */
+  onFinish?: UIMessageStreamOnFinishCallback<UI_MESSAGE>;
+  /**
+   * Override the response message-id generator. Forwarded to
+   * `createUIMessageStream`'s `generateId` option. Useful for deterministic
+   * IDs in tests or coordinating with a server-side ID space.
+   */
+  generateId?: IdGenerator;
 }
 
 // ── Loop Types ──────────────────────────────────────────────────────
@@ -648,7 +693,7 @@ function demotePendingError(state: RuntimeState, pe: PendingError): void {
  */
 function maybeWarnStreamOnErrorOnSuspend(
   result: WorkflowResult<unknown>,
-  options: WorkflowStreamOptions | undefined,
+  options: { onError?: (error: unknown) => string } | undefined,
 ): void {
   if (result.status !== "suspended" || !options?.onError || warnedStreamOnErrorOnSuspend) return;
   warnedStreamOnErrorOnSuspend = true;
@@ -858,15 +903,15 @@ export class SealedWorkflow<
     return this.buildResult(state);
   }
 
-  stream(
+  stream<UI_MESSAGE extends UIMessage = UIMessage>(
     ctx: TContext,
     ...args: TInput extends void
-      ? [input?: TInput, options?: WorkflowStreamOptions, opts?: RunOptions]
-      : [input: TInput, options?: WorkflowStreamOptions, opts?: RunOptions]
+      ? [input?: TInput, options?: WorkflowStreamOptions<UI_MESSAGE>, opts?: RunOptions]
+      : [input: TInput, options?: WorkflowStreamOptions<UI_MESSAGE>, opts?: RunOptions]
   ): WorkflowStreamResult<TOutput> {
     this.ensureDuplicateCheck();
     const input = args[0];
-    const options = args[1] as WorkflowStreamOptions | undefined;
+    const options = args[1] as WorkflowStreamOptions<UI_MESSAGE> | undefined;
     const opts = args[2] as RunOptions | undefined;
     this.validateRunOptions(opts);
     const abortSignal = opts?.abortSignal;
@@ -881,7 +926,7 @@ export class SealedWorkflow<
     // Prevent unhandled rejection warning if the consumer never awaits `output`.
     outputPromise.catch(() => {});
 
-    const stream = createUIMessageStream({
+    const stream = createUIMessageStream<UI_MESSAGE>({
       execute: async ({ writer }) => {
         const state: RuntimeState = {
           ctx,
@@ -904,6 +949,8 @@ export class SealedWorkflow<
       },
       ...(options?.onError ? { onError: options.onError } : {}),
       ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
+      ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
+      ...(options?.generateId ? { generateId: options.generateId } : {}),
     });
 
     return {
@@ -1259,7 +1306,7 @@ export class SealedWorkflow<
         const result = await (agent.stream as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
 
         if (options?.handleStream) {
-          await options.handleStream({ result, writer, ctx });
+          await options.handleStream({ result, writer, ctx, input });
         } else {
           writer.merge(result.toUIMessageStream());
         }
@@ -1510,14 +1557,14 @@ export class ResumedWorkflow<
     return this.buildResult(state);
   }
 
-  override stream(
+  override stream<UI_MESSAGE extends UIMessage = UIMessage>(
     ctx: TContext,
     ...args: TResponse extends void
-      ? [response?: TResponse, options?: WorkflowStreamOptions, opts?: RunOptions]
-      : [response: TResponse, options?: WorkflowStreamOptions, opts?: RunOptions]
+      ? [response?: TResponse, options?: WorkflowStreamOptions<UI_MESSAGE>, opts?: RunOptions]
+      : [response: TResponse, options?: WorkflowStreamOptions<UI_MESSAGE>, opts?: RunOptions]
   ): WorkflowStreamResult<TOutput> {
     const rawResponse = args[0] as TResponse;
-    const options = args[1] as WorkflowStreamOptions | undefined;
+    const options = args[1] as WorkflowStreamOptions<UI_MESSAGE> | undefined;
     const opts = args[2] as RunOptions | undefined;
     const abortSignal = opts?.abortSignal;
 
@@ -1533,7 +1580,7 @@ export class ResumedWorkflow<
     const priorOutput = this.priorOutput;
     const startIndex = this.startIndex;
 
-    const stream = createUIMessageStream({
+    const stream = createUIMessageStream<UI_MESSAGE>({
       execute: async ({ writer }) => {
         // Run prep (schema.parse + mergeFn) inside the error pipeline (same as
         // generate()). Without this, a schema parse throw escapes synchronously
@@ -1569,6 +1616,8 @@ export class ResumedWorkflow<
       },
       ...(options?.onError ? { onError: options.onError } : {}),
       ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
+      ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
+      ...(options?.generateId ? { generateId: options.generateId } : {}),
     });
 
     return { stream, output: outputPromise };
@@ -1619,9 +1668,9 @@ export class CheckpointResumedWorkflow<
     return this.buildResult(state);
   }
 
-  override stream(
+  override stream<UI_MESSAGE extends UIMessage = UIMessage>(
     ctx: TContext,
-    ...args: [input?: void, options?: WorkflowStreamOptions, opts?: RunOptions]
+    ...args: [input?: void, options?: WorkflowStreamOptions<UI_MESSAGE>, opts?: RunOptions]
   ): WorkflowStreamResult<TOutput> {
     const options = args[1];
     const opts = args[2];
@@ -1638,7 +1687,7 @@ export class CheckpointResumedWorkflow<
     const priorOutput = this.priorOutput;
     const startIndex = this.startIndex;
 
-    const stream = createUIMessageStream({
+    const stream = createUIMessageStream<UI_MESSAGE>({
       execute: async ({ writer }) => {
         const state: RuntimeState = {
           ctx,
@@ -1659,6 +1708,8 @@ export class CheckpointResumedWorkflow<
       },
       ...(options?.onError ? { onError: options.onError } : {}),
       ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
+      ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
+      ...(options?.generateId ? { generateId: options.generateId } : {}),
     });
 
     return { stream, output: outputPromise };

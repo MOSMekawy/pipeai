@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+
+- **`handleStream` now receives `input: TOutput`** — the typed carry from the prior step. Closes the asymmetry with `mapResult` / `onResult`, which already receive `input` via `AgentResultParams`. Lets consumers read the upstream value inside `handleStream` without round-tripping through `ctx`. Non-breaking — existing destructures (`{ result, writer, ctx }`) keep working.
+- **`WorkflowStreamOptions` now surfaces every option the AI SDK's `createUIMessageStream` accepts**, with honest types:
+  - `onFinish` is typed as the AI SDK's `UIMessageStreamOnFinishCallback<UI_MESSAGE>` — receives the real payload (`messages`, `responseMessage`, `isAborted`, `isContinuation`, `finishReason?`). Previously the public type was `() => MaybePromise<void>`, hiding all of it and forcing consumers to cast through `unknown`.
+  - `originalMessages?: UI_MESSAGE[]` — for chat resumption / continuation flows. Forwarded verbatim; AI SDK assumes persistence mode and assigns a response-message id when provided.
+  - `generateId?: IdGenerator` — overrides the response message-id generator. Useful for deterministic IDs in tests or coordinating with a server-side ID space.
+- **`WorkflowStreamOptions` is now generic** over `UI_MESSAGE extends UIMessage`, default `UIMessage`. `Workflow.stream` / `ResumedWorkflow.stream` / `CheckpointResumedWorkflow.stream` all accept the same method-local generic, so consumers can pass a narrower `UIMessage<METADATA, DATA_PARTS, TOOLS>` and have `onFinish`'s `responseMessage` / `messages` narrow accordingly. Existing call sites continue to compile against the `UIMessage` default.
+
+### Notes
+
+- AI SDK's `createUIMessageStream` also accepts an `onStepFinish` (per-model-step) callback. We intentionally do not expose it on `WorkflowStreamOptions` — pipeai already has two clearer step-finish callbacks at different granularities (`Agent.onStepFinish` for per-model-call, `WorkflowObservability.onStepFinish` for per-workflow-step). Adding a third one with the same name would be confusing. Reach for one of the two above instead.
+
 ## [0.8.0] - 2026-05-24
 
 Combines the [fix/review-findings] correctness/ergonomics work with the F0+F1+F2+F3+F4 feature stack from master (suspension-as-return-value, step-level checkpointing, parallel combinator, workflow observability, graph-pattern docs).

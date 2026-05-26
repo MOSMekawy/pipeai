@@ -2008,6 +2008,110 @@ describe("Workflow", () => {
 
       expect(ctxSpy).toHaveBeenCalledWith(testCtx);
     });
+
+    it("handleStream receives the prior step's output as `input`", async () => {
+      const inputSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "first-output"))
+        .step(createPassthroughAgent("a2", "second-output"), {
+          handleStream: async ({ result, input }) => {
+            inputSpy(input);
+            await result.text;
+          },
+        });
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expectComplete(await output);
+
+      expect(inputSpy).toHaveBeenCalledWith("first-output");
+    });
+  });
+
+  // ── WorkflowStreamOptions: honest pass-through to createUIMessageStream ──
+  describe("WorkflowStreamOptions", () => {
+    it("onFinish receives the full createUIMessageStream payload, not bare ()", async () => {
+      const finishSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "hello"));
+
+      const { output, stream } = pipeline.stream(testCtx, undefined, {
+        onFinish: (event) => {
+          finishSpy(event);
+        },
+      });
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expectComplete(await output);
+
+      expect(finishSpy).toHaveBeenCalledOnce();
+      const event = finishSpy.mock.calls[0]![0]!;
+      expect(event).toMatchObject({
+        messages: expect.any(Array),
+        responseMessage: expect.any(Object),
+        isAborted: expect.any(Boolean),
+        isContinuation: expect.any(Boolean),
+      });
+      expect(event.messages.length).toBeGreaterThan(0);
+    });
+
+    it("originalMessages flows through to the response message-id assignment", async () => {
+      // When originalMessages is supplied, AI SDK assumes persistence mode and
+      // assigns an id to the response message. We can observe that id appearing
+      // in the onFinish payload's responseMessage.
+      const finishSpy = vi.fn();
+      const originalMessages = [
+        { id: "prior-1", role: "user", parts: [{ type: "text", text: "ping" }] },
+      ] as Parameters<typeof Workflow.create<TestCtx>>[0] extends undefined ? never : never;
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "pong"));
+
+      const { output, stream } = pipeline.stream(testCtx, undefined, {
+        originalMessages: [
+          { id: "prior-1", role: "user", parts: [{ type: "text", text: "ping" }] },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ] as any,
+        onFinish: (event) => finishSpy(event),
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+      originalMessages;
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expectComplete(await output);
+
+      expect(finishSpy).toHaveBeenCalledOnce();
+      const event = finishSpy.mock.calls[0]![0]!;
+      // The original prior-1 message is present in the merged messages array.
+      const ids = event.messages.map((m: { id?: string }) => m.id);
+      expect(ids).toContain("prior-1");
+      // The response message has an id (assigned because persistence mode is on).
+      expect(event.responseMessage.id).toBeTruthy();
+    });
+
+    it("generateId overrides the response message-id generator", async () => {
+      const generateId = vi.fn(() => "deterministic-id-42");
+      const finishSpy = vi.fn();
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step(createTextAgent("a1", "out"));
+
+      const { output, stream } = pipeline.stream(testCtx, undefined, {
+        generateId,
+        onFinish: (event) => finishSpy(event),
+      });
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expectComplete(await output);
+
+      expect(generateId).toHaveBeenCalled();
+      const event = finishSpy.mock.calls[0]![0]!;
+      // The response message uses the generated id.
+      expect(event.responseMessage.id).toBe("deterministic-id-42");
+    });
   });
 
   // ── F0 verification tests ─────────────────────────────────────────
