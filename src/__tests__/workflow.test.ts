@@ -90,6 +90,55 @@ describe("Workflow", () => {
     });
   });
 
+  describe("step() with transform — writer param", () => {
+    it("inline step receives the stream writer and can emit a data part before the terminal agent", async () => {
+      const pipeline = Workflow.create<TestCtx>()
+        .step("emit-phase", ({ writer }) => {
+          writer?.write({ type: "data-status", data: { phase: "searching" } });
+          return "after-emit";
+        })
+        .step(createPassthroughAgent("synth", "final answer"));
+
+      const { output, stream } = pipeline.stream(testCtx);
+      const reader = stream.getReader();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const chunks: any[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+
+      expect(expectComplete(await output).output).toBe("final answer");
+
+      // The data part the inline step wrote is on the stream.
+      expect(chunks).toContainEqual(
+        expect.objectContaining({ type: "data-status", data: { phase: "searching" } }),
+      );
+
+      // …and it precedes the terminal agent's first text token.
+      const statusIdx = chunks.findIndex((c) => c.type === "data-status");
+      const firstTextIdx = chunks.findIndex((c) => typeof c.type === "string" && c.type.startsWith("text"));
+      expect(statusIdx).toBeGreaterThanOrEqual(0);
+      expect(firstTextIdx).toBeGreaterThanOrEqual(0);
+      expect(statusIdx).toBeLessThan(firstTextIdx);
+    });
+
+    it("writer is undefined in generate mode; the step still transforms", async () => {
+      let sawWriter: unknown = "unset";
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("emit-phase", ({ writer }) => {
+          sawWriter = writer;
+          return "transformed";
+        });
+
+      const { output } = expectComplete(await pipeline.generate(testCtx));
+      expect(output).toBe("transformed");
+      expect(sawWriter).toBeUndefined();
+    });
+  });
+
   describe("branch() with predicates", () => {
     it("routes to the matching branch", async () => {
       const premiumAgent = createPassthroughAgent("premium", "premium response");
