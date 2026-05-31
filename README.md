@@ -299,6 +299,23 @@ const pipeline = Workflow.create<Ctx>()
   });
 ```
 
+An inline `.step(id, fn)` handler receives `{ ctx, input, writer? }`. When the workflow runs via `.stream(...)`, `writer` is the same `UIMessageStreamWriter` the agent steps merge into — so an inline step can surface mid-pipeline progress (status/data parts) to the client before the terminal agent starts emitting tokens. `writer` is `undefined` in generate mode (`.generate(...)`), so guard with `?.`:
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step("plan", async ({ ctx, input, writer }) => {
+    writer?.write({ type: "data-status", data: { phase: "planning" } });
+    return planner.run(ctx, input);
+  })
+  .step("search", async ({ ctx, input, writer }) => {
+    writer?.write({ type: "data-status", data: { phase: "searching", queries: input.queries.length } });
+    return ctx.search.run(input.queries);
+  })
+  .step(synthesizerAgent); // terminal streaming agent
+```
+
+For ambient writer access from helper functions called *inside* a step, compose the AI SDK's `createUIMessageStream` directly — pipeai only threads `writer` into the inline step handler itself.
+
 ### Running a workflow
 
 ```ts

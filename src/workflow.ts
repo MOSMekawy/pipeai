@@ -1777,14 +1777,14 @@ export class Workflow<
 
   step<TNextOutput>(
     id: string,
-    fn: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>
+    fn: (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
   // ── step: implementation ──────────────────────────────────────
 
   step<TNextOutput>(
     target: Agent<TContext, TOutput, TNextOutput> | SealedWorkflow<TContext, TOutput, TNextOutput> | string,
-    optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>)
+    optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>)
   ): Workflow<TContext, TInput, TNextOutput, TGates> {
     // Nested workflow overload: step(workflow)
     if (target instanceof SealedWorkflow) {
@@ -1806,7 +1806,7 @@ export class Workflow<
       if (typeof optionsOrFn !== "function") {
         throw new Error(`Workflow step("${target}"): second argument must be a function`);
       }
-      const fn = optionsOrFn as (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
+      const fn = optionsOrFn as (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>;
       const node: StepNode = {
         type: "step",
         id: target,
@@ -1814,6 +1814,9 @@ export class Workflow<
           state.output = await fn({
             ctx: state.ctx as Readonly<TContext>,
             input: state.output as TOutput,
+            // Present in stream mode (undefined in generate mode), letting the
+            // inline step emit UIMessageChunk parts onto the workflow's stream.
+            writer: state.writer,
           });
         },
       };

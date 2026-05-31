@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- **Inline `.step(id, fn)` handlers now receive `writer?: UIMessageStreamWriter`** — the same writer the agent steps merge into. In a `.stream(...)` run an inline step can emit `UIMessageChunk` parts (status / data parts) to surface mid-pipeline progress before the terminal agent starts emitting tokens, without dropping out of `Workflow.stream(...)`. `writer` is `undefined` in generate mode (guard with `?.`). Non-breaking — existing `({ ctx, input })` destructures keep working. `getActiveWriter()` is unchanged (still scoped to `Tool.execute`); for ambient access inside step helpers, compose the AI SDK's `createUIMessageStream` directly.
 - **`handleStream` now receives `input: TOutput`** — the typed carry from the prior step. Closes the asymmetry with `mapResult` / `onResult`, which already receive `input` via `AgentResultParams`. Lets consumers read the upstream value inside `handleStream` without round-tripping through `ctx`. Non-breaking — existing destructures (`{ result, writer, ctx }`) keep working.
 - **`WorkflowStreamOptions` now surfaces every option the AI SDK's `createUIMessageStream` accepts**, with honest types:
   - `onFinish` is typed as the AI SDK's `UIMessageStreamOnFinishCallback<UI_MESSAGE>` — receives the real payload (`messages`, `responseMessage`, `isAborted`, `isContinuation`, `finishReason?`). Previously the public type was `() => MaybePromise<void>`, hiding all of it and forcing consumers to cast through `unknown`.
