@@ -35,6 +35,33 @@ export function createMockModel(text: string) {
   });
 }
 
+// ── Replayable streaming mock model ────────────────────────────────
+// createMockModel's `doStream` is a single ReadableStream created once, so it
+// can only be consumed ONCE. That's fine for a single-use agent, but when one
+// agent is reused across multiple stream-mode invocations (e.g. a foreach over
+// N items with one target), the first call drains the stream and the rest get
+// an empty one. A real model produces a fresh stream per `.stream()` call —
+// this mock mirrors that by building the stream inside a `doStream` function.
+export function createReplayableMockModel(text: string) {
+  const doGenerate: LanguageModelV3GenerateResult = {
+    content: [{ type: "text", text }],
+    finishReason,
+    usage: mockUsage,
+    warnings: [],
+  };
+  return new MockLanguageModelV3({
+    doGenerate,
+    doStream: async () => ({
+      stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+        { type: "text-start", id: "text-1" },
+        { type: "text-delta", id: "text-1", delta: text },
+        { type: "text-end", id: "text-1" },
+        { type: "finish", finishReason, usage: mockUsage },
+      ]),
+    }),
+  });
+}
+
 // ── Signal-probe mock model ─────────────────────────────────────────
 // createMockModel ignores abortSignal, so whether a caller forwards the signal
 // to the model call is invisible. This model records the abortSignal it

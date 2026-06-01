@@ -373,12 +373,18 @@ export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
    * Has no generate-mode analog because in generate mode there is no stream
    * to merge. If both `handleStream` and `mapResult`/`onResult` are
    * configured, `handleStream` runs first.
+   *
+   * `itemIndex` identifies the execution when this hook runs inside a
+   * multi-execution combinator: the numeric index for `foreach` and tuple
+   * `parallel`, the key for record `parallel`, and the matched key / case
+   * index for `branch`. It is `undefined` for a plain single `.step(agent)`.
    */
   handleStream?: (params: {
     result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
     writer: UIMessageStreamWriter;
     ctx: Readonly<TContext>;
     input: TOutput;
+    itemIndex?: number | string;
   }) => MaybePromise<void>;
 }
 
@@ -578,7 +584,7 @@ export type ParallelOutputTuplePartial<T extends ReadonlyArray<unknown>> = {
   [K in keyof T]: BranchOutput<T[K]> | undefined;
 };
 
-export interface ParallelOptions<TContext> {
+export interface ParallelOptions<TContext, TOutput = unknown> {
   /** Override the default step id. Default: `parallel:record` or `parallel:tuple`. */
   id?: string;
   /**
@@ -609,6 +615,24 @@ export interface ParallelOptions<TContext> {
     index?: number;
     ctx: Readonly<TContext>;
   }) => unknown | typeof Workflow.SKIP | Promise<unknown | typeof Workflow.SKIP>;
+  /**
+   * **Stream-mode + agent-branch only.** When the workflow is run via
+   * `.stream(...)`, each agent branch runs in stream mode and this hook decides
+   * how its stream surfaces to the writer (`itemIndex` = the record key or the
+   * tuple index). Without it, agent branches run in generate mode (no
+   * auto-merge). Not invoked for `SealedWorkflow` branches (which stream
+   * transitively via their own steps) nor in generate mode.
+   */
+  handleStream?: (params: {
+    // Branch output types vary across the record/tuple, so the result is loosely
+    // typed here — narrow inside the handler if needed.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    result: StreamTextResult<ToolSet, any>;
+    writer: UIMessageStreamWriter;
+    ctx: Readonly<TContext>;
+    input: TOutput;
+    itemIndex: number | string;
+  }) => MaybePromise<void>;
 }
 
 // ── Schema type (structural — works with Zod, Valibot, ArkType, etc.) ──
@@ -1503,6 +1527,10 @@ export class SealedWorkflow<
     ctx: TContext,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     options?: AgentStepHooks<TContext, any, TNextOutput>,
+    // Identifies the execution to `handleStream` inside foreach / parallel /
+    // branch (numeric index, record key, or matched case). Undefined for a
+    // plain single `.step(agent)`.
+    itemIndex?: number | string,
   ): Promise<void> {
     const input = state.output as TAgentInput;
     const hasStructuredOutput = agent.hasOutput;
@@ -1517,7 +1545,7 @@ export class SealedWorkflow<
         const result = await (agent.stream as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
 
         if (options?.handleStream) {
-          await options.handleStream({ result, writer, ctx, input });
+          await options.handleStream({ result, writer, ctx, input, itemIndex });
         } else {
           writer.merge(result.toUIMessageStream());
         }
@@ -2087,14 +2115,15 @@ export class Workflow<
         const ctx = state.ctx as TContext;
         const input = state.output as TOutput;
 
-        for (const branchCase of cases) {
+        for (let caseIndex = 0; caseIndex < cases.length; caseIndex++) {
+          const branchCase = cases[caseIndex];
           if (branchCase.when) {
             const match = await branchCase.when({ ctx, input });
             if (!match) continue;
           }
 
-          // Matched (or no `when` = default)
-          await this.executeAgent(state, branchCase.agent, ctx, branchCase);
+          // Matched (or no `when` = default). itemIndex = matched case index.
+          await this.executeAgent(state, branchCase.agent, ctx, branchCase, caseIndex);
           return;
         }
 
@@ -2161,7 +2190,8 @@ export class Workflow<
           }
         }
 
-        await this.executeAgent(state, agent, ctx, config);
+        // itemIndex = the selected key.
+        await this.executeAgent(state, agent, ctx, config, key);
       },
     };
     return this.appendStep<TNextOutput>(node);
@@ -2196,6 +2226,22 @@ export class Workflow<
         index: number;
         ctx: Readonly<TContext>;
       }) => MaybePromise<TNextOutput | typeof Workflow.SKIP>;
+      /**
+       * **Stream-mode + agent-target only.** When the workflow is run via
+       * `.stream(...)`, each item's agent runs in stream mode and this hook
+       * decides how its stream surfaces to the writer (`itemIndex` = the item
+       * index). Without it, agent items run in generate mode (no auto-merge —
+       * unlike a single `.step(agent)`, foreach never auto-merges N streams).
+       * Not invoked for `SealedWorkflow` targets (which stream transitively via
+       * their own steps) nor in generate mode.
+       */
+      handleStream?: (params: {
+        result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
+        writer: UIMessageStreamWriter;
+        ctx: Readonly<TContext>;
+        input: ElementOf<TOutput>;
+        itemIndex: number;
+      }) => MaybePromise<void>;
     },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
     // Validate up front: a positive integer or `Infinity` (full fan-out,
@@ -2211,7 +2257,13 @@ export class Workflow<
     }
     const concurrency = options?.concurrency ?? 1;
     const onError = options?.onError;
+    const handleStream = options?.handleStream;
     const isWorkflow = target instanceof SealedWorkflow;
+    // Agent items inherit the parent's stream mode + writer ONLY when a
+    // handleStream is supplied (otherwise they run generate — foreach never
+    // auto-merges N streams). Workflow items always inherit, so the nested
+    // pipeline streams transitively via its own steps when the parent streams.
+    const inheritStreaming = isWorkflow || handleStream !== undefined;
     const defaultId = isWorkflow
       ? (target.id ?? "foreach")
       : `foreach:${(target as Agent<TContext, ElementOf<TOutput>, TNextOutput>).id}`;
@@ -2241,7 +2293,8 @@ export class Workflow<
           const itemState: RuntimeState = {
             ctx: state.ctx,
             output: item,
-            mode: "generate",
+            mode: inheritStreaming ? state.mode : "generate",
+            writer: inheritStreaming ? state.writer : undefined,
             abortSignal: state.abortSignal,
           };
           itemStates[index] = itemState;
@@ -2253,7 +2306,17 @@ export class Workflow<
             if (isWorkflow) {
               await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
             } else {
-              await this.executeAgent(itemState, target as Agent<TContext, unknown, TNextOutput>, ctx);
+              await this.executeAgent(
+                itemState,
+                target as Agent<TContext, unknown, TNextOutput>,
+                ctx,
+                // foreach narrows handleStream's itemIndex to `number` for the
+                // caller; the internal AgentStepHooks shape is `number | string`.
+                // executeAgent always forwards the numeric `index` below, so the
+                // cast is sound.
+                handleStream ? ({ handleStream } as AgentStepHooks<TContext, unknown, TNextOutput>) : undefined,
+                index,
+              );
             }
             results[index] = itemState.output;
             await this.fireHook(state, "onItemFinish", {
@@ -2424,31 +2487,31 @@ export class Workflow<
   /** Record-form + `onError`. Values are `BranchOutput | undefined` (SKIP-able). */
   parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
     branches: TBranches,
-    options: ParallelOptions<TContext> & { onError: NonNullable<ParallelOptions<TContext>["onError"]> },
+    options: ParallelOptions<TContext, TOutput> & { onError: NonNullable<ParallelOptions<TContext, TOutput>["onError"]> },
   ): Workflow<TContext, TInput, ParallelOutputRecordPartial<TBranches>, TGates>;
 
   /** Record-form overload. Returns `{ [K]: BranchOutput<T[K]> }`. */
   parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
     branches: TBranches,
-    options?: ParallelOptions<TContext>,
+    options?: ParallelOptions<TContext, TOutput>,
   ): Workflow<TContext, TInput, ParallelOutputRecord<TBranches>, TGates>;
 
   /** Tuple-form + `onError`. Each slot is `BranchOutput | undefined` (SKIP-able). */
   parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
     branches: TBranches,
-    options: ParallelOptions<TContext> & { onError: NonNullable<ParallelOptions<TContext>["onError"]> },
+    options: ParallelOptions<TContext, TOutput> & { onError: NonNullable<ParallelOptions<TContext, TOutput>["onError"]> },
   ): Workflow<TContext, TInput, ParallelOutputTuplePartial<TBranches>, TGates>;
 
   /** Tuple-form overload. Returns `[O1, O2, ...]`. Use `as const`. */
   parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
     branches: TBranches,
-    options?: ParallelOptions<TContext>,
+    options?: ParallelOptions<TContext, TOutput>,
   ): Workflow<TContext, TInput, ParallelOutputTuple<TBranches>, TGates>;
 
   // Implementation
   parallel(
     branches: Record<string, ParallelTarget<TContext, TOutput>> | ReadonlyArray<ParallelTarget<TContext, TOutput>>,
-    options?: ParallelOptions<TContext>,
+    options?: ParallelOptions<TContext, TOutput>,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Workflow<TContext, TInput, any, TGates> {
     const isTuple = Array.isArray(branches);
@@ -2481,6 +2544,7 @@ export class Workflow<
       );
     }
     const onError = options?.onError;
+    const handleStream = options?.handleStream;
     const id = options?.id ?? (isTuple ? "parallel:tuple" : "parallel:record");
 
     const node: StepNode = {
@@ -2494,10 +2558,21 @@ export class Workflow<
         const branchStates: (RuntimeState | undefined)[] = new Array(branchCount);
 
         const executeBranch = async ({ key, index, target }: { key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }) => {
+          const isWorkflowBranch = target instanceof SealedWorkflow;
+          // Agent branches inherit the parent's stream mode + writer ONLY when a
+          // handleStream is supplied (else generate — no auto-merge of N
+          // streams). Workflow branches always inherit, streaming transitively.
+          const inheritStreaming = isWorkflowBranch || handleStream !== undefined;
           // Per-branch state — same isolation as foreach (no runOptions), but
           // abortSignal IS forwarded so cancellation is transitive into branch
           // agent/SDK calls and nested-workflow branches.
-          const branchState: RuntimeState = { ctx: state.ctx, output: input, mode: "generate", abortSignal: state.abortSignal };
+          const branchState: RuntimeState = {
+            ctx: state.ctx,
+            output: input,
+            mode: inheritStreaming ? state.mode : "generate",
+            writer: inheritStreaming ? state.writer : undefined,
+            abortSignal: state.abortSignal,
+          };
           branchStates[index] = branchState;
           const branchStart = performance.now();
           // itemIndex is the key for record form, numeric index for tuple form.
@@ -2506,10 +2581,16 @@ export class Workflow<
             stepId: id, type: "parallel", itemIndex, ctx: state.ctx, input,
           });
           try {
-            if (target instanceof SealedWorkflow) {
+            if (isWorkflowBranch) {
               await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
             } else {
-              await this.executeAgent(branchState, target as Agent<TContext, unknown, unknown>, ctx);
+              await this.executeAgent(
+                branchState,
+                target as Agent<TContext, unknown, unknown>,
+                ctx,
+                handleStream ? ({ handleStream } as AgentStepHooks<TContext, unknown, unknown>) : undefined,
+                itemIndex,
+              );
             }
             results[key] = branchState.output;
             await this.fireHook(state, "onItemFinish", {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
 import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
-import { createMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
+import { createMockModel, createReplayableMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
 function createTextAgent(id: string, text: string): Agent<TestCtx, void, string> {
@@ -491,6 +491,181 @@ describe("Workflow", () => {
 
       await expect(run).rejects.toThrow(/kill/);
       expect(seenStepId).toBe("::pipeai::abort");
+    });
+  });
+
+  describe("per-item/branch handleStream streaming", () => {
+    // Helper: drain a workflow stream, returning the chunks and resolved output.
+    const drain = async (s: ReadableStream) => {
+      const reader = s.getReader();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const chunks: any[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      return chunks;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const textChunks = (chunks: any[]) =>
+      chunks.filter((c) => typeof c.type === "string" && c.type.startsWith("text"));
+
+    it("foreach: handleStream fires per item with numeric itemIndex and surfaces to the writer", async () => {
+      const seen: Array<{ itemIndex: number | string | undefined; input: unknown }> = [];
+      // Single agent reused across items → needs a fresh stream per call.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const agent = new Agent<TestCtx, any, any>({
+        id: "proc",
+        model: createReplayableMockModel("ITEM"),
+        prompt: (_ctx: TestCtx, input: string) => input,
+      });
+      const pipeline = Workflow.create<TestCtx, string[]>()
+        .foreach(agent, {
+          handleStream: ({ result, writer, input, itemIndex }) => {
+            seen.push({ itemIndex, input });
+            writer.merge(result.toUIMessageStream());
+          },
+        });
+
+      const { stream, output } = pipeline.stream(testCtx, ["a", "b", "c"]);
+      const chunks = await drain(stream);
+      const result = expectComplete(await output);
+
+      // Sequential (default concurrency 1) → ordered indices.
+      expect(seen.map((s) => s.itemIndex)).toEqual([0, 1, 2]);
+      expect(seen.map((s) => s.input)).toEqual(["a", "b", "c"]);
+      // The handler merged → item text reached the stream.
+      expect(textChunks(chunks).length).toBeGreaterThan(0);
+      expect(result.output).toEqual(["ITEM", "ITEM", "ITEM"]);
+    });
+
+    it("foreach: agent target without handleStream does NOT auto-merge (no item text on the stream)", async () => {
+      const agent = createPassthroughAgent("proc", "SHOULD_NOT_APPEAR");
+      const pipeline = Workflow.create<TestCtx, string[]>().foreach(agent);
+
+      const { stream, output } = pipeline.stream(testCtx, ["a", "b"]);
+      const chunks = await drain(stream);
+      const result = expectComplete(await output);
+
+      expect(textChunks(chunks)).toHaveLength(0);
+      // Output still produced (items ran in generate mode).
+      expect(result.output).toEqual(["SHOULD_NOT_APPEAR", "SHOULD_NOT_APPEAR"]);
+    });
+
+    it("parallel record: handleStream fires per branch with itemIndex = key", async () => {
+      const seen: Array<number | string | undefined> = [];
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      const pipeline = Workflow.create<TestCtx, string>()
+        .parallel(
+          { alpha: a, beta: b },
+          {
+            concurrency: 1,
+            handleStream: ({ result, writer, itemIndex }) => {
+              seen.push(itemIndex);
+              writer.merge(result.toUIMessageStream());
+            },
+          },
+        );
+
+      const { stream, output } = pipeline.stream(testCtx, "x");
+      await drain(stream);
+      await output;
+
+      expect(seen.sort()).toEqual(["alpha", "beta"]);
+    });
+
+    it("parallel tuple: handleStream itemIndex = numeric index", async () => {
+      const seen: Array<number | string | undefined> = [];
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      const pipeline = Workflow.create<TestCtx, string>()
+        .parallel([a, b] as const, {
+          concurrency: 1,
+          handleStream: ({ result, writer, itemIndex }) => {
+            seen.push(itemIndex);
+            writer.merge(result.toUIMessageStream());
+          },
+        });
+
+      const { stream, output } = pipeline.stream(testCtx, "x");
+      await drain(stream);
+      await output;
+
+      expect(seen.sort()).toEqual([0, 1]);
+    });
+
+    it("branch select: handleStream receives itemIndex = matched key", async () => {
+      let seenIndex: number | string | undefined = "unset";
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      const pipeline = Workflow.create<TestCtx, string>()
+        .branch({
+          select: (): "first" | "second" => "second",
+          agents: { first: a, second: b },
+          handleStream: ({ result, writer, itemIndex }) => {
+            seenIndex = itemIndex;
+            writer.merge(result.toUIMessageStream());
+          },
+        });
+
+      const { stream, output } = pipeline.stream(testCtx, "x");
+      await drain(stream);
+      await output;
+
+      expect(seenIndex).toBe("second");
+    });
+
+    it("branch predicate: handleStream receives itemIndex = matched case index", async () => {
+      let seenIndex: number | string | undefined = "unset";
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      const pipeline = Workflow.create<TestCtx, string>()
+        .branch([
+          { when: () => false, agent: a },
+          {
+            when: () => true,
+            agent: b,
+            handleStream: ({ result, writer, itemIndex }) => {
+              seenIndex = itemIndex;
+              writer.merge(result.toUIMessageStream());
+            },
+          },
+        ]);
+
+      const { stream, output } = pipeline.stream(testCtx, "x");
+      await drain(stream);
+      await output;
+
+      expect(seenIndex).toBe(1);
+    });
+
+    it("generate mode never calls handleStream (foreach)", async () => {
+      const agent = createPassthroughAgent("proc", "X");
+      let called = false;
+      const pipeline = Workflow.create<TestCtx, string[]>()
+        .foreach(agent, {
+          handleStream: () => { called = true; },
+        });
+
+      await pipeline.generate(testCtx, ["a", "b"]);
+      expect(called).toBe(false);
+    });
+
+    it("foreach over a nested workflow streams transitively when the parent streams", async () => {
+      const inner = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("inner", "NESTED"));
+      const pipeline = Workflow.create<TestCtx, string[]>()
+        .foreach(inner);
+
+      const { stream, output } = pipeline.stream(testCtx, ["a"]);
+      const chunks = await drain(stream);
+      const result = expectComplete(await output);
+
+      // The nested workflow's single agent step auto-merges per its own rules.
+      expect(textChunks(chunks).length).toBeGreaterThan(0);
+      expect(result.output).toEqual(["NESTED"]);
     });
   });
 

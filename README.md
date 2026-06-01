@@ -519,7 +519,7 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Array iteration via `foreach()`
 
-`foreach()` maps each element of an array output through an agent or workflow. Items run in generate mode to avoid interleaved streams:
+`foreach()` maps each element of an array output through an agent or workflow. By default items run in generate mode — `foreach` never auto-merges, since merging N concurrent streams would interleave into a garbled message (see [Streaming items](#streaming-foreach--parallel-items) to opt in via `handleStream`):
 
 ```ts
 const summarizer = new Agent<Ctx, string, string>({
@@ -556,6 +556,33 @@ const pipeline = Workflow.create<Ctx>()
   .step("fetch-items", async ({ ctx }) => ctx.db.items.getAll())
   .foreach(processItem, { concurrency: 5 });
 ```
+
+#### Streaming `foreach` / `parallel` items
+
+When the workflow is run with `.stream(...)`, pass `handleStream` to `foreach` or `parallel` to run each **agent** item/branch in stream mode and control how it surfaces to the writer — the same hook as a single `.step(agent)`, plus an `itemIndex`:
+
+```ts
+// foreach: itemIndex is the numeric item index
+.foreach(summarizer, {
+  handleStream: ({ result, writer, input, itemIndex }) => {
+    writer.write({ type: "data-item-start", data: { itemIndex } });
+    writer.merge(result.toUIMessageStream());
+  },
+})
+
+// parallel record form: itemIndex is the branch key
+.parallel({ summary: summarizer, sentiment: classifier }, {
+  handleStream: ({ result, writer, itemIndex }) => {
+    if (itemIndex === "summary") writer.merge(result.toUIMessageStream());
+  },
+})
+```
+
+- **No `handleStream`** → agent items run in generate mode (no auto-merge). `foreach`/`parallel` never auto-merge; you opt into surfacing explicitly.
+- **`SealedWorkflow` items/branches** stream transitively via their own steps when the parent streams — `handleStream` is not called for them.
+- `itemIndex`: `number` for `foreach` and tuple `parallel`; the key (`string`) for record `parallel`. `branch` threads the matched key (select) / case index (predicate) into its existing `handleStream`.
+- With `foreach`'s default `concurrency: 1`, items stream sequentially (ordered). Higher concurrency / `parallel`'s concurrent default interleaves parts (id-keyed, non-corrupting, but nondeterministic order).
+- Generate-mode runs (`.generate(...)`) never call `handleStream`.
 
 #### Per-item error recovery via `onError`
 
@@ -598,6 +625,8 @@ const pipeline = Workflow.create<Ctx, string>()
 ```
 
 The same input (`state.output`) is fed to each branch. Default concurrency is `min(branches.length, 5)` — most users want fan-out, but the cap protects against rate-limit pressure. Pass `concurrency: Infinity` (or `branches.length`) to opt out.
+
+Like `foreach`, `parallel` runs agent branches in generate mode and never auto-merges; pass `handleStream` to surface branch streams in a `.stream(...)` run — see [Streaming items](#streaming-foreach--parallel-items).
 
 ```ts
 .parallel({ a, b, c, d, e, f, g, h }, { concurrency: 3 })     // explicit override
