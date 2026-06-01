@@ -536,14 +536,16 @@ const pipeline = Workflow.create<Ctx>()
   .step("combine", ({ input }) => input.join("\n\n"));
 ```
 
-Concurrent processing with bounded parallelism:
+By default `foreach` is **unbounded** — every item runs concurrently. Pass `concurrency` to throttle (e.g. against provider rate limits):
 
 ```ts
-// Up to 3 items run simultaneously; the next launches as soon as one finishes.
+// Cap at 3 items in flight; the next launches as soon as one finishes.
 .foreach(summarizer, { concurrency: 3 })
 ```
 
-`concurrency` is the **maximum number of items in flight at any moment** — backed by a semaphore. There's no lockstep batching: a slow item never blocks a finished slot from picking up the next pending one.
+`concurrency` is the **maximum number of items in flight at any moment** — backed by a worker pool. There's no lockstep batching: a slow item never blocks a finished slot from picking up the next pending one.
+
+> **Rate-limit hazard:** the unbounded default fires all items at once. For large arrays against a rate-limited provider, set an explicit `concurrency`.
 
 Works with nested workflows too:
 
@@ -581,7 +583,7 @@ When the workflow is run with `.stream(...)`, pass `handleStream` to `foreach` o
 - **No `handleStream`** → agent items run in generate mode (no auto-merge). `foreach`/`parallel` never auto-merge; you opt into surfacing explicitly.
 - **`SealedWorkflow` items/branches** stream transitively via their own steps when the parent streams — `handleStream` is not called for them.
 - `itemIndex`: `number` for `foreach` and tuple `parallel`; the key (`string`) for record `parallel`. `branch` threads the matched key (select) / case index (predicate) into its existing `handleStream`.
-- With `foreach`'s default `concurrency: 1`, items stream sequentially (ordered). Higher concurrency / `parallel`'s concurrent default interleaves parts (id-keyed, non-corrupting, but nondeterministic order).
+- Both default to unbounded concurrency, so streamed parts **interleave** (id-keyed, non-corrupting, but nondeterministic order). Set `concurrency: 1` if you want each item/branch to stream sequentially in order.
 - Generate-mode runs (`.generate(...)`) never call `handleStream`.
 
 #### Per-item error recovery via `onError`
@@ -624,7 +626,7 @@ const pipeline = Workflow.create<Ctx, string>()
   .parallel([researcher, critic] as const);
 ```
 
-The same input (`state.output`) is fed to each branch. Default concurrency is `min(branches.length, 5)` — most users want fan-out, but the cap protects against rate-limit pressure. Pass `concurrency: Infinity` (or `branches.length`) to opt out.
+The same input (`state.output`) is fed to each branch. By default `parallel` is **unbounded** — all branches run concurrently. Pass an explicit `concurrency` to throttle against rate-limit pressure.
 
 Like `foreach`, `parallel` runs agent branches in generate mode and never auto-merges; pass `handleStream` to surface branch streams in a `.stream(...)` run — see [Streaming items](#streaming-foreach--parallel-items).
 
@@ -653,7 +655,7 @@ Like `foreach`, `parallel` runs agent branches in generate mode and never auto-m
 
 Gates inside parallel branches throw `NestedGateUnsupportedError`, same as `foreach` concurrent. The lowest-index suspending branch wins the marker; others contribute to `siblingSuspensions`. Multi-branch suspension semantics are finalized in F0.6 alongside `cancelOnFirstSuspend` — until then, all branches run to completion (or sibling-failure) before the marker reaches the caller.
 
-> **Rate-limit hazard:** `parallel`'s default `min(N, 5)` assumes ≥5 RPS headroom on your model provider. Symptoms of overflow: 429s and stair-stepped latency.
+> **Rate-limit hazard:** `parallel`'s unbounded default fires all branches at once. With many branches on a rate-limited provider, set an explicit `concurrency`. Symptoms of overflow: 429s and stair-stepped latency.
 
 > **Concurrent ctx-mutation hazard:** branches share the `ctx` object by reference. Treat `ctx` as immutable inside parallel branches.
 
@@ -748,7 +750,7 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | `.step(id, fn)`           | Transform the output. `fn` receives `{ ctx, input }` and returns the new output. |
 | `.branch([...cases])`     | Predicate routing. First `when` match wins; case without `when` is default. |
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
-| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: 1). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
+| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: unbounded). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
 | `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
 | `.gate(id, opts?)`        | Human-in-the-loop suspension point. Returns a result with `status: "suspended"` carrying a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
 | `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. Bypassed on suspension. |

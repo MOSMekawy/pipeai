@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   - `generateId?: IdGenerator` — overrides the response message-id generator. Useful for deterministic IDs in tests or coordinating with a server-side ID space.
 - **`WorkflowStreamOptions` is now generic** over `UI_MESSAGE extends UIMessage`, default `UIMessage`. `Workflow.stream` / `ResumedWorkflow.stream` / `CheckpointResumedWorkflow.stream` all accept the same method-local generic, so consumers can pass a narrower `UIMessage<METADATA, DATA_PARTS, TOOLS>` and have `onFinish`'s `responseMessage` / `messages` narrow accordingly. Existing call sites continue to compile against the `UIMessage` default.
 
+### Changed
+
+- **`foreach` and `parallel` now default to unbounded concurrency.** When `concurrency` is omitted, both run every item/branch concurrently (clamped only by item/branch count) instead of `foreach`'s old sequential default (`1`) and `parallel`'s old `min(branches.length, 5)` cap. The `parallel` cap removal also drops its one-time "capped at concurrency 5" warning. **Heads-up:** the prior defaults guarded against provider rate limits — pass an explicit integer `concurrency` to throttle large fan-outs (a `foreach` over N items now fires N concurrent calls by default).
+
 ### Removed
 
 - **`getActiveWriter` is no longer exported from `pipeai`** (was added to the public surface in 0.8.0). It remains the internal mechanism that powers the writer hand-off, but is no longer a supported extension point. Reach the writer through the explicit paths instead: `defineTool` / `ToolProvider` inject `writer` into `execute(input, ctx, { writer })`, agent `onStepFinish` / `onFinish` / `onError` callbacks receive it, and inline `Workflow.step(id, fn)` handlers receive it. A hand-rolled `IToolProvider` (not built via `defineTool` / `ToolProvider`) that needs the writer should wrap its definition in `ToolProvider`/`defineTool`, which performs the injection.

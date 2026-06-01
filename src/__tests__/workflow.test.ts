@@ -522,6 +522,7 @@ describe("Workflow", () => {
       });
       const pipeline = Workflow.create<TestCtx, string[]>()
         .foreach(agent, {
+          concurrency: 1, // pin sequential so the handler-call order is deterministic
           handleStream: ({ result, writer, input, itemIndex }) => {
             seen.push({ itemIndex, input });
             writer.merge(result.toUIMessageStream());
@@ -532,7 +533,7 @@ describe("Workflow", () => {
       const chunks = await drain(stream);
       const result = expectComplete(await output);
 
-      // Sequential (default concurrency 1) → ordered indices.
+      // concurrency: 1 → ordered indices.
       expect(seen.map((s) => s.itemIndex)).toEqual([0, 1, 2]);
       expect(seen.map((s) => s.input)).toEqual(["a", "b", "c"]);
       // The handler merged → item text reached the stream.
@@ -1570,6 +1571,31 @@ describe("Workflow", () => {
         await pipeline.generate(testCtx);
         expect(maxInFlight).toBeLessThanOrEqual(3);
         expect(maxInFlight).toBe(3);
+      });
+
+      it("defaults to unbounded concurrency (no cap) — all items run in flight", async () => {
+        let inFlight = 0;
+        let maxInFlight = 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const agent = new Agent<TestCtx, any, any>({
+          id: "tracker",
+          model: createMockModel("ok"),
+          prompt: async (_ctx: TestCtx, input: string) => {
+            inFlight++;
+            if (inFlight > maxInFlight) maxInFlight = inFlight;
+            await new Promise(r => setTimeout(r, 5));
+            inFlight--;
+            return input;
+          },
+        });
+
+        const items = Array.from({ length: 12 }, (_, i) => String(i));
+        const pipeline = Workflow.create<TestCtx>()
+          .step("items", () => items)
+          .foreach(agent); // no concurrency → unbounded
+
+        await pipeline.generate(testCtx);
+        expect(maxInFlight).toBe(12);
       });
 
       it("launches the next item as soon as one completes (no lockstep)", async () => {
@@ -3371,7 +3397,10 @@ describe("Workflow", () => {
 
       const pipeline = Workflow.create<TestCtx>()
         .step("seed", () => [0, 1, 2, 3, 4] as number[])
-        .foreach(itemAgent);
+        // concurrency: 1 so the between-items abort check is observable — with
+        // the unbounded default all items launch in the same tick before the
+        // abort fires (a launched item can't be yanked back).
+        .foreach(itemAgent, { concurrency: 1 });
 
       await expect(
         pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
@@ -3943,7 +3972,7 @@ describe("Workflow", () => {
     });
 
     describe("concurrency", () => {
-      it("default concurrency is min(branches.length, 5) — 3 branches → 3 in flight", async () => {
+      it("default concurrency is unbounded — 3 branches all run in flight", async () => {
         let maxConcurrent = 0;
         let current = 0;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3965,7 +3994,7 @@ describe("Workflow", () => {
         expect(maxConcurrent).toBe(3);
       });
 
-      it("> 5 branches without explicit concurrency caps at 5 and warn-once fires", async () => {
+      it("> 5 branches without explicit concurrency run unbounded and do NOT warn", async () => {
         const { __resetWarnOnceForTests } = await import("../utils");
         __resetWarnOnceForTests();
         const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -3987,9 +4016,9 @@ describe("Workflow", () => {
           for (let i = 0; i < 8; i++) branches[`b${i}`] = slow(`b${i}`);
           const pipeline = Workflow.create<TestCtx, string>().step("init", ({ input }) => input).parallel(branches);
           await pipeline.generate(testCtx, "x");
-          expect(maxConcurrent).toBe(5);
-          expect(warnSpy).toHaveBeenCalled();
-          expect((warnSpy.mock.calls[0][0] as string)).toMatch(/parallel\(\) with 8 branches capped at concurrency 5/);
+          // No cap by default → all 8 run; no rate-limit warning.
+          expect(maxConcurrent).toBe(8);
+          expect(warnSpy).not.toHaveBeenCalled();
         } finally {
           warnSpy.mockRestore();
         }

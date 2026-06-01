@@ -588,10 +588,9 @@ export interface ParallelOptions<TContext, TOutput = unknown> {
   /** Override the default step id. Default: `parallel:record` or `parallel:tuple`. */
   id?: string;
   /**
-   * Max branches in flight at any moment. Default: `min(branches.length, 5)`.
-   * Pass `Infinity` (or `branches.length`) for full fan-out on >5-branch calls
-   * — the default caps at 5 to protect against rate limits and emits a
-   * one-time warn when the cap kicks in.
+   * Max branches in flight at any moment. **Default: unbounded** (`Infinity` —
+   * all branches run concurrently, clamped only by branch count). Pass an
+   * integer to throttle against provider rate limits.
    */
   concurrency?: number;
   /**
@@ -815,6 +814,117 @@ function pushWarning(
  */
 function demotePendingError(state: RuntimeState, pe: PendingError): void {
   pushWarning(state, pe.source, pe.stepId, pe.error);
+}
+
+/** A unit (foreach item / parallel branch) that rejected. */
+type UnitFailure = { key: string | number; index: number; error: unknown };
+
+/**
+ * Shared concurrent-dispatch core for `foreach` and `parallel`. Runs `count`
+ * units through `runUnit(index)` — sequentially when `concurrency <= 1`,
+ * otherwise via a worker pool of `min(concurrency, count)` closures sharing a
+ * counter (`Infinity` → full fan-out, since `Math.min(Infinity, count) === count`).
+ *
+ * Both callers share the same post-dispatch contract, handled here:
+ *   1. Cooperative cancellation — bail before launching each unit; in-flight
+ *      units forwarded the signal so the SDK tears them down.
+ *   2. Merge each unit's warnings into the parent, namespaced `id[key]:stepId`.
+ *   3. Abort wins over onError AND suspension: pre-abort failures become
+ *      `foreach-sibling` warnings, then the abort reason rethrows.
+ *   4. A nested-gate rejection suspends (bypassing onError): non-gate failures
+ *      become warnings and the lowest-index gate marker rethrows, carrying the
+ *      others as sibling errors / suspensions.
+ *
+ * Returns the non-gate failures (index-sorted) for the caller's `onError`
+ * handling. Throws on abort or suspension — callers must run no other cleanup
+ * after this resolves on those paths.
+ */
+async function runUnitsConcurrently(
+  state: RuntimeState,
+  id: string,
+  count: number,
+  concurrency: number,
+  keyAt: (index: number) => string | number,
+  unitStates: ReadonlyArray<RuntimeState | undefined>,
+  runUnit: (index: number) => Promise<void>,
+): Promise<UnitFailure[]> {
+  const signal = state.abortSignal;
+  const failures: UnitFailure[] = [];
+
+  if (concurrency <= 1) {
+    for (let i = 0; i < count; i++) {
+      if (signal?.aborted) break;
+      try {
+        await runUnit(i);
+      } catch (error) {
+        failures.push({ key: keyAt(i), index: i, error });
+      }
+    }
+  } else {
+    // Worker pool: K closures share `nextIndex` rather than N closures queuing
+    // on a semaphore. The read+increment is synchronous (JS is single-threaded)
+    // and the following `await` yields only AFTER the index is captured.
+    let nextIndex = 0;
+    const worker = async () => {
+      while (true) {
+        const i = nextIndex++;
+        if (i >= count) return;
+        if (signal?.aborted) return;
+        try {
+          await runUnit(i);
+        } catch (error) {
+          failures.push({ key: keyAt(i), index: i, error });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, count) }, () => worker()));
+  }
+
+  failures.sort((a, b) => a.index - b.index);
+
+  // Merge per-unit warnings into the parent (every exit path, once).
+  for (let i = 0; i < count; i++) {
+    const us = unitStates[i];
+    if (!us?.warnings) continue;
+    for (const w of us.warnings) {
+      pushWarning(state, w.source, `${id}[${keyAt(i)}]:${w.stepId}`, w.error);
+    }
+  }
+
+  // Cooperative cancellation wins over onError and suspension (mirror `repeat`,
+  // which rethrows the abort reason rather than routing it through recovery).
+  if (signal?.aborted) {
+    for (const f of failures) {
+      pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
+    }
+    throw signal.reason ?? new Error("Workflow aborted");
+  }
+
+  // Partition gate vs non-gate. `failures` is already index-sorted, so each
+  // partition preserves index order.
+  const gateFailures: UnitFailure[] = [];
+  const nonGateFailures: UnitFailure[] = [];
+  for (const f of failures) {
+    if (f.error instanceof NestedGateUnsupportedError) gateFailures.push(f);
+    else nonGateFailures.push(f);
+  }
+
+  if (gateFailures.length > 0) {
+    // Suspension path — onError is bypassed; non-gate rejections become
+    // warnings and the lowest-index gate marker wins.
+    for (const nr of nonGateFailures) {
+      pushWarning(state, "foreach-sibling", `${id}[${nr.key}]`, nr.error);
+    }
+    const lowest = gateFailures[0].error as NestedGateUnsupportedError;
+    const otherSuspensions = gateFailures.slice(1).map(g => ({
+      index: g.index,
+      gateId: (g.error as NestedGateUnsupportedError).gateId,
+    }));
+    const siblingErrors = nonGateFailures.map(nr => nr.error);
+    throw new NestedGateUnsupportedError(lowest.gateId, lowest.workflowId, siblingErrors, otherSuspensions);
+  }
+
+  return nonGateFailures;
 }
 
 /**
@@ -1617,7 +1727,7 @@ export class SealedWorkflow<
       priorOutput: gateLike.output,
       snapshot: gateLike,
       observability: this.observability,
-    });
+    }); 
   }
 
   // ── Checkpoint resume ──────────────────────────────────────────
@@ -2206,8 +2316,10 @@ export class Workflow<
    * @param options.id Override the default step id (`foreach:<agentId>` or
    *   the workflow's id). Required when chaining multiple foreach over the same
    *   target — the construction-time `(type, id)` walk rejects duplicates.
-   * @param options.concurrency Max items in flight at any moment (default 1).
-   *   Backed by a semaphore: as soon as one item completes, the next launches —
+   * @param options.concurrency Max items in flight at any moment. **Default:
+   *   unbounded** (`Infinity` — every item runs concurrently, clamped only by
+   *   item count). Pass an integer to throttle against provider rate limits.
+   *   Backed by a worker pool: as soon as one item completes, the next launches —
    *   no lockstep batching.
    * @param options.onError Per-iteration error handler. **Bypassed entirely on
    *   the suspension path** (when any item hits a nested gate) — see the
@@ -2255,7 +2367,7 @@ export class Workflow<
     ) {
       throw new Error(`foreach: concurrency must be a positive integer or Infinity, got ${options.concurrency}`);
     }
-    const concurrency = options?.concurrency ?? 1;
+    const concurrency = options?.concurrency ?? Infinity;
     const onError = options?.onError;
     const handleStream = options?.handleStream;
     const isWorkflow = target instanceof SealedWorkflow;
@@ -2332,23 +2444,24 @@ export class Workflow<
           }
         };
 
-        // Merge per-item warnings into the parent state, namespaced.
-        // Runs on EVERY exit path (success, suspension, or onError throw).
-        const mergeItemWarnings = () => {
-          for (let idx = 0; idx < items.length; idx++) {
-            const its = itemStates[idx];
-            if (!its?.warnings) continue;
-            for (const w of its.warnings) {
-              pushWarning(state, w.source, `${id}[${idx}]:${w.stepId}`, w.error);
-            }
-          }
-        };
+        // Dispatch + warning-merge + abort + gate-suspension partition is
+        // shared with `parallel`. foreach's per-item key IS its index.
+        const nonGateFailures = await runUnitsConcurrently(
+          state,
+          id,
+          items.length,
+          concurrency,
+          (i) => i,
+          itemStates,
+          (i) => executeItem(items[i], i),
+        );
 
-        const handleRejection = async (error: unknown, item: unknown, index: number) => {
+        // No suspension — run onError per existing semantics in index order.
+        for (const { index, error } of nonGateFailures) {
           if (!onError) throw error;
           const recovered = await onError({
             error,
-            item: item as ElementOf<TOutput>,
+            item: items[index] as ElementOf<TOutput>,
             index,
             ctx: state.ctx as Readonly<TContext>,
           });
@@ -2357,108 +2470,6 @@ export class Workflow<
           } else {
             results[index] = recovered;
           }
-        };
-
-        // Collect rejections, then partition + branch.
-        type Failure = { index: number; error: unknown };
-        const failures: Failure[] = [];
-
-        // Cooperative cancellation: bail before launching each item so a
-        // large foreach doesn't fire off all items just because the parent's
-        // abortSignal triggered mid-iteration. In-flight items already running
-        // can't be yanked back, but their executeAgent call forwarded the
-        // signal so the SDK side will tear them down.
-        const signal = state.abortSignal;
-
-        if (concurrency <= 1) {
-          for (let i = 0; i < items.length; i++) {
-            // Cooperative cancellation: stop launching. The abort is handled
-            // after the loop (bypassing onError) — don't fabricate a failure.
-            if (signal?.aborted) break;
-            try {
-              await executeItem(items[i], i);
-            } catch (error) {
-              failures.push({ index: i, error });
-            }
-          }
-        } else {
-          // Worker pool: O(concurrency) async closures share a counter rather
-          // than O(N) closures all queuing on a semaphore. The shared
-          // `nextIndex++` is safe because JS is single-threaded — the
-          // read+increment is synchronous and the following `await` yields
-          // AFTER the index is captured.
-          let nextIndex = 0;
-          const worker = async () => {
-            while (true) {
-              const i = nextIndex++;
-              if (i >= items.length) return;
-              // Cooperative cancellation: stop this worker. Abort handled after.
-              if (signal?.aborted) return;
-              try {
-                await executeItem(items[i], i);
-              } catch (error) {
-                failures.push({ index: i, error });
-              }
-            }
-          };
-          const workers = Array.from(
-            { length: Math.min(concurrency, items.length) },
-            () => worker(),
-          );
-          await Promise.all(workers);
-        }
-
-        failures.sort((a, b) => a.index - b.index);
-
-        // Always merge per-item warnings before any exit path (once).
-        mergeItemWarnings();
-
-        // Cooperative cancellation wins over BOTH onError and suspension —
-        // mirror `repeat`, which rethrows the abort reason rather than routing
-        // it through recovery. Failures collected before the abort are kept as
-        // warnings; the abort reason propagates so execute()'s abort path tears
-        // the run down.
-        if (signal?.aborted) {
-          for (const f of failures) {
-            pushWarning(state, "foreach-sibling", `${id}[${f.index}]`, f.error);
-          }
-          throw signal.reason ?? new Error("Workflow aborted");
-        }
-
-        // Partition into gate vs non-gate rejections.
-        const gateFailures: { index: number; error: NestedGateUnsupportedError }[] = [];
-        const nonGateFailures: Failure[] = [];
-        for (const f of failures) {
-          if (f.error instanceof NestedGateUnsupportedError) {
-            gateFailures.push({ index: f.index, error: f.error });
-          } else {
-            nonGateFailures.push(f);
-          }
-        }
-
-        if (gateFailures.length > 0) {
-          // Suspension path — onError is bypassed entirely. Non-gate rejections
-          // become foreach-sibling warnings. Lowest-index marker wins.
-          for (const nr of nonGateFailures) {
-            pushWarning(state, "foreach-sibling", `${id}[${nr.index}]`, nr.error);
-          }
-          const lowest = gateFailures[0];
-          const otherSuspensions = gateFailures.slice(1).map(g => ({
-            index: g.index,
-            gateId: g.error.gateId,
-          }));
-          const siblingErrors = nonGateFailures.map(nr => nr.error);
-          throw new NestedGateUnsupportedError(
-            lowest.error.gateId,
-            lowest.error.workflowId,
-            siblingErrors,
-            otherSuspensions,
-          );
-        }
-
-        // No suspension — run onError per existing semantics in index order.
-        for (const { index, error } of nonGateFailures) {
-          await handleRejection(error, items[index], index);
         }
 
         state.output = skipped.size === 0
@@ -2530,19 +2541,11 @@ export class Workflow<
     ) {
       throw new Error(`parallel: concurrency must be a positive integer or Infinity, got ${requestedConcurrency}`);
     }
-    let effectiveConcurrency: number;
-    if (requestedConcurrency === undefined) {
-      effectiveConcurrency = Math.min(branchCount, 5);
-    } else {
-      effectiveConcurrency = requestedConcurrency;
-    }
-    // Warn-once when >5 branches without explicit concurrency override.
-    if (requestedConcurrency === undefined && branchCount > 5) {
-      warnOnce(
-        "pipeai:parallel-cap",
-        `pipeai: parallel() with ${branchCount} branches capped at concurrency 5 by default. Pass { concurrency: ${branchCount} } (or Infinity) to opt in, or set { concurrency: N } if you want fewer.`,
-      );
-    }
+    // Default: unbounded (full fan-out, clamped only by branch count). Both
+    // `Infinity` and a finite override flow into the worker pool's
+    // `Math.min(_, count)`. No rate-limit cap by default — pass an explicit
+    // `concurrency` to throttle against provider limits.
+    const concurrency = requestedConcurrency ?? Infinity;
     const onError = options?.onError;
     const handleStream = options?.handleStream;
     const id = options?.id ?? (isTuple ? "parallel:tuple" : "parallel:record");
@@ -2606,93 +2609,17 @@ export class Workflow<
           }
         };
 
-        // Same partition + suspension contract as foreach concurrent.
-        type Failure = { key: string | number; index: number; error: unknown };
-        const failures: Failure[] = [];
-
-        // Cooperative cancellation: bail before launching each branch so an
-        // already-aborted run doesn't fire every branch (mirrors foreach). The
-        // abort is handled after the loop (bypassing onError).
-        const signal = state.abortSignal;
-
-        const eff = Number.isFinite(effectiveConcurrency) ? Math.max(1, effectiveConcurrency) : branchCount;
-        if (eff <= 1) {
-          for (const e of entries) {
-            if (signal?.aborted) break;
-            try {
-              await executeBranch(e);
-            } catch (error) {
-              failures.push({ key: e.key, index: e.index, error });
-            }
-          }
-        } else {
-          // Worker pool (same shape as foreach): K closures share a counter
-          // instead of N closures queuing on a semaphore.
-          let nextIndex = 0;
-          const worker = async () => {
-            while (true) {
-              const i = nextIndex++;
-              if (i >= branchCount) return;
-              if (signal?.aborted) return;
-              const e = entries[i];
-              try {
-                await executeBranch(e);
-              } catch (error) {
-                failures.push({ key: e.key, index: e.index, error });
-              }
-            }
-          };
-          const workers = Array.from(
-            { length: Math.min(eff, branchCount) },
-            () => worker(),
-          );
-          await Promise.all(workers);
-        }
-
-        // Always merge per-branch warnings into the parent, namespaced.
-        for (let idx = 0; idx < branchCount; idx++) {
-          const bs = branchStates[idx];
-          if (!bs?.warnings) continue;
-          for (const w of bs.warnings) {
-            pushWarning(state, w.source, `${id}[${entries[idx].key}]:${w.stepId}`, w.error);
-          }
-        }
-
-        // Cooperative cancellation wins over onError and suspension (mirrors
-        // foreach / repeat). Branches that errored from the forwarded abort are
-        // preserved as warnings; rethrow so execute()'s abort path tears down.
-        if (signal?.aborted) {
-          for (const f of failures) {
-            pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
-          }
-          throw signal.reason ?? new Error("Workflow aborted");
-        }
-
-        // Partition rejections into gate vs non-gate.
-        const gateFailures: { key: string | number; index: number; error: NestedGateUnsupportedError }[] = [];
-        const nonGateFailures: Failure[] = [];
-        for (const f of failures) {
-          if (f.error instanceof NestedGateUnsupportedError) gateFailures.push({ key: f.key, index: f.index, error: f.error });
-          else nonGateFailures.push(f);
-        }
-        gateFailures.sort((a, b) => a.index - b.index);
-        nonGateFailures.sort((a, b) => a.index - b.index);
-
-        if (gateFailures.length > 0) {
-          // Suspension path — onError bypassed; non-gate rejections become warnings.
-          for (const nr of nonGateFailures) {
-            pushWarning(state, "foreach-sibling", `${id}[${nr.key}]`, nr.error);
-          }
-          const lowest = gateFailures[0];
-          const otherSuspensions = gateFailures.slice(1).map(g => ({ index: g.index, gateId: g.error.gateId }));
-          const siblingErrors = nonGateFailures.map(nr => nr.error);
-          throw new NestedGateUnsupportedError(
-            lowest.error.gateId,
-            lowest.error.workflowId,
-            siblingErrors,
-            otherSuspensions,
-          );
-        }
+        // Dispatch + warning-merge + abort + gate-suspension partition is
+        // shared with `foreach`. Per-branch key is the record key / tuple index.
+        const nonGateFailures = await runUnitsConcurrently(
+          state,
+          id,
+          branchCount,
+          concurrency,
+          (i) => entries[i].key,
+          branchStates,
+          (i) => executeBranch(entries[i]),
+        );
 
         // No suspension — handle non-gate failures via onError or rethrow.
         for (const { key, index, error } of nonGateFailures) {
