@@ -224,6 +224,78 @@ describe("Workflow", () => {
       expect(expectComplete(await pipeline.generate(testCtx, "abc")).output).toBe(6);
       expect(expectComplete(await pipeline.generate(testCtx, "")).output).toBe(0);
     });
+
+    it("a skipped step still fires onStepStart / onStepFinish with the skip output", async () => {
+      const events: Array<{ phase: string; output?: unknown }> = [];
+      const pipeline = Workflow.create<TestCtx, string>({
+        observability: {
+          onStepStart: ({ stepId }) => { if (stepId === "maybe") events.push({ phase: "start" }); },
+          onStepFinish: ({ stepId, output }) => { if (stepId === "maybe") events.push({ phase: "finish", output }); },
+        },
+      }).step("maybe", ({ input }) => input.toUpperCase(), {
+        when: () => false,
+        otherwise: () => "OTHERWISE",
+      });
+
+      await pipeline.generate(testCtx, "x");
+      expect(events).toEqual([{ phase: "start" }, { phase: "finish", output: "OTHERWISE" }]);
+    });
+
+    it("`when` throwing routes through .catch()", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("maybe", ({ input }) => input, { when: () => { throw new Error("when-boom"); } })
+        .catch("recover", ({ error }) => `caught:${(error as Error).message}`);
+      expect(expectComplete(await pipeline.generate(testCtx, "x")).output).toBe("caught:when-boom");
+    });
+
+    it("`otherwise` throwing routes through .catch()", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("maybe", ({ input }) => input, {
+          when: () => false,
+          otherwise: () => { throw new Error("otherwise-boom"); },
+        })
+        .catch("recover", ({ error }) => `caught:${(error as Error).message}`);
+      expect(expectComplete(await pipeline.generate(testCtx, "x")).output).toBe("caught:otherwise-boom");
+    });
+
+    it("nested step accepts an `id` override (reusing the same sub-workflow twice)", async () => {
+      const sub = Workflow.create<TestCtx, string>().step("up", ({ input }) => input.toUpperCase());
+      // Distinct ids are required — the construction-time (type, id) walk would
+      // otherwise reject the duplicate default "nested-workflow" id.
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(sub, { id: "sub-a" })
+        .step(sub, { id: "sub-b" });
+      expect(expectComplete(await pipeline.generate(testCtx, "hi")).output).toBe("HI");
+    });
+
+    it("agent step skip in stream mode uses `otherwise` and never invokes the agent", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("a", "AGENT-RAN"), {
+          when: () => false,
+          otherwise: () => "SKIPPED",
+        });
+      const { output, stream } = pipeline.stream(testCtx, "x");
+      const reader = stream.getReader();
+      while (!(await reader.read()).done) { /* drain */ }
+      expect(expectComplete(await output).output).toBe("SKIPPED");
+    });
+
+    it("Workflow.from supports `when` + `otherwise`", async () => {
+      const wf = Workflow.from(createPassthroughAgent("a", "AGENT-OUT"), {
+        when: ({ input }) => input === "go",
+        otherwise: ({ input }) => `skip:${input}`,
+      });
+      expect(expectComplete(await wf.generate(testCtx, "go")).output).toBe("AGENT-OUT");
+      expect(expectComplete(await wf.generate(testCtx, "stop")).output).toBe("skip:stop");
+    });
+
+    it("Workflow.from with `when` (no otherwise) passes input through on skip", async () => {
+      const wf = Workflow.from(createPassthroughAgent("a", "AGENT-OUT"), {
+        when: ({ input }) => input === "go",
+      });
+      expect(expectComplete(await wf.generate(testCtx, "stop")).output).toBe("stop");
+      expect(expectComplete(await wf.generate(testCtx, "go")).output).toBe("AGENT-OUT");
+    });
   });
 
   describe("branch() with predicates", () => {

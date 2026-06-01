@@ -1787,12 +1787,24 @@ export class Workflow<
     return new Workflow<TContext, TInput, TInput>([], options?.id, options?.observability as WorkflowObservability | undefined);
   }
 
+  // `when` without `otherwise` can passthrough the first step → output widens
+  // to `TInput | TOutput`, mirroring the `step` overloads. Declared first so it
+  // wins when `otherwise` is absent.
+  static from<TContext, TInput, TOutput>(
+    agent: Agent<TContext, TInput, TOutput>,
+    options: StepOptions<TContext, TInput, TOutput> & SkipPassthrough<TContext, TInput, TOutput>
+  ): Workflow<TContext, TInput, TInput | TOutput>;
   static from<TContext, TInput, TOutput>(
     agent: Agent<TContext, TInput, TOutput>,
     options?: StepOptions<TContext, TInput, TOutput>
-  ): Workflow<TContext, TInput, TOutput> {
+  ): Workflow<TContext, TInput, TOutput>;
+  static from<TContext, TInput, TOutput>(
+    agent: Agent<TContext, TInput, TOutput>,
+    options?: StepOptions<TContext, TInput, TOutput>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return new Workflow<TContext, TInput, any>([]).step(agent, options);
+  ): Workflow<TContext, TInput, any> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new Workflow<TContext, TInput, any>([]).step(agent, options as any);
   }
 
   // Builder helper — append a step and return a re-typed Workflow.
