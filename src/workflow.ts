@@ -134,6 +134,9 @@ export type WorkflowStepType =
  *   - step-like / gate (cond-true → suspends): onStepStart always; onStepFinish
  *     when body returns (suspended: true for gate, false otherwise); onStepError
  *     on body throw.
+ *   - step-like (`when` → false → skip): onStepStart, onStepFinish({ suspended:
+ *     false }) with the passthrough/`otherwise` value as `output`. A skipped
+ *     step's body never runs, but it is still bracketed by start/finish.
  *   - gate (cond false → skip): onStepStart, onStepFinish({ suspended: false }).
  *   - catch: onStepStart only when pendingError set; onStepFinish when catchFn
  *     returns; onStepError when catchFn throws.
@@ -373,7 +376,10 @@ export type StepOtherwise<TContext, TOutput, TNextOutput> = (params: { ctx: Read
 export interface ConditionalStepOptions<TContext, TOutput, TNextOutput> {
   /** Run the step only when this returns true. Omit to always run. */
   when?: StepWhen<TContext, TOutput>;
-  /** Skip value when `when` is false. Omit for passthrough (input unchanged). */
+  /**
+   * Skip value when `when` is false. Omit for passthrough (input unchanged).
+   * Has no effect without `when` — a lone `otherwise` is never invoked.
+   */
   otherwise?: StepOtherwise<TContext, TOutput, TNextOutput>;
 }
 
