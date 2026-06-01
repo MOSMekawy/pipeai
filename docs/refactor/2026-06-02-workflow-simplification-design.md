@@ -65,7 +65,7 @@ that re-exports the current public surface verbatim. `./workflow` resolves to
 | `types.ts` | Public option/result types: `RunOptions`, `WorkflowResult`, `WorkflowStreamResult`, `WorkflowStreamOptions`, `AgentStepHooks`, `AgentResultParams`, step/conditional/nested/inline options, `BranchCase`, `BranchSelect`, `RepeatOptions`, all `Parallel*` types, `WorkflowObservability`, `WorkflowWarning`, `WorkflowStepType` |
 | `runtime.ts` | `RuntimeState`, `PendingError`, `StateSeed`, `makeRuntimeState`, `pushWarning`, `demotePendingError`, `resolveFreezeSnapshots`, `pendingErrorSourceToStepType` |
 | `checkpoint.ts` | `emitCheckpoint` |
-| `concurrency.ts` | `runUnitsConcurrently`, `UnitFailure` (stays exception-based — see §4) |
+| `concurrency.ts` | `mapConcurrent<R>` (generic worker pool), `reconcileUnitOutcomes`, `UnitOutcome`, `UnitFailure` (see §4) |
 | `nodes.ts` | `WorkflowNode` interface, `BaseNode`, `StepNodeImpl`, `GateNodeImpl`, `CatchNodeImpl`, `FinallyNodeImpl`, `NodeOutcome`, `RunContext` |
 | `executor.ts` | `ExecutionPass` — the fold loop + `finalize()` reducer |
 | `sealed-workflow.ts` | `SealedWorkflow` class (caches, validation, `fireHook`, `executeAgent`, `executeNestedWorkflow`, `generate`/`stream`, `loadState`/`resumeFrom`/`finally`, delegates running to `ExecutionPass`) |
@@ -171,39 +171,96 @@ demotion + `onStepError` emission.
 independently testable. `SealedWorkflow.execute()` shrinks to: empty-steps
 guard, plumb `runOptions`, then `new ExecutionPass(host, state, opts).run(...)`.
 
-### 4. What deliberately stays exception-based
+### 4. Concurrency core (`foreach` / `parallel`)
 
-`foreach` / `parallel` detect a nested gate by throwing
-`NestedGateUnsupportedError` so it unwinds through `Promise.all`. A status return
-cannot unwind concurrent siblings mid-flight. This path stays exception-based;
-the surrounding node's `run` catches at the `Promise.all` boundary and converts
-to a `suspended`/`failed` outcome there. The status-object model applies to the
-sequential top-level loop only, not the concurrency core (`concurrency.ts` is
-unchanged).
+Today `runUnitsConcurrently` is one ~85-line function with a 7-param signature
+that conflates two unrelated jobs: generic concurrent dispatch and
+workflow-specific reconciliation (warning merge + abort precedence + a
+`instanceof NestedGateUnsupportedError` partition that decides
+suspend-vs-`onError`). The per-unit work is *already* fully closure-captured by
+`executeItem` / `executeBranch`, so the lever is splitting these two jobs apart.
+
+Split into a generic primitive and a discriminant fold:
+
+```ts
+// Generic worker pool — no workflow knowledge, independently testable.
+// Sequential when concurrency <= 1, else a pool of min(concurrency, count)
+// workers sharing a counter. Honors the abort signal (pre-launch check).
+async function mapConcurrent<R>(
+  count: number,
+  concurrency: number,
+  signal: AbortSignal | undefined,
+  runUnit: (index: number) => Promise<R>,
+): Promise<R[]>;
+
+// Each unit reports an outcome instead of throwing-or-returning. Carries its
+// own inner warnings so reconcile needs no separate `unitStates` array.
+type UnitOutcome =
+  | { kind: "ran"; warnings?: WorkflowWarning[] }
+  | { kind: "suspended"; gateId: string; workflowId?: string; warnings?: WorkflowWarning[] }
+  | { kind: "failed"; error: unknown; warnings?: WorkflowWarning[] };
+
+// Fold over the discriminant — replaces the instanceof partition. Merges
+// warnings (namespaced `id[key]:stepId`), applies abort precedence, builds the
+// NestedGateUnsupportedError on any suspension, else returns the failures for
+// the caller's onError pass.
+function reconcileUnitOutcomes(
+  state: RuntimeState,
+  id: string,
+  keyAt: (index: number) => string | number,
+  outcomes: UnitOutcome[],
+): UnitFailure[];
+```
+
+`executeItem` / `executeBranch` keep their existing `try/catch` (which fires
+`onItemError`) but convert at the boundary: a `NestedGateUnsupportedError` thrown
+by `executeNestedWorkflow` becomes `{ kind: "suspended" }`; any other throw
+becomes `{ kind: "failed" }`; success is `{ kind: "ran" }`. `foreach`/`parallel`
+then read as `mapConcurrent(...)` → `reconcileUnitOutcomes(...)` → `onError` loop.
+
+**Behavior preserved exactly.** The pool already ran every unit to completion
+regardless of gates (the old thrown marker was a *reporting* mechanism collected
+by the pool, never sibling cancellation), so moving to returned outcomes changes
+nothing observable. Abort still early-stops launching new units and wins over
+suspension/`onError`. **`onItemError` still fires for a nested-gate suspension**
+(it flows through `executeItem`'s catch today) — preserved. `mapConcurrent`
+keeps a defensive catch so a truly unexpected throw still surfaces as a failure.
+
+The only remaining use of exceptions here is `executeNestedWorkflow` throwing
+`NestedGateUnsupportedError`, caught immediately at the unit boundary (and, in
+the sequential top-level loop, converted to a `failed` outcome by
+`BaseNode.bracket`). No `instanceof`-based partition across siblings survives.
 
 ### 5. What this does and does not remove
 
 Removed (accidental complexity): the `node.type` dispatch switch, the
 `getObservabilityType` indirection, the scattered participation conditionals, the
-four duplicated hook-bracketing blocks, and the mixing of exception/flag
-signalling in one loop.
+four duplicated hook-bracketing blocks, the mixing of exception/flag signalling
+in one loop, and the `instanceof NestedGateUnsupportedError` partition in the
+concurrency core.
 
 Retained (essential complexity): multi-error precedence and the `AggregateError`
 contract — relocated into `finalize()` as a readable reducer (~40 lines) but not
-eliminated, because multiple errors genuinely can coexist.
+eliminated, because multiple errors genuinely can coexist. Likewise the
+concurrent abort/suspension/`onError` precedence stays, as a `reconcileUnitOutcomes`
+fold.
 
 ## Safety strategy
 
 1. Establish green baseline: `npm run typecheck` and `npm test` both pass before
    any change.
 2. Relocate pure modules first (`errors`, `snapshots`, `types`, `runtime`,
-   `checkpoint`, `concurrency`) behind the barrel; run `typecheck` after each.
+   `checkpoint`) behind the barrel, moving `runUnitsConcurrently` verbatim into
+   `concurrency.ts` for now; run `typecheck` after each.
 3. Introduce `nodes.ts` + `executor.ts` and rewire the builder to construct node
-   classes, in an isolated commit; run the **full suite**. This is the only
-   step with behavioral risk, so it bisects cleanly.
-4. Extract `sealed-workflow.ts` / `resumed.ts` / `builder.ts`; delete the old
+   classes, in an isolated commit; run the **full suite**.
+4. Refactor the concurrency core (`mapConcurrent` + `reconcileUnitOutcomes` +
+   unit outcomes in `foreach`/`parallel`) in its own isolated commit; run the
+   **full suite**. Steps 3 and 4 are the only behaviorally-risky steps, each
+   isolated so a bisect is trivial.
+5. Extract `sealed-workflow.ts` / `resumed.ts` / `builder.ts`; delete the old
    `src/workflow.ts`.
-5. Final `typecheck` + full suite + `npm run build` (tsup) to confirm the bundle
+6. Final `typecheck` + full suite + `npm run build` (tsup) to confirm the bundle
    still emits the same entry points.
 
 Expected test diff: none beyond possibly import paths — and those resolve
