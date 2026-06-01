@@ -51,5 +51,4 @@ export type {
 export { defineTool, ToolProvider, isToolProvider, TOOL_PROVIDER_BRAND } from "./tool-provider";
 export type { ToolProviderConfig, ToolExecuteOptions, IToolProvider } from "./tool-provider";
 
-export { getActiveWriter } from "./utils";
 export type { MaybePromise, Resolvable } from "./utils";

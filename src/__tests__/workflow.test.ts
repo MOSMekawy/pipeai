@@ -139,6 +139,24 @@ describe("Workflow", () => {
     });
   });
 
+  describe("observability — typed ctx", () => {
+    it("ctx in observability hooks is typed as the workflow's TContext", async () => {
+      let seenUserId: string | undefined;
+
+      const pipeline = Workflow.create<TestCtx>({
+        observability: {
+          // `ctx.userId` only compiles if ctx is Readonly<TestCtx>, not
+          // `unknown` — this line is the type-level assertion (fails `tsc`
+          // when WorkflowObservability is not generic over TContext).
+          onStepFinish: ({ ctx }) => { seenUserId = ctx.userId; },
+        },
+      }).step(createTextAgent("a1", "hi"));
+
+      await pipeline.generate(testCtx);
+      expect(seenUserId).toBe("user-1");
+    });
+  });
+
   describe("branch() with predicates", () => {
     it("routes to the matching branch", async () => {
       const premiumAgent = createPassthroughAgent("premium", "premium response");

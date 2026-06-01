@@ -146,17 +146,17 @@ export type WorkflowStepType =
  * Skip-checked nodes (`state.suspension || pendingError` already set on entry)
  * emit nothing — `.finally()` is the exception.
  */
-export interface WorkflowObservability {
+export interface WorkflowObservability<TContext = unknown> {
   onStepStart?: (event: {
     stepId: string;
     type: WorkflowStepType;
-    ctx: unknown;
+    ctx: TContext;
     input: unknown;
   }) => MaybePromise<void>;
   onStepFinish?: (event: {
     stepId: string;
     type: WorkflowStepType;
-    ctx: unknown;
+    ctx: TContext;
     output: unknown;
     durationMs: number;
     suspended: boolean;
@@ -164,7 +164,7 @@ export interface WorkflowObservability {
   onStepError?: (event: {
     stepId: string;
     type: WorkflowStepType;
-    ctx: unknown;
+    ctx: TContext;
     error: unknown;
     durationMs: number;
   }) => MaybePromise<void>;
@@ -172,14 +172,14 @@ export interface WorkflowObservability {
     stepId: string;
     type: "foreach" | "parallel";
     itemIndex: number | string;
-    ctx: unknown;
+    ctx: TContext;
     input: unknown;
   }) => MaybePromise<void>;
   onItemFinish?: (event: {
     stepId: string;
     type: "foreach" | "parallel";
     itemIndex: number | string;
-    ctx: unknown;
+    ctx: TContext;
     output: unknown;
     durationMs: number;
   }) => MaybePromise<void>;
@@ -187,7 +187,7 @@ export interface WorkflowObservability {
     stepId: string;
     type: "foreach" | "parallel";
     itemIndex: number | string;
-    ctx: unknown;
+    ctx: TContext;
     error: unknown;
     durationMs: number;
   }) => MaybePromise<void>;
@@ -1737,9 +1737,12 @@ export class Workflow<
   }
 
   static create<TContext, TInput = void>(
-    options?: { id?: string; observability?: WorkflowObservability },
+    options?: { id?: string; observability?: WorkflowObservability<TContext> },
   ): Workflow<TContext, TInput, TInput> {
-    return new Workflow<TContext, TInput, TInput>([], options?.id, options?.observability);
+    // The internal representation threads `ctx` as `unknown`; the public
+    // option is narrowed to WorkflowObservability<TContext> so user callbacks
+    // see their real context type. The cast bridges the contravariant gap.
+    return new Workflow<TContext, TInput, TInput>([], options?.id, options?.observability as WorkflowObservability | undefined);
   }
 
   static from<TContext, TInput, TOutput>(

@@ -1068,9 +1068,12 @@ Pass an `observability` object to `Workflow.create()` to receive lifecycle event
 ```ts
 import { Workflow, type WorkflowObservability } from "pipeai";
 
-const obs: WorkflowObservability = {
+// `WorkflowObservability<Ctx>` types `ctx` in every hook as your context.
+// It defaults to `unknown`, so the bare `WorkflowObservability` form still
+// works for context-agnostic hooks.
+const obs: WorkflowObservability<Ctx> = {
   onStepStart: ({ stepId, type, ctx, input }) => {
-    console.log(`step ${stepId} (${type}) starting`);
+    console.log(`[${ctx.requestId}] step ${stepId} (${type}) starting`);
   },
   onStepFinish: ({ stepId, type, output, durationMs, suspended }) => {
     console.log(`step ${stepId} (${type}) finished in ${durationMs}ms, suspended=${suspended}`);
@@ -1084,6 +1087,8 @@ const pipeline = Workflow.create<Ctx, string>({ observability: obs })
   .step("classify", classifier)
   .step("respond", responder);
 ```
+
+`ctx` is typed as the workflow's context: pass `WorkflowObservability<Ctx>` (or just inline the object into `Workflow.create<Ctx>({ observability: { ... } })` and let `Ctx` flow in). The `input` / `output` fields stay `unknown` — they differ at every step in the chain, so only `ctx` (constant across the run) can be typed.
 
 The hooks are threaded through every builder return, so any chain following `Workflow.create({ observability })` keeps the same hooks. `ResumedWorkflow` (gate resume via `loadState`) and `CheckpointResumedWorkflow` (checkpoint resume via `resumeFrom`) ALSO inherit it — events fire on resumed runs without re-wiring.
 
