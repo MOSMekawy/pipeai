@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
 import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability } from "../workflow";
-import { createMockModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
+import { createMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
 function createTextAgent(id: string, text: string): Agent<TestCtx, void, string> {
@@ -338,6 +338,74 @@ describe("Workflow", () => {
       const a: string | undefined = output.a;
       expect(a).toBeUndefined();
       expect(output.b).toBe("OK");
+    });
+
+    it("parallel forwards abortSignal into branch agent calls", async () => {
+      // Probe records the abortSignal each branch's model call receives. No
+      // abort is fired, so this directly observes forwarding rather than the
+      // run loop's abort promotion (which masks a dropped signal).
+      const seen: Array<AbortSignal | undefined> = [];
+      const probe = (s: AbortSignal | undefined) => { seen.push(s); };
+      const a = new Agent<TestCtx, string, string>({ id: "a", model: createSignalProbeModel("A", probe), prompt: () => "go" });
+      const b = new Agent<TestCtx, string, string>({ id: "b", model: createSignalProbeModel("B", probe), prompt: () => "go" });
+      const controller = new AbortController();
+      const wf = Workflow.create<TestCtx, string>().parallel({ a, b });
+
+      await wf.generate(testCtx, "x", { abortSignal: controller.signal });
+
+      expect(seen).toHaveLength(2);
+      expect(seen.every((s) => s !== undefined)).toBe(true);
+    });
+
+    it("ResumedWorkflow.generate validates RunOptions (gate-resume path)", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .step("s", ({ input }) => input)
+        .gate("g");
+      const suspended = expectSuspended(await wf.generate(testCtx, "x"));
+      const resumed = wf.loadState("g", suspended.snapshot);
+
+      await expect(
+        resumed.generate(testCtx, "resp", {
+          onCheckpoint: () => {},
+          checkpointEvery: 1,
+          checkpointWhen: () => true,
+        }),
+      ).rejects.toThrow(/mutually exclusive/);
+    });
+
+    it("catch() is allowed after a gate-only workflow and recovers a throwing gate", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .gate("g", { payload: () => { throw new Error("gate-boom"); } })
+        .catch("c", ({ error }) => `caught:${(error as Error).message}`);
+      expect(expectComplete(await wf.generate(testCtx, "x")).output).toBe("caught:gate-boom");
+    });
+
+    it("checkpoint cadence counts executable steps, not raw indices (catch interleaved)", async () => {
+      const resumeIndices: number[] = [];
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("a", ({ input }) => `${input}a`)
+        .catch("c1", ({ lastOutput }) => lastOutput as string) // no-op (no error)
+        .step("b", ({ input }) => `${input}b`);
+
+      await pipeline.generate(testCtx, "x", {
+        onCheckpoint: (snap) => { resumeIndices.push(snap.resumeFromIndex); },
+        checkpointEvery: 2,
+      });
+
+      // Two executable steps (a, b); cadence 2 → checkpoint after the 2nd
+      // executable step (b, raw index 2 → resumeFromIndex 3). With raw-index
+      // counting the modulo never lands and nothing checkpoints.
+      expect(resumeIndices).toEqual([3]);
+    });
+
+    it("foreach rejects NaN / sub-1 concurrency", () => {
+      const agent = createPassthroughAgent("x", "X");
+      expect(() =>
+        Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: NaN }),
+      ).toThrow(/concurrency must be >= 1/);
+      expect(() =>
+        Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: 0 }),
+      ).toThrow(/concurrency/);
     });
   });
 

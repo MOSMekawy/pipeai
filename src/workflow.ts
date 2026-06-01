@@ -226,13 +226,13 @@ export interface RunOptions {
   /**
    * Cooperative cancellation signal. Checked at every step boundary inside
    * `execute()` and forwarded to agent calls in `executeAgent`, foreach
-   * workers, and nested workflows. When the signal aborts, the workflow
-   * tears down to `signal.reason` via the same pending-error path as any
-   * other step failure, so `.catch()` handlers still get a chance to
+   * workers, parallel branches, and nested workflows. When the signal aborts,
+   * the workflow tears down to `signal.reason` via the same pending-error path
+   * as any other step failure, so `.catch()` handlers still get a chance to
    * observe (or recover from) the abort. `.finally()` bodies still run
    * on the abort path. Unlike `freezeSnapshots`, this option DOES
-   * propagate into nested workflows, foreach items, and repeat loops —
-   * cancellation should be transitive.
+   * propagate into nested workflows, foreach items, parallel branches, and
+   * repeat loops — cancellation should be transitive.
    */
   readonly abortSignal?: AbortSignal;
   /**
@@ -1059,6 +1059,12 @@ export class SealedWorkflow<
       ? (opts.checkpointEvery ?? Math.max(1, Math.ceil(this.cachedExecutableStepCount / 4)))
       : 0;
 
+    // Counts completed executable step bodies (not raw loop indices), so the
+    // numeric `checkpointEvery` cadence means "every N executable steps" even
+    // when catch/finally nodes are interleaved (they don't reach the checkpoint
+    // block, so they don't advance this counter — unlike the raw index `i`).
+    let executableStepsSeen = 0;
+
     // `initialError` lets callers (e.g. ResumedWorkflow.stream) seed the
     // pipeline already-in-error so a pre-execute failure (schema.parse,
     // merge throw) flows through downstream `.catch()` like any other step
@@ -1237,9 +1243,10 @@ export class SealedWorkflow<
       // already won). Numeric `checkpointEvery` (default: max(1, ceil(count/4)))
       // uses the loop-hoisted `ckptCadence`; predicate form runs per step.
       if (!pendingError && !state.suspension && opts?.onCheckpoint) {
+        executableStepsSeen++;
         const shouldCheckpoint = opts.checkpointWhen
           ? opts.checkpointWhen({ stepIndex: i, stepId: node.id, ctx: state.ctx })
-          : (i + 1) % ckptCadence === 0;
+          : executableStepsSeen % ckptCadence === 0;
         if (shouldCheckpoint) {
           const ckptStart = performance.now();
           try {
@@ -1597,6 +1604,7 @@ export class ResumedWorkflow<
   ): Promise<WorkflowResult<TOutput>> {
     const rawResponse = args[0] as TResponse;
     const opts = args[1] as RunOptions | undefined;
+    this.validateRunOptions(opts);
     // Run prep (schema.parse + mergeFn) inside the workflow's error pipeline
     // so a downstream `.catch()` can observe failures here. Without this,
     // a schema/merge throw would reject the promise raw, bypassing catch.
@@ -1630,6 +1638,7 @@ export class ResumedWorkflow<
     const rawResponse = args[0] as TResponse;
     const options = args[1] as WorkflowStreamOptions<UI_MESSAGE> | undefined;
     const opts = args[2] as RunOptions | undefined;
+    this.validateRunOptions(opts);
     const abortSignal = opts?.abortSignal;
 
     let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
@@ -2153,6 +2162,13 @@ export class Workflow<
       }) => MaybePromise<TNextOutput | typeof Workflow.SKIP>;
     },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
+    // Validate up front: `!(c >= 1)` rejects NaN, 0, and negatives (NaN would
+    // otherwise slip past the `<= 1` sequential branch into a `Math.min(NaN, …)`
+    // worker pool that silently processes nothing). `Infinity` is allowed (full
+    // fan-out, clamped by item count).
+    if (options?.concurrency !== undefined && !(options.concurrency >= 1)) {
+      throw new Error(`foreach: concurrency must be >= 1 (or Infinity), got ${options.concurrency}`);
+    }
     const concurrency = options?.concurrency ?? 1;
     const onError = options?.onError;
     const isWorkflow = target instanceof SealedWorkflow;
@@ -2428,8 +2444,10 @@ export class Workflow<
         const branchStates: (RuntimeState | undefined)[] = new Array(branchCount);
 
         const executeBranch = async ({ key, index, target }: { key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }) => {
-          // Per-branch itemState — same isolation as foreach (no runOptions).
-          const branchState: RuntimeState = { ctx: state.ctx, output: input, mode: "generate" };
+          // Per-branch state — same isolation as foreach (no runOptions), but
+          // abortSignal IS forwarded so cancellation is transitive into branch
+          // agent/SDK calls and nested-workflow branches.
+          const branchState: RuntimeState = { ctx: state.ctx, output: input, mode: "generate", abortSignal: state.abortSignal };
           branchStates[index] = branchState;
           const branchStart = performance.now();
           // itemIndex is the key for record form, numeric index for tuple form.
@@ -2461,9 +2479,15 @@ export class Workflow<
         type Failure = { key: string | number; index: number; error: unknown };
         const failures: Failure[] = [];
 
+        // Cooperative cancellation: bail before launching each branch so an
+        // already-aborted run doesn't fire every branch (mirrors foreach). The
+        // abort is handled after the loop (bypassing onError).
+        const signal = state.abortSignal;
+
         const eff = Number.isFinite(effectiveConcurrency) ? Math.max(1, effectiveConcurrency) : branchCount;
         if (eff <= 1) {
           for (const e of entries) {
+            if (signal?.aborted) break;
             try {
               await executeBranch(e);
             } catch (error) {
@@ -2478,6 +2502,7 @@ export class Workflow<
             while (true) {
               const i = nextIndex++;
               if (i >= branchCount) return;
+              if (signal?.aborted) return;
               const e = entries[i];
               try {
                 await executeBranch(e);
@@ -2505,11 +2530,11 @@ export class Workflow<
         // Cooperative cancellation wins over onError and suspension (mirrors
         // foreach / repeat). Branches that errored from the forwarded abort are
         // preserved as warnings; rethrow so execute()'s abort path tears down.
-        if (state.abortSignal?.aborted) {
+        if (signal?.aborted) {
           for (const f of failures) {
             pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
           }
-          throw state.abortSignal.reason ?? new Error("Workflow aborted");
+          throw signal.reason ?? new Error("Workflow aborted");
         }
 
         // Partition rejections into gate vs non-gate.
@@ -2626,8 +2651,10 @@ export class Workflow<
     id: string,
     fn: (params: { error: unknown; ctx: Readonly<TContext>; lastOutput: TOutput; stepId: string }) => MaybePromise<TOutput>
   ): Workflow<TContext, TInput, TOutput, TGates> {
-    if (!this.steps.some(s => s.type === "step")) {
-      throw new Error(`Workflow: catch("${id}") requires at least one preceding step.`);
+    // A preceding `gate` also qualifies — a throwing gate condition/payload is
+    // routed as a `source: "step"` pendingError that `.catch()` is meant to handle.
+    if (!this.steps.some(s => s.type === "step" || s.type === "gate")) {
+      throw new Error(`Workflow: catch("${id}") requires at least one preceding step or gate.`);
     }
     const node: StepNode = {
       type: "catch",

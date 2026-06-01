@@ -24,8 +24,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- **`parallel` now propagates `abortSignal` into its branches.** Branch state was created without the abort signal, so cancellation never reached branch agent/SDK calls or nested-workflow branches, and the worker pool had no pre-launch abort check — every branch fired even on an already-aborted run. `parallel` is now cooperatively cancellable, matching `foreach` / `repeat` (and the `RunOptions.abortSignal` doc now lists `parallel`).
 - **`foreach` / `parallel` no longer route cancellation through `onError`.** When the run is aborted, a skipped/aborted branch was being fed to `onError` as an ordinary failure, letting recovery logic "recover" from a cancellation and pollute results. Both combinators now bypass `onError` on abort and rethrow the abort reason (mirroring `repeat`); failures collected before the abort are preserved as warnings.
 - **`parallel` output types are now honest about `SKIP`.** Supplying `onError` (the only way a branch can `SKIP`) widens the output values to `BranchOutput | undefined` in both the record and tuple forms, instead of typing a possibly-`undefined` slot as a guaranteed value. Without `onError` the output stays precise.
+- **`ResumedWorkflow` now validates `RunOptions`.** Gate-resume via `loadState(...).generate/stream(...)` previously skipped `validateRunOptions`, so invalid combos (mutually-exclusive `checkpointEvery` + `checkpointWhen`, non-positive values, the catastrophic freeze guard) went unchecked on that one entry point. It now validates like every other entry.
+- **`catch()` is allowed after a gate-only workflow.** The precondition required a preceding `step`, rejecting `.gate(...).catch(...)` — even though a throwing gate `condition`/`payload` is routed as a `source: "step"` error that `catch` is meant to handle. A preceding `gate` now qualifies.
+- **Checkpoint cadence counts executable steps, not raw indices.** The numeric `checkpointEvery` modulo used the raw loop index, so interleaved `catch`/`finally` nodes drifted the "every N executable steps" contract (and could skip checkpointing entirely). It now counts completed executable step bodies.
+- **`foreach` validates `concurrency`.** A `NaN` concurrency silently processed nothing (it slipped past the sequential branch into a zero-worker pool); `0`/negative "worked by accident." `foreach` now throws unless `concurrency >= 1` (or `Infinity`).
 - **`repeat` validates `maxIterations`.** A non-positive `maxIterations` (e.g. `0`) previously made the loop a silent no-op; it now throws `repeat: maxIterations must be a positive integer`.
 
 ### Notes
