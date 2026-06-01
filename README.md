@@ -4,7 +4,7 @@ A typed multi-agent workflow pipeline built on top of the [Vercel AI SDK v6](htt
 
 Agents are pure AI SDK wrappers that return native `GenerateTextResult` / `StreamTextResult`. Workflows chain agents into pipelines with automatic stream merging, deterministic agent routing, and typed output extraction.
 
-The library is ~1000 lines across 4 files. It's designed to be read, understood, and modified — a thin composition layer over AI SDK, not a framework to learn around.
+It's a lean composition layer over the Vercel AI SDK — not a framework to learn around. Agents return native AI SDK results and workflows merge native streams, so anything you can do with the AI SDK still works underneath; pipeai stays out of the way and stays fully compatible.
 
 ## Core Concepts
 
