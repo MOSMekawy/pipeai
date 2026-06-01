@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - **Checkpoint cadence counts executable steps, not raw indices.** The numeric `checkpointEvery` modulo used the raw loop index, so interleaved `catch`/`finally` nodes drifted the "every N executable steps" contract (and could skip checkpointing entirely). It now counts completed executable step bodies.
 - **`foreach` validates `concurrency`.** A `NaN` concurrency silently processed nothing (it slipped past the sequential branch into a zero-worker pool); `0`/negative "worked by accident." `foreach` now throws unless `concurrency >= 1` (or `Infinity`).
 - **`repeat` validates `maxIterations`.** A non-positive `maxIterations` (e.g. `0`) previously made the loop a silent no-op; it now throws `repeat: maxIterations must be a positive integer`.
+- **An abort is no longer swallowed by a terminal `.catch()`.** Aborts are re-promoted at the top of each iteration so a `.catch()` can't resume a pipeline mid-flight — but a `.catch()` that was the *last* node had no subsequent iteration to re-promote it, so it could "recover" the abort and let the run report `complete`, while the same workflow with a trailing `.finally()` correctly rejected. The run now re-promotes a cleared abort in the tail: a terminal `.catch()` may still *observe* the abort (for logging/cleanup), but the run rejects with `signal.reason` regardless of catch position. (The `RunOptions.abortSignal` doc no longer claims `.catch()` can recover from an abort.)
 
 ### Notes
 

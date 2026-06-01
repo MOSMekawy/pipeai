@@ -3010,11 +3010,16 @@ describe("Workflow", () => {
       expect(seenSignals[0]).toBe(controller.signal);
     });
 
-    it(".catch() can recover from an abort error", async () => {
+    it(".catch() observes an abort but cannot recover it (abort is sticky, position-independent)", async () => {
       // Abort flows through pendingError like any other failure, so a
-      // downstream `.catch()` sees it. Recovery is permitted.
+      // downstream `.catch()` body still runs (it can log / clean up). But
+      // the abort is NON-recoverable: the run rejects with the abort reason
+      // regardless of whether `.catch()` is the terminal node. Otherwise
+      // recoverability would depend purely on whether a `.finally()` happens
+      // to follow the catch — see the `.finally()` test below, which rejects.
       const controller = new AbortController();
       const barrier = defer<void>();
+      const catchSpy = vi.fn();
 
       const pipeline = Workflow.create<TestCtx>()
         .step("first", async () => {
@@ -3022,14 +3027,19 @@ describe("Workflow", () => {
           await barrier.promise;
           return "ok";
         })
-        .catch("recover", ({ error }) => `recovered:${(error as Error).message}`);
+        .catch("recover", ({ error }) => {
+          catchSpy((error as Error).message);
+          return "recovered";
+        });
 
       const run = pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
       await new Promise((r) => setTimeout(r, 5));
       barrier.resolve();
 
-      const { output } = expectComplete(await run);
-      expect(output).toBe("recovered:kill");
+      // Terminal catch must behave like catch+finally: the run still rejects.
+      await expect(run).rejects.toThrow(/kill/);
+      // ...but the catch body did run and observed the abort error.
+      expect(catchSpy).toHaveBeenCalledWith("kill");
     });
 
     it(".finally() bodies still run on the abort path", async () => {

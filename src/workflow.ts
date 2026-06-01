@@ -229,8 +229,10 @@ export interface RunOptions {
    * workers, parallel branches, and nested workflows. When the signal aborts,
    * the workflow tears down to `signal.reason` via the same pending-error path
    * as any other step failure, so `.catch()` handlers still get a chance to
-   * observe (or recover from) the abort. `.finally()` bodies still run
-   * on the abort path. Unlike `freezeSnapshots`, this option DOES
+   * observe the abort (e.g. for logging/cleanup) — but an abort is sticky and
+   * non-recoverable: even a terminal `.catch()` that returns a value cannot
+   * make the run complete; it still rejects with `signal.reason`. `.finally()`
+   * bodies still run on the abort path. Unlike `freezeSnapshots`, this option DOES
    * propagate into nested workflows, foreach items, parallel branches, and
    * repeat loops — cancellation should be transitive.
    */
@@ -1268,6 +1270,19 @@ export class SealedWorkflow<
           }
         }
       }
+    }
+
+    // Abort is sticky and non-recoverable. The in-loop re-promotion at the
+    // top of each iteration prevents a `.catch()` from resuming a pipeline
+    // mid-flight, but a *terminal* `.catch()` that clears the promoted abort
+    // has no subsequent iteration to re-promote it — so without this the run
+    // would report `complete` while `.catch().finally()` correctly rejects.
+    // Re-promote here so recoverability never depends on catch position.
+    // Guarded by `abortPromoted`: only re-promote an abort already observed
+    // during this pass (a catch cleared it), not one whose checkpointFailed
+    // precedence must win below.
+    if (abortPromoted && !pendingError && !state.suspension && state.abortSignal?.aborted) {
+      pendingError = makeAbortError(state.abortSignal);
     }
 
     // Tail — mutually exclusive branches.
