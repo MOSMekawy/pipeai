@@ -14,6 +14,8 @@ export {
   NestedGateUnsupportedError,
   CheckpointTimeoutError,
   CHECKPOINT_STEP_ID,
+  ABORT_STEP_ID,
+  GATE_RESUME_STEP_ID,
   migrateSnapshot,
 } from "./workflow";
 

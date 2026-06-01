@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
-import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability } from "../workflow";
+import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
 import { createMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
@@ -402,10 +402,95 @@ describe("Workflow", () => {
       const agent = createPassthroughAgent("x", "X");
       expect(() =>
         Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: NaN }),
-      ).toThrow(/concurrency must be >= 1/);
+      ).toThrow(/concurrency must be a positive integer/);
       expect(() =>
         Workflow.create<TestCtx, string[]>().foreach(agent, { concurrency: 0 }),
       ).toThrow(/concurrency/);
+    });
+
+    it("parallel rejects NaN / sub-1 concurrency (mirrors foreach)", () => {
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      // NaN previously slipped past Number.isFinite() and silently became
+      // full fan-out (cap removed); 0 / negative silently became 1.
+      expect(() =>
+        Workflow.create<TestCtx, string>().parallel({ a, b }, { concurrency: NaN }),
+      ).toThrow(/concurrency must be a positive integer/);
+      expect(() =>
+        Workflow.create<TestCtx, string>().parallel({ a, b }, { concurrency: 0 }),
+      ).toThrow(/concurrency/);
+      expect(() =>
+        Workflow.create<TestCtx, string>().parallel({ a, b }, { concurrency: -1 }),
+      ).toThrow(/concurrency/);
+    });
+
+    it("checkpoint auto-cadence denominator excludes gates (matches the runtime counter)", async () => {
+      // 4 executable (type:"step") bodies + 1 skipped gate. Gates never reach
+      // the checkpoint block, so the auto-cadence denominator must exclude
+      // them: ceil(4/4)=1 → a checkpoint after every step body. Counting the
+      // gate inflates the denominator to ceil(5/4)=2 → only 2 checkpoints.
+      const fires: number[] = [];
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("s1", ({ input }) => `${input}1`)
+        .step("s2", ({ input }) => `${input}2`)
+        .gate("g", { condition: () => false })
+        .step("s3", ({ input }) => `${input}3`)
+        .step("s4", ({ input }) => `${input}4`);
+
+      await pipeline.generate(testCtx, "x", {
+        onCheckpoint: (snap) => { fires.push(snap.resumeFromIndex); },
+      });
+
+      expect(fires).toHaveLength(4);
+    });
+
+    it("foreach / parallel reject fractional concurrency (integer or Infinity only)", () => {
+      const a = createPassthroughAgent("a", "A");
+      const b = createPassthroughAgent("b", "B");
+      expect(() =>
+        Workflow.create<TestCtx, string[]>().foreach(a, { concurrency: 2.5 }),
+      ).toThrow(/concurrency must be a positive integer/);
+      expect(() =>
+        Workflow.create<TestCtx, string>().parallel({ a, b }, { concurrency: 2.5 }),
+      ).toThrow(/concurrency must be a positive integer/);
+      // Integer and Infinity remain valid (no throw at construction).
+      expect(() =>
+        Workflow.create<TestCtx, string[]>().foreach(a, { concurrency: 3 }),
+      ).not.toThrow();
+      expect(() =>
+        Workflow.create<TestCtx, string>().parallel({ a, b }, { concurrency: Infinity }),
+      ).not.toThrow();
+    });
+
+    it("repeat throws upfront when neither until nor while is given", () => {
+      const agent = createPassthroughAgent("r", "x");
+      expect(() =>
+        // @ts-expect-error — defeat the type union to hit the runtime guard
+        Workflow.create<TestCtx, string>().repeat(agent, { maxIterations: 3 }),
+      ).toThrow(/exactly one of `until` or `while`/);
+    });
+
+    it("abort uses the reserved ::pipeai:: namespace for its synthetic step id", async () => {
+      // The synthetic abort marker must not collide with a legitimate user
+      // step named "abort". A `.catch()` observes the abort's stepId.
+      const controller = new AbortController();
+      const barrier = defer<void>();
+      let seenStepId: string | undefined;
+
+      const pipeline = Workflow.create<TestCtx>()
+        .step("first", async () => {
+          queueMicrotask(() => controller.abort(new Error("kill")));
+          await barrier.promise;
+          return "ok";
+        })
+        .catch("observe", ({ stepId }) => { seenStepId = stepId; return "x"; });
+
+      const run = pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
+      await new Promise((r) => setTimeout(r, 5));
+      barrier.resolve();
+
+      await expect(run).rejects.toThrow(/kill/);
+      expect(seenStepId).toBe("::pipeai::abort");
     });
   });
 
@@ -2800,6 +2885,40 @@ describe("Workflow", () => {
         expect(Object.isFrozen(a)).toBe(true);
       });
 
+      it("freezeSnapshots + checkpoint does not freeze the live pipeline value", async () => {
+        // The checkpoint snapshot's `output` must not alias-and-freeze the live
+        // state.output: the checkpoint path keeps executing, so a downstream
+        // step that mutates its input in place would otherwise hit a frozen
+        // object. (The gate path stops, so its freeze is harmless.)
+        const pipeline = Workflow.create<TestCtx, number[]>()
+          .step("grow", ({ input }) => [...input, 1])
+          .step("mutate", ({ input }) => { (input as number[]).push(2); return input; });
+
+        const result = await pipeline.generate(testCtx, [0], {
+          onCheckpoint: () => {},
+          checkpointEvery: 1,
+          freezeSnapshots: true,
+        });
+        expect(expectComplete(result).output).toEqual([0, 1, 2]);
+      });
+
+      it("freezeSnapshots: true → result.warnings frozen on the COMPLETE path", async () => {
+        // The contract says freezeSnapshots freezes the warnings array; that
+        // previously only happened on the suspended path.
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const pipeline = Workflow.create<TestCtx>({
+            observability: { onStepFinish: () => { throw new Error("warn-me"); } },
+          }).step("s", () => "x");
+          const result = await pipeline.generate(testCtx, undefined, { freezeSnapshots: true });
+          expect(result.status).toBe("complete");
+          expect(result.warnings.length).toBeGreaterThan(0);
+          expect(Object.isFrozen(result.warnings)).toBe(true);
+        } finally {
+          consoleSpy.mockRestore();
+        }
+      });
+
       it("runOptions does not propagate into nested workflows", async () => {
         // Parent uses freezeSnapshots: true. Inner workflow's gate snapshot path
         // is moot (NestedGateUnsupportedError fires), but we can verify the
@@ -3961,6 +4080,35 @@ describe("Workflow", () => {
         const gateFinish = finishes.find(f => f.id === "review");
         expect(gateFinish?.suspended).toBe(false);
       });
+
+      it("throwing gate payload → onStepError fires with type 'gate'", async () => {
+        // Contract: a gate that throws in condition/payload must fire
+        // onStepError just like a step body throw — and report type "gate",
+        // not "step" (the error was tagged source: "step" before this fix).
+        const errors: { stepId: string; type: string }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepError: ({ stepId, type }) => { errors.push({ stepId, type }); },
+          },
+        })
+          .step("s", () => "x")
+          .gate("review", { payload: () => { throw new Error("gate-boom"); } });
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("gate-boom");
+        expect(errors).toContainEqual({ stepId: "review", type: "gate" });
+      });
+
+      it("throwing gate condition → onStepError fires with type 'gate'", async () => {
+        const errors: { stepId: string; type: string }[] = [];
+        const pipeline = Workflow.create<TestCtx>({
+          observability: {
+            onStepError: ({ stepId, type }) => { errors.push({ stepId, type }); },
+          },
+        })
+          .step("s", () => "x")
+          .gate("review", { condition: () => { throw new Error("cond-boom"); } });
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("cond-boom");
+        expect(errors).toContainEqual({ stepId: "review", type: "gate" });
+      });
     });
 
     describe("combinator-level + per-item events", () => {
@@ -3994,6 +4142,27 @@ describe("Workflow", () => {
           .parallel({ a, b }, { id: "para" });
         await pipeline.generate(testCtx, "in");
         expect(itemStarts.map(e => e.itemIndex).sort()).toEqual(["a", "b"]);
+      });
+
+      it("foreach: a throwing onItemStart hook surfaces a warning with source 'onItemStart'", async () => {
+        // The item-hook sources are part of the public WorkflowWarning.source
+        // union, so an exhaustive switch over w.source can match them.
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const pipeline = Workflow.create<TestCtx>({
+            observability: {
+              onItemStart: () => { throw new Error("item-start-fail"); },
+            },
+          })
+            .step("items", () => ["a", "b"])
+            .foreach(createPassthroughAgent("p", "ok"), { id: "fe" });
+          const result = await pipeline.generate(testCtx);
+          expect(result.status).toBe("complete");
+          const sources: WorkflowWarning["source"][] = result.warnings.map(w => w.source);
+          expect(sources).toContain("onItemStart");
+        } finally {
+          consoleSpy.mockRestore();
+        }
       });
 
       it("repeat: NO per-item events fire (combinator-level only)", async () => {

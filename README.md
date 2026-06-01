@@ -661,6 +661,8 @@ Use `while` for the opposite condition (repeat while true, stop when false):
 
 The `until` and `while` options are mutually exclusive — TypeScript enforces this at compile time.
 
+Both forms are **do-while**: the body always runs at least once, then the predicate is checked against its `output`. So `while: () => false` still runs the body once — it is not a pre-check.
+
 When `maxIterations` is exceeded, a `WorkflowLoopError` is thrown — catchable by `.catch()`:
 
 ```ts
@@ -996,9 +998,9 @@ const final = await resumed.generate(ctx);   // no response arg — state is see
 
 ### Cadence
 
-- `checkpointEvery: N` — fire every N executable steps. Defaults to `max(1, ceil(executableCount / 4))` — 4 checkpoints across the run, floor of every step on tiny pipelines.
+- `checkpointEvery: N` — fire every N executable steps. Defaults to `max(1, ceil(stepCount / 4))` — 4 checkpoints across the run, floor of every step on tiny pipelines.
 - `checkpointWhen({ stepIndex, stepId, ctx }) => boolean` — predicate variant. Mutually exclusive with `checkpointEvery`.
-- `.catch()` and `.finally()` nodes are NOT counted as executable, so adding cleanup doesn't surprise you with extra checkpoints.
+- The default-cadence denominator counts only checkpointable steps (`step` / `branch` / `foreach` / `repeat` / `parallel` / nested). `gate` nodes suspend or skip and never checkpoint, and `.catch()` / `.finally()` are cleanup — none of them count, so adding them doesn't shift the cadence.
 
 ### Timeout via `AbortSignal`
 

@@ -101,12 +101,16 @@ export type WorkflowSnapshot = GateSnapshot | CheckpointSnapshot | LegacyGateSna
 export interface WorkflowWarning {
   readonly source:
     | "step"
+    | "gate"
     | "finally"
     | "catch"
     | "onCheckpoint"
     | "onStepStart"
     | "onStepFinish"
     | "onStepError"
+    | "onItemStart"
+    | "onItemFinish"
+    | "onItemError"
     | "foreach-sibling";
   readonly stepId: string;
   readonly error: unknown;
@@ -241,6 +245,12 @@ export interface RunOptions {
    * Maximum ms `onCheckpoint` is allowed to run before its AbortSignal fires.
    * On timeout, a `CheckpointTimeoutError` is raised on the run (catch is
    * bypassed; original error reaches the caller). Default: no timeout.
+   *
+   * Note: the timeout abandons the *await*, not the *work*. The callback's
+   * AbortSignal fires, but JavaScript can't forcibly cancel an in-flight
+   * promise — a callback that ignores the signal (e.g. a blind S3/Postgres
+   * write) will still complete its side effect after the run has thrown.
+   * Honor the passed `signal` inside `onCheckpoint` to make the timeout real.
    */
   readonly checkpointTimeout?: number;
 }
@@ -251,6 +261,21 @@ export interface RunOptions {
  * contain the `::pipeai::` namespace.
  */
 export const CHECKPOINT_STEP_ID = "::pipeai::onCheckpoint" as const;
+
+/**
+ * Synthetic step id carried by the pending-error a cancellation promotes
+ * (surfaced to `.catch()` / observability). Lives in the reserved
+ * `::pipeai::` namespace so it can't be confused with a user step literally
+ * named "abort".
+ */
+export const ABORT_STEP_ID = "::pipeai::abort" as const;
+
+/**
+ * Synthetic step id used when a gate-resume's response validation / merge
+ * throws before the pipeline re-enters `execute()`. Reserved-namespaced for
+ * the same reason as {@link ABORT_STEP_ID}.
+ */
+export const GATE_RESUME_STEP_ID = "::pipeai::gate:resume" as const;
 
 /**
  * Thrown internally when `onCheckpoint` exceeds `RunOptions.checkpointTimeout`.
@@ -496,7 +521,14 @@ type LoopPredicate<TContext, TOutput> = (params: {
   iterations: number;
 }) => MaybePromise<boolean>;
 
-// Exactly one of `until` or `while` — never both.
+/**
+ * Loop control for `repeat`. Exactly one of `until` / `while` — never both.
+ *
+ * Both forms are **do-while**: the body always runs at least once, then the
+ * predicate is checked. This is intentional — the predicate receives the
+ * body's `output`, which doesn't exist until the body has run — but it means
+ * `while: () => false` still executes the body once (it is not a pre-check).
+ */
 export type RepeatOptions<TContext, TOutput> =
   | { until: LoopPredicate<TContext, TOutput>; while?: never; maxIterations?: number }
   | { while: LoopPredicate<TContext, TOutput>; until?: never; maxIterations?: number };
@@ -656,7 +688,7 @@ interface RuntimeState {
 type PendingError = {
   error: unknown;
   stepId: string;
-  source: "step" | "finally" | "catch" | "onCheckpoint";
+  source: "step" | "gate" | "finally" | "catch" | "onCheckpoint";
 };
 
 /**
@@ -668,6 +700,7 @@ type PendingError = {
 function pendingErrorSourceToStepType(source: PendingError["source"]): WorkflowStepType {
   switch (source) {
     case "step": return "step";
+    case "gate": return "gate";
     case "finally": return "finally";
     case "catch": return "catch";
     case "onCheckpoint": return "step";
@@ -688,14 +721,20 @@ async function emitCheckpoint(
   stepShapeHash: string,
 ): Promise<void> {
   if (!opts.onCheckpoint) return;
+  // When freezing, the checkpoint path keeps executing — so deep-freezing
+  // `state.output` directly would hand the next step a frozen input. Snapshot
+  // an independent clone instead, leaving the live value mutable. (Snapshots
+  // are meant to be serializable for Redis/S3/Postgres persistence, so a
+  // structured clone is sound here.) Without freeze we alias as before.
+  const willFreeze = resolveFreezeSnapshots(state);
   const snap: CheckpointSnapshot = {
     version: 2,
     kind: "checkpoint",
     resumeFromIndex,
-    output: state.output,
+    output: willFreeze ? structuredClone(state.output) : state.output,
     stepShapeHash,
   };
-  if (resolveFreezeSnapshots(state)) deepFreeze(snap);
+  if (willFreeze) deepFreeze(snap);
 
   const controller = new AbortController();
   if (opts.checkpointTimeout !== undefined) {
@@ -768,6 +807,37 @@ function maybeWarnStreamOnErrorOnSuspend(
   );
 }
 
+/**
+ * Seed for a run: the initial pipeline `output` plus an optional pre-execute
+ * `initialError`. The resume entry points compute these differently (gate
+ * schema-parse + merge vs. plain snapshot output), but every entry point then
+ * funnels through the same `runGenerate` / `runStream` machinery.
+ */
+type StateSeed = { output: unknown; initialError: PendingError | null };
+
+/**
+ * Build the per-run `RuntimeState`. Centralizes the shape every entry point
+ * (generate/stream + gate/checkpoint resume) used to hand-construct. `abortSignal`
+ * is always sourced from `opts` so cancellation is honored uniformly — the
+ * checkpoint-resume path previously omitted it.
+ */
+function makeRuntimeState(
+  ctx: unknown,
+  output: unknown,
+  mode: "generate" | "stream",
+  opts: RunOptions | undefined,
+  writer?: UIMessageStreamWriter,
+): RuntimeState {
+  return {
+    ctx,
+    output,
+    mode,
+    ...(writer ? { writer } : {}),
+    runOptions: opts,
+    abortSignal: opts?.abortSignal,
+  };
+}
+
 // ── Sealed Workflow (returned by finally — execution only) ───────────
 
 export class SealedWorkflow<
@@ -784,6 +854,7 @@ export class SealedWorkflow<
   // Memoized lazily per terminal instance — build pipelines once at module
   // load and re-run via generate() to amortize.
   private _cachedExecutableStepCount?: number;
+  private _cachedCheckpointableStepCount?: number;
   private _cachedStepShapeHash?: string;
 
   protected constructor(steps: ReadonlyArray<StepNode>, id?: string, observability?: WorkflowObservability) {
@@ -841,6 +912,25 @@ export class SealedWorkflow<
     return n;
   }
 
+  /**
+   * Count of *checkpointable* nodes — `type === "step"` only (this includes
+   * `branch`/`foreach`/`repeat`/`parallel`/`nested`, all internally `step`).
+   * Drives the checkpoint auto-cadence denominator. Distinct from
+   * {@link cachedExecutableStepCount}, which also counts `gate` nodes: gates
+   * suspend/skip and never reach the checkpoint block, so the runtime
+   * `executableStepsSeen` counter never advances on them. Counting gates in
+   * the denominator would dilute the "~4 checkpoints across the run" target.
+   */
+  protected get cachedCheckpointableStepCount(): number {
+    if (this._cachedCheckpointableStepCount !== undefined) return this._cachedCheckpointableStepCount;
+    let n = 0;
+    for (const s of this.steps) {
+      if (s.type === "step") n++;
+    }
+    this._cachedCheckpointableStepCount = n;
+    return n;
+  }
+
   /** @internal — used by `computeStepShapeHash` to descend nested workflows. */
   getStepsForShapeHash(): ReadonlyArray<StepNode> {
     return this.steps;
@@ -879,7 +969,10 @@ export class SealedWorkflow<
       throw new Error(`RunOptions: checkpointTimeout must be a finite positive number (ms), got ${opts.checkpointTimeout}`);
     }
     const length = this.cachedExecutableStepCount;
-    const cadence = opts.checkpointEvery ?? Math.max(1, Math.ceil(length / 4));
+    // Cadence is computed from the checkpointable-step count (gates excluded)
+    // so this guard predicts the actual runtime cadence; `length` stays the
+    // executable-node count as a graph-size proxy for the catastrophe threshold.
+    const cadence = opts.checkpointEvery ?? Math.max(1, Math.ceil(this.cachedCheckpointableStepCount / 4));
     if (opts.freezeSnapshots && opts.freezeSnapshots !== "iAcceptThePerformanceCost" && cadence === 1 && length >= 8) {
       throw new Error(
         `freezeSnapshots+checkpointEvery:1 on a ${length}-step workflow is reliably catastrophic. ` +
@@ -936,7 +1029,10 @@ export class SealedWorkflow<
     } catch (e) {
       if (name !== "onStepError") {
         const stepId = (event as { stepId: string }).stepId;
-        pushWarning(state, name as WorkflowWarning["source"], stepId, e);
+        // No cast: every WorkflowObservability hook name (onStep* / onItem*)
+        // is a member of WorkflowWarning["source"], so the type checker
+        // verifies the warning source is representable in the public union.
+        pushWarning(state, name, stepId, e);
         // eslint-disable-next-line no-console
         console.error(`pipeai: ${name} hook threw for stepId "${stepId}":`, e);
       }
@@ -955,18 +1051,7 @@ export class SealedWorkflow<
     this.ensureDuplicateCheck();
     const input = args[0];
     const opts = args[1] as RunOptions | undefined;
-    this.validateRunOptions(opts);
-    const state: RuntimeState = {
-      ctx,
-      output: input,
-      mode: "generate",
-      runOptions: opts,
-      abortSignal: opts?.abortSignal,
-    };
-
-    await this.execute(state, 0, opts);
-
-    return this.buildResult(state);
+    return this.runGenerate(ctx, 0, opts, () => ({ output: input, initialError: null }));
   }
 
   stream<UI_MESSAGE extends UIMessage = UIMessage>(
@@ -979,8 +1064,52 @@ export class SealedWorkflow<
     const input = args[0];
     const options = args[1] as WorkflowStreamOptions<UI_MESSAGE> | undefined;
     const opts = args[2] as RunOptions | undefined;
+    return this.runStream(ctx, 0, opts, options, () => ({ output: input, initialError: null }));
+  }
+
+  // Helper — converts terminal RuntimeState into a WorkflowResult; freezes
+  // snapshot + warnings if requested via runOptions.
+  protected buildResult(state: RuntimeState): WorkflowResult<TOutput> {
+    const warnings = state.warnings ?? [];
+    // freezeSnapshots freezes the warnings array on BOTH terminal paths
+    // (complete and suspended), per the documented contract.
+    if (resolveFreezeSnapshots(state)) {
+      deepFreeze(warnings);
+    }
+    if (state.suspension) {
+      return { status: "suspended", snapshot: state.suspension, warnings };
+    }
+    return { status: "complete", output: state.output as TOutput, warnings };
+  }
+
+  // ── Shared run drivers (generate / stream) ────────────────────
+  // Every public entry point — base generate/stream plus gate- and
+  // checkpoint-resume — differs only in (a) how it seeds the initial output /
+  // pre-execute error and (b) the start index. Both drivers take a `seed`
+  // thunk for (a) and a `startIndex` for (b); the rest (validation, state
+  // construction, execute, result building, stream plumbing) is identical.
+
+  protected async runGenerate(
+    ctx: unknown,
+    startIndex: number,
+    opts: RunOptions | undefined,
+    seed: () => MaybePromise<StateSeed>,
+  ): Promise<WorkflowResult<TOutput>> {
     this.validateRunOptions(opts);
-    const abortSignal = opts?.abortSignal;
+    const { output, initialError } = await seed();
+    const state = makeRuntimeState(ctx, output, "generate", opts);
+    await this.execute(state, startIndex, opts, initialError);
+    return this.buildResult(state);
+  }
+
+  protected runStream<UI_MESSAGE extends UIMessage = UIMessage>(
+    ctx: unknown,
+    startIndex: number,
+    opts: RunOptions | undefined,
+    options: WorkflowStreamOptions<UI_MESSAGE> | undefined,
+    seed: () => MaybePromise<StateSeed>,
+  ): WorkflowStreamResult<TOutput> {
+    this.validateRunOptions(opts);
 
     let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
     let rejectOutput!: (error: unknown) => void;
@@ -988,23 +1117,19 @@ export class SealedWorkflow<
       resolveOutput = res;
       rejectOutput = rej;
     });
-
     // Prevent unhandled rejection warning if the consumer never awaits `output`.
     outputPromise.catch(() => {});
 
     const stream = createUIMessageStream<UI_MESSAGE>({
       execute: async ({ writer }) => {
-        const state: RuntimeState = {
-          ctx,
-          output: input,
-          mode: "stream",
-          writer,
-          runOptions: opts,
-          abortSignal,
-        };
-
+        // Seeding (gate schema-parse + merge) runs here, inside the stream's
+        // error pipeline — a throw must surface as a rejected `output`/stream,
+        // not escape synchronously from `.stream(...)`. The resume seeds catch
+        // their own errors into `initialError` so `.catch()` can observe them.
         try {
-          await this.execute(state, 0, opts);
+          const { output, initialError } = await seed();
+          const state = makeRuntimeState(ctx, output, "stream", opts, writer);
+          await this.execute(state, startIndex, opts, initialError);
           const result = this.buildResult(state);
           maybeWarnStreamOnErrorOnSuspend(result, options);
           resolveOutput(result);
@@ -1019,23 +1144,7 @@ export class SealedWorkflow<
       ...(options?.generateId ? { generateId: options.generateId } : {}),
     });
 
-    return {
-      stream,
-      output: outputPromise,
-    };
-  }
-
-  // Helper — converts terminal RuntimeState into a WorkflowResult; freezes
-  // snapshot + warnings if requested via runOptions.
-  protected buildResult(state: RuntimeState): WorkflowResult<TOutput> {
-    const warnings = state.warnings ?? [];
-    if (state.suspension && resolveFreezeSnapshots(state)) {
-      deepFreeze(warnings);
-    }
-    if (state.suspension) {
-      return { status: "suspended", snapshot: state.suspension, warnings };
-    }
-    return { status: "complete", output: state.output as TOutput, warnings };
+    return { stream, output: outputPromise };
   }
 
   // ── Internal: execute pipeline ────────────────────────────────
@@ -1058,7 +1167,7 @@ export class SealedWorkflow<
     // Hoisted once per run — the numeric cadence form has no per-step input,
     // so recomputing it per iteration was pure overhead.
     const ckptCadence = opts?.onCheckpoint && opts.checkpointWhen === undefined
-      ? (opts.checkpointEvery ?? Math.max(1, Math.ceil(this.cachedExecutableStepCount / 4)))
+      ? (opts.checkpointEvery ?? Math.max(1, Math.ceil(this.cachedCheckpointableStepCount / 4)))
       : 0;
 
     // Counts completed executable step bodies (not raw loop indices), so the
@@ -1083,7 +1192,7 @@ export class SealedWorkflow<
     let abortPromoted = false;
     const makeAbortError = (signal: AbortSignal): PendingError => ({
       error: signal.reason ?? new Error("Workflow aborted"),
-      stepId: "abort",
+      stepId: ABORT_STEP_ID,
       source: "step",
     });
 
@@ -1194,7 +1303,23 @@ export class SealedWorkflow<
             durationMs: performance.now() - gStart, suspended: true,
           });
         } catch (e) {
-          pendingError = { error: e, stepId: node.id, source: "step" };
+          // A throwing gate condition/payload is a gate body failure: fire
+          // onStepError with type "gate" (parity with the step path below)
+          // and tag the pending error source "gate" so the suspension-wins
+          // tail also reports type "gate", not "step". If the onStepError hook
+          // itself throws, attach its error as `cause`, exactly like a step.
+          pendingError = { error: e, stepId: node.id, source: "gate" };
+          const obsError = await this.fireHook(state, "onStepError", {
+            stepId: node.id, type: "gate", ctx: state.ctx, error: e,
+            durationMs: performance.now() - gStart,
+          });
+          if (obsError !== undefined && typeof e === "object" && e !== null) {
+            try {
+              (e as { cause?: unknown }).cause = obsError;
+            } catch {
+              // Some objects are frozen / non-extensible — ignore.
+            }
+          }
         }
         continue;
       }
@@ -1611,6 +1736,25 @@ export class ResumedWorkflow<
     return response;
   }
 
+  /**
+   * Seed the run by validating the gate response and merging it with the
+   * suspended output. Runs schema.parse + mergeFn inside a try so a failure
+   * becomes a pre-execute `initialError` (routed through `.catch()`) rather
+   * than escaping the run synchronously. On error the output falls back to the
+   * prior (pre-gate) output.
+   */
+  private async seedFromResponse(rawResponse: TResponse): Promise<StateSeed> {
+    try {
+      const response = this.validateResponse(rawResponse);
+      const output = this.mergeFn
+        ? await this.mergeFn({ priorOutput: this.priorOutput, response })
+        : response;
+      return { output, initialError: null };
+    } catch (error) {
+      return { output: this.priorOutput, initialError: { error, stepId: GATE_RESUME_STEP_ID, source: "step" } };
+    }
+  }
+
   override async generate(
     ctx: TContext,
     ...args: TResponse extends void
@@ -1619,29 +1763,7 @@ export class ResumedWorkflow<
   ): Promise<WorkflowResult<TOutput>> {
     const rawResponse = args[0] as TResponse;
     const opts = args[1] as RunOptions | undefined;
-    this.validateRunOptions(opts);
-    // Run prep (schema.parse + mergeFn) inside the workflow's error pipeline
-    // so a downstream `.catch()` can observe failures here. Without this,
-    // a schema/merge throw would reject the promise raw, bypassing catch.
-    let output: unknown = this.priorOutput;
-    let initialError: PendingError | null = null;
-    try {
-      const response = this.validateResponse(rawResponse);
-      output = this.mergeFn
-        ? await this.mergeFn({ priorOutput: this.priorOutput, response })
-        : response;
-    } catch (error) {
-      initialError = { error, stepId: "gate:resume", source: "step" };
-    }
-    const state: RuntimeState = {
-      ctx,
-      output,
-      mode: "generate",
-      runOptions: opts,
-      abortSignal: opts?.abortSignal,
-    };
-    await this.execute(state, this.startIndex, opts, initialError);
-    return this.buildResult(state);
+    return this.runGenerate(ctx, this.startIndex, opts, () => this.seedFromResponse(rawResponse));
   }
 
   override stream<UI_MESSAGE extends UIMessage = UIMessage>(
@@ -1653,62 +1775,7 @@ export class ResumedWorkflow<
     const rawResponse = args[0] as TResponse;
     const options = args[1] as WorkflowStreamOptions<UI_MESSAGE> | undefined;
     const opts = args[2] as RunOptions | undefined;
-    this.validateRunOptions(opts);
-    const abortSignal = opts?.abortSignal;
-
-    let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
-    let rejectOutput!: (error: unknown) => void;
-    const outputPromise = new Promise<WorkflowResult<TOutput>>((res, rej) => {
-      resolveOutput = res;
-      rejectOutput = rej;
-    });
-    outputPromise.catch(() => {});
-
-    const mergeFn = this.mergeFn;
-    const priorOutput = this.priorOutput;
-    const startIndex = this.startIndex;
-
-    const stream = createUIMessageStream<UI_MESSAGE>({
-      execute: async ({ writer }) => {
-        // Run prep (schema.parse + mergeFn) inside the error pipeline (same as
-        // generate()). Without this, a schema parse throw escapes synchronously
-        // from .stream(...) and bypasses any downstream .catch().
-        let output: unknown = priorOutput;
-        let initialError: PendingError | null = null;
-        try {
-          const response = this.validateResponse(rawResponse);
-          output = mergeFn
-            ? await mergeFn({ priorOutput, response })
-            : response;
-        } catch (error) {
-          initialError = { error, stepId: "gate:resume", source: "step" };
-        }
-        const state: RuntimeState = {
-          ctx,
-          output,
-          mode: "stream",
-          writer,
-          runOptions: opts,
-          abortSignal,
-        };
-
-        try {
-          await this.execute(state, startIndex, opts, initialError);
-          const result = this.buildResult(state);
-          maybeWarnStreamOnErrorOnSuspend(result, options);
-          resolveOutput(result);
-        } catch (error) {
-          rejectOutput(error);
-          throw error;
-        }
-      },
-      ...(options?.onError ? { onError: options.onError } : {}),
-      ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
-      ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
-      ...(options?.generateId ? { generateId: options.generateId } : {}),
-    });
-
-    return { stream, output: outputPromise };
+    return this.runStream(ctx, this.startIndex, opts, options, () => this.seedFromResponse(rawResponse));
   }
 }
 
@@ -1745,15 +1812,7 @@ export class CheckpointResumedWorkflow<
     ...args: [input?: void, opts?: RunOptions]
   ): Promise<WorkflowResult<TOutput>> {
     const opts = args[1];
-    this.validateRunOptions(opts);
-    const state: RuntimeState = {
-      ctx,
-      output: this.priorOutput,
-      mode: "generate",
-      runOptions: opts,
-    };
-    await this.execute(state, this.startIndex, opts);
-    return this.buildResult(state);
+    return this.runGenerate(ctx, this.startIndex, opts, () => ({ output: this.priorOutput, initialError: null }));
   }
 
   override stream<UI_MESSAGE extends UIMessage = UIMessage>(
@@ -1762,45 +1821,7 @@ export class CheckpointResumedWorkflow<
   ): WorkflowStreamResult<TOutput> {
     const options = args[1];
     const opts = args[2];
-    this.validateRunOptions(opts);
-
-    let resolveOutput!: (value: WorkflowResult<TOutput>) => void;
-    let rejectOutput!: (error: unknown) => void;
-    const outputPromise = new Promise<WorkflowResult<TOutput>>((res, rej) => {
-      resolveOutput = res;
-      rejectOutput = rej;
-    });
-    outputPromise.catch(() => {});
-
-    const priorOutput = this.priorOutput;
-    const startIndex = this.startIndex;
-
-    const stream = createUIMessageStream<UI_MESSAGE>({
-      execute: async ({ writer }) => {
-        const state: RuntimeState = {
-          ctx,
-          output: priorOutput,
-          mode: "stream",
-          writer,
-          runOptions: opts,
-        };
-        try {
-          await this.execute(state, startIndex, opts);
-          const result = this.buildResult(state);
-          maybeWarnStreamOnErrorOnSuspend(result, options);
-          resolveOutput(result);
-        } catch (error) {
-          rejectOutput(error);
-          throw error;
-        }
-      },
-      ...(options?.onError ? { onError: options.onError } : {}),
-      ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
-      ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
-      ...(options?.generateId ? { generateId: options.generateId } : {}),
-    });
-
-    return { stream, output: outputPromise };
+    return this.runStream(ctx, this.startIndex, opts, options, () => ({ output: this.priorOutput, initialError: null }));
   }
 }
 
@@ -2177,12 +2198,16 @@ export class Workflow<
       }) => MaybePromise<TNextOutput | typeof Workflow.SKIP>;
     },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
-    // Validate up front: `!(c >= 1)` rejects NaN, 0, and negatives (NaN would
-    // otherwise slip past the `<= 1` sequential branch into a `Math.min(NaN, …)`
-    // worker pool that silently processes nothing). `Infinity` is allowed (full
-    // fan-out, clamped by item count).
-    if (options?.concurrency !== undefined && !(options.concurrency >= 1)) {
-      throw new Error(`foreach: concurrency must be >= 1 (or Infinity), got ${options.concurrency}`);
+    // Validate up front: a positive integer or `Infinity` (full fan-out,
+    // clamped by item count). Rejects NaN / 0 / negatives (NaN would otherwise
+    // slip into a `Math.min(NaN, …)` worker pool that processes nothing) and
+    // fractional values (which `Array.from({length})` would silently floor) —
+    // matching the stricter `maxIterations` / `checkpointEvery` validation.
+    if (
+      options?.concurrency !== undefined &&
+      !((Number.isInteger(options.concurrency) && options.concurrency >= 1) || options.concurrency === Infinity)
+    ) {
+      throw new Error(`foreach: concurrency must be a positive integer or Infinity, got ${options.concurrency}`);
     }
     const concurrency = options?.concurrency ?? 1;
     const onError = options?.onError;
@@ -2432,6 +2457,16 @@ export class Workflow<
       : Object.entries(branches as Record<string, ParallelTarget<TContext, TOutput>>).map(([k, t], i) => ({ key: k, index: i, target: t }));
     const branchCount = entries.length;
     const requestedConcurrency = options?.concurrency;
+    // Mirror foreach's guard (positive integer or Infinity). Without it `NaN`
+    // slipped past the later `Number.isFinite()` check and silently became
+    // full fan-out (the cap removed), `0` / negative were clamped to 1, and a
+    // fractional value was floored by the worker-pool `Array.from({length})`.
+    if (
+      requestedConcurrency !== undefined &&
+      !((Number.isInteger(requestedConcurrency) && requestedConcurrency >= 1) || requestedConcurrency === Infinity)
+    ) {
+      throw new Error(`parallel: concurrency must be a positive integer or Infinity, got ${requestedConcurrency}`);
+    }
     let effectiveConcurrency: number;
     if (requestedConcurrency === undefined) {
       effectiveConcurrency = Math.min(branchCount, 5);
@@ -2612,6 +2647,12 @@ export class Workflow<
   ): Workflow<TContext, TInput, TOutput, TGates> {
     if (options.maxIterations !== undefined && (!Number.isInteger(options.maxIterations) || options.maxIterations < 1)) {
       throw new Error(`repeat: maxIterations must be a positive integer, got ${options.maxIterations}`);
+    }
+    // The type union already enforces exactly-one; this guards a type-bypassed
+    // caller (`{}` or both) from a confusing `options.while is not a function`
+    // TypeError deep inside the loop body.
+    if ((options.until === undefined) === (options.while === undefined)) {
+      throw new Error("repeat: requires exactly one of `until` or `while`");
     }
     const maxIterations = options.maxIterations ?? 10;
     const isWorkflow = target instanceof SealedWorkflow;
