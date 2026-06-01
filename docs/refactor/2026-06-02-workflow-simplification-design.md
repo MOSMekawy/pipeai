@@ -212,6 +212,14 @@ function reconcileUnitOutcomes(
 ): UnitFailure[];
 ```
 
+`reconcileUnitOutcomes` is the child→parent reduction, kept shared because its
+precedence (`abort > any-suspension > failures`, plus packing the
+`NestedGateUnsupportedError` siblings — lowest-index gate wins, other gates →
+`siblingSuspensions`, non-gate failures → `siblingErrors`, all index-ordered) is
+subtle and must stay byte-identical across `foreach` and `parallel`. It is
+deliberately *not* the executor's `finalize()` (different precedence) and *not*
+part of `mapConcurrent` (which stays workflow-agnostic).
+
 `executeItem` / `executeBranch` keep their existing `try/catch` (which fires
 `onItemError`) but convert at the boundary: a `NestedGateUnsupportedError` thrown
 by `executeNestedWorkflow` becomes `{ kind: "suspended" }`; any other throw
