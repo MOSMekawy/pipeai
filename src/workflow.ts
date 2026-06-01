@@ -531,6 +531,19 @@ export type ParallelOutputTuple<T extends ReadonlyArray<unknown>> = {
   [K in keyof T]: BranchOutput<T[K]>;
 };
 
+/**
+ * Record output when `onError` is supplied: any branch may be `SKIP`ped,
+ * leaving its slot `undefined`, so every value is widened to `| undefined`.
+ */
+export type ParallelOutputRecordPartial<T extends Record<string, unknown>> = {
+  [K in keyof T]: BranchOutput<T[K]> | undefined;
+};
+
+/** Tuple counterpart of `ParallelOutputRecordPartial` — each slot `| undefined`. */
+export type ParallelOutputTuplePartial<T extends ReadonlyArray<unknown>> = {
+  [K in keyof T]: BranchOutput<T[K]> | undefined;
+};
+
 export interface ParallelOptions<TContext> {
   /** Override the default step id. Default: `parallel:record` or `parallel:tuple`. */
   id?: string;
@@ -544,12 +557,15 @@ export interface ParallelOptions<TContext> {
   /**
    * Per-branch error handler. On the no-suspension path, called once per
    * rejected branch in index order after all settle. Return a value to
-   * substitute, return `Workflow.SKIP` to leave the slot undefined (record
-   * form only — tuple SKIP would shift indices), or rethrow to abort the
-   * parallel.
+   * substitute, return `Workflow.SKIP` to leave the slot `undefined`, or
+   * rethrow to abort the parallel. SKIP works in both the record and tuple
+   * forms (the slot stays `undefined` in place — it does not shift indices);
+   * supplying `onError` widens the output values to `BranchOutput | undefined`
+   * to reflect that a slot may be skipped.
    *
    * **Bypassed entirely on the suspension path** (any branch hit a nested
-   * gate). See README's "Suspension under `parallel()`" section.
+   * gate) and on the cancellation path (the run was aborted). See README's
+   * "Suspension under `parallel()`" section.
    */
   onError?: (params: {
     error: unknown;
@@ -2237,10 +2253,9 @@ export class Workflow<
 
         if (concurrency <= 1) {
           for (let i = 0; i < items.length; i++) {
-            if (signal?.aborted) {
-              failures.push({ index: i, error: signal.reason ?? new Error("Workflow aborted") });
-              continue;
-            }
+            // Cooperative cancellation: stop launching. The abort is handled
+            // after the loop (bypassing onError) — don't fabricate a failure.
+            if (signal?.aborted) break;
             try {
               await executeItem(items[i], i);
             } catch (error) {
@@ -2258,10 +2273,8 @@ export class Workflow<
             while (true) {
               const i = nextIndex++;
               if (i >= items.length) return;
-              if (signal?.aborted) {
-                failures.push({ index: i, error: signal.reason ?? new Error("Workflow aborted") });
-                continue;
-              }
+              // Cooperative cancellation: stop this worker. Abort handled after.
+              if (signal?.aborted) return;
               try {
                 await executeItem(items[i], i);
               } catch (error) {
@@ -2278,6 +2291,21 @@ export class Workflow<
 
         failures.sort((a, b) => a.index - b.index);
 
+        // Always merge per-item warnings before any exit path (once).
+        mergeItemWarnings();
+
+        // Cooperative cancellation wins over BOTH onError and suspension —
+        // mirror `repeat`, which rethrows the abort reason rather than routing
+        // it through recovery. Failures collected before the abort are kept as
+        // warnings; the abort reason propagates so execute()'s abort path tears
+        // the run down.
+        if (signal?.aborted) {
+          for (const f of failures) {
+            pushWarning(state, "foreach-sibling", `${id}[${f.index}]`, f.error);
+          }
+          throw signal.reason ?? new Error("Workflow aborted");
+        }
+
         // Partition into gate vs non-gate rejections.
         const gateFailures: { index: number; error: NestedGateUnsupportedError }[] = [];
         const nonGateFailures: Failure[] = [];
@@ -2288,9 +2316,6 @@ export class Workflow<
             nonGateFailures.push(f);
           }
         }
-
-        // Always merge per-item warnings before deciding which path to take.
-        mergeItemWarnings();
 
         if (gateFailures.length > 0) {
           // Suspension path — onError is bypassed entirely. Non-gate rejections
@@ -2336,11 +2361,27 @@ export class Workflow<
   // not lockstep batching. Warn-once when branch count exceeds the 5 cap so
   // users notice unexpected rate-limit pressure.
 
+  // With `onError`, any branch may be SKIPped → output values widen to
+  // `BranchOutput | undefined`. The with-onError overloads are declared first
+  // so they win when `onError` is present.
+
+  /** Record-form + `onError`. Values are `BranchOutput | undefined` (SKIP-able). */
+  parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
+    branches: TBranches,
+    options: ParallelOptions<TContext> & { onError: NonNullable<ParallelOptions<TContext>["onError"]> },
+  ): Workflow<TContext, TInput, ParallelOutputRecordPartial<TBranches>, TGates>;
+
   /** Record-form overload. Returns `{ [K]: BranchOutput<T[K]> }`. */
   parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
     branches: TBranches,
     options?: ParallelOptions<TContext>,
   ): Workflow<TContext, TInput, ParallelOutputRecord<TBranches>, TGates>;
+
+  /** Tuple-form + `onError`. Each slot is `BranchOutput | undefined` (SKIP-able). */
+  parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
+    branches: TBranches,
+    options: ParallelOptions<TContext> & { onError: NonNullable<ParallelOptions<TContext>["onError"]> },
+  ): Workflow<TContext, TInput, ParallelOutputTuplePartial<TBranches>, TGates>;
 
   /** Tuple-form overload. Returns `[O1, O2, ...]`. Use `as const`. */
   parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
@@ -2461,6 +2502,16 @@ export class Workflow<
           }
         }
 
+        // Cooperative cancellation wins over onError and suspension (mirrors
+        // foreach / repeat). Branches that errored from the forwarded abort are
+        // preserved as warnings; rethrow so execute()'s abort path tears down.
+        if (state.abortSignal?.aborted) {
+          for (const f of failures) {
+            pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
+          }
+          throw state.abortSignal.reason ?? new Error("Workflow aborted");
+        }
+
         // Partition rejections into gate vs non-gate.
         const gateFailures: { key: string | number; index: number; error: NestedGateUnsupportedError }[] = [];
         const nonGateFailures: Failure[] = [];
@@ -2497,9 +2548,9 @@ export class Workflow<
             ctx: state.ctx as Readonly<TContext>,
           });
           if (recovered === Workflow.SKIP) {
-            // Record form: leave the key as `undefined`. Tuple form: same — the
-            // slot stays `undefined`. The output type accepts SKIP only on the
-            // record form at compile time.
+            // Both forms: the slot stays `undefined` in place (no index shift).
+            // Supplying `onError` widens the output type to `BranchOutput |
+            // undefined`, so this hole is reflected in the type.
             results[key] = undefined;
           } else {
             results[key] = recovered;
@@ -2519,6 +2570,9 @@ export class Workflow<
     target: Agent<TContext, TOutput, TOutput> | SealedWorkflow<TContext, TOutput, TOutput>,
     options: RepeatOptions<TContext, TOutput> & { id?: string },
   ): Workflow<TContext, TInput, TOutput, TGates> {
+    if (options.maxIterations !== undefined && (!Number.isInteger(options.maxIterations) || options.maxIterations < 1)) {
+      throw new Error(`repeat: maxIterations must be a positive integer, got ${options.maxIterations}`);
+    }
     const maxIterations = options.maxIterations ?? 10;
     const isWorkflow = target instanceof SealedWorkflow;
     const defaultId = isWorkflow

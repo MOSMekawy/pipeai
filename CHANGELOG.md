@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 - **`getActiveWriter` is no longer exported from `pipeai`** (was added to the public surface in 0.8.0). It remains the internal mechanism that powers the writer hand-off, but is no longer a supported extension point. Reach the writer through the explicit paths instead: `defineTool` / `ToolProvider` inject `writer` into `execute(input, ctx, { writer })`, agent `onStepFinish` / `onFinish` / `onError` callbacks receive it, and inline `Workflow.step(id, fn)` handlers receive it. A hand-rolled `IToolProvider` (not built via `defineTool` / `ToolProvider`) that needs the writer should wrap its definition in `ToolProvider`/`defineTool`, which performs the injection.
 
+### Fixed
+
+- **`foreach` / `parallel` no longer route cancellation through `onError`.** When the run is aborted, a skipped/aborted branch was being fed to `onError` as an ordinary failure, letting recovery logic "recover" from a cancellation and pollute results. Both combinators now bypass `onError` on abort and rethrow the abort reason (mirroring `repeat`); failures collected before the abort are preserved as warnings.
+- **`parallel` output types are now honest about `SKIP`.** Supplying `onError` (the only way a branch can `SKIP`) widens the output values to `BranchOutput | undefined` in both the record and tuple forms, instead of typing a possibly-`undefined` slot as a guaranteed value. Without `onError` the output stays precise.
+- **`repeat` validates `maxIterations`.** A non-positive `maxIterations` (e.g. `0`) previously made the loop a silent no-op; it now throws `repeat: maxIterations must be a positive integer`.
+
 ### Notes
 
 - AI SDK's `createUIMessageStream` also accepts an `onStepFinish` (per-model-step) callback. We intentionally do not expose it on `WorkflowStreamOptions` — pipeai already has two clearer step-finish callbacks at different granularities (`Agent.onStepFinish` for per-model-call, `WorkflowObservability.onStepFinish` for per-workflow-step). Adding a third one with the same name would be confusing. Reach for one of the two above instead.

@@ -298,6 +298,49 @@ describe("Workflow", () => {
     });
   });
 
+  describe("hardening — abort / repeat validation / parallel SKIP typing", () => {
+    it("foreach: cancellation bypasses onError (abort is not routed through recovery)", async () => {
+      const controller = new AbortController();
+      const onError = vi.fn(() => "recovered");
+      // The first item aborts mid-run; the loop's between-items abort check must
+      // then propagate the abort rather than fabricating a failure that onError
+      // "recovers" from.
+      const sub = Workflow.create<TestCtx, string>()
+        .step("maybe-abort", ({ input }) => {
+          if (input === "a") controller.abort(new Error("cancelled"));
+          return input.toUpperCase();
+        });
+      const pipeline = Workflow.create<TestCtx, string[]>()
+        .foreach(sub, { concurrency: 1, onError });
+
+      await expect(
+        pipeline.generate(testCtx, ["a", "b"], { abortSignal: controller.signal }),
+      ).rejects.toThrow("cancelled");
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("repeat throws on non-positive maxIterations", () => {
+      expect(() =>
+        Workflow.create<TestCtx, string>().repeat(createPassthroughAgent("r", "x"), {
+          until: () => true,
+          maxIterations: 0,
+        }),
+      ).toThrow(/maxIterations must be a positive integer/);
+    });
+
+    it("parallel + onError SKIP leaves the skipped record key undefined", async () => {
+      const failing = createFailingAgent("f", () => true, "boom");
+      const ok = createPassthroughAgent("ok", "OK");
+      const wf = Workflow.create<TestCtx, string>()
+        .parallel({ a: failing, b: ok }, { onError: () => Workflow.SKIP });
+      const { output } = expectComplete(await wf.generate(testCtx, "x"));
+      // With the honest typing, output.a is `string | undefined`.
+      const a: string | undefined = output.a;
+      expect(a).toBeUndefined();
+      expect(output.b).toBe("OK");
+    });
+  });
+
   describe("branch() with predicates", () => {
     it("routes to the matching branch", async () => {
       const premiumAgent = createPassthroughAgent("premium", "premium response");
