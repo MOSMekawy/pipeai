@@ -157,6 +157,75 @@ describe("Workflow", () => {
     });
   });
 
+  describe("step() conditional — when / otherwise", () => {
+    it("agent step runs the agent when `when` is true", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("a", "AGENT-OUT"), {
+          when: ({ input }) => input === "go",
+          otherwise: ({ input }) => `skip:${input}`,
+        });
+      expect(expectComplete(await pipeline.generate(testCtx, "go")).output).toBe("AGENT-OUT");
+    });
+
+    it("agent step uses `otherwise` when `when` is false", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(createPassthroughAgent("a", "AGENT-OUT"), {
+          when: ({ input }) => input === "go",
+          otherwise: ({ input }) => `skip:${input}`,
+        });
+      expect(expectComplete(await pipeline.generate(testCtx, "stop")).output).toBe("skip:stop");
+    });
+
+    it("inline step passes input through when `when` is false and no `otherwise`", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("maybe-upper", ({ input }) => input.toUpperCase(), {
+          when: ({ input }) => input.startsWith("x"),
+        });
+      expect(expectComplete(await pipeline.generate(testCtx, "abc")).output).toBe("abc");
+      expect(expectComplete(await pipeline.generate(testCtx, "xyz")).output).toBe("XYZ");
+    });
+
+    it("inline step uses `otherwise` when `when` is false", async () => {
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("maybe-upper", ({ input }) => input.toUpperCase(), {
+          when: ({ input }) => input.startsWith("x"),
+          otherwise: ({ input }) => `default:${input}`,
+        });
+      expect(expectComplete(await pipeline.generate(testCtx, "abc")).output).toBe("default:abc");
+    });
+
+    it("nested workflow step is skipped (passthrough) when `when` is false", async () => {
+      const sub = Workflow.create<TestCtx, string>().step(createPassthroughAgent("inner", "INNER"));
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step(sub, { when: ({ input }) => input === "run" });
+      expect(expectComplete(await pipeline.generate(testCtx, "skip")).output).toBe("skip");
+      expect(expectComplete(await pipeline.generate(testCtx, "run")).output).toBe("INNER");
+    });
+
+    it("does not invoke the body when `when` is false", async () => {
+      const spy = vi.fn((s: string) => s.toUpperCase());
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("maybe", ({ input }) => spy(input), { when: () => false });
+      await pipeline.generate(testCtx, "x");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("type: `otherwise` collapses output to TNextOutput (no union)", async () => {
+      // `len` outputs number; otherwise returns number → output is `number`,
+      // so the next step's `input` is usable as a number. If output were
+      // `string | number` (the no-otherwise union), `input * 2` would not
+      // type-check — this is the type-level collapse assertion.
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("len", ({ input }) => input.length, {
+          when: ({ input }) => input.length > 0,
+          otherwise: () => 0,
+        })
+        .step("double", ({ input }) => input * 2);
+      expect(expectComplete(await pipeline.generate(testCtx, "abc")).output).toBe(6);
+      expect(expectComplete(await pipeline.generate(testCtx, "")).output).toBe(0);
+    });
+  });
+
   describe("branch() with predicates", () => {
     it("routes to the matching branch", async () => {
       const premiumAgent = createPassthroughAgent("premium", "premium response");

@@ -366,6 +366,31 @@ const pipeline = Workflow.create<Ctx>()
 
 Nested workflows can be arbitrarily deep — a workflow step can contain another workflow that itself contains nested workflows.
 
+### Conditional steps via `when` / `otherwise`
+
+Any `step` form — agent, inline `step(id, fn)`, or nested `step(workflow)` — accepts a `when` predicate. When it returns false the step is **skipped** and its body never runs:
+
+```ts
+const pipeline = Workflow.create<Ctx, Input>()
+  // skip → passthrough: input is forwarded unchanged
+  .step(enrichAgent, { when: ({ input }) => input.needsEnrichment })
+  // skip → `otherwise` produces the value
+  .step("search", runSearch, {
+    when: ({ input }) => input.intent === "search",
+    otherwise: ({ input }) => ({ ...input, results: [] }),
+  })
+  // conditionally run a whole sub-pipeline
+  .step(productPipeline, { when: ({ input }) => input.intent === "product" });
+```
+
+The output type reflects what can actually happen — this is deliberate, so a skipped step can't be mistaken for one that always ran:
+
+- **`when` + `otherwise`** → output stays `TNextOutput` (`otherwise` returns it).
+- **`when` without `otherwise`** → output widens to `TOutput | TNextOutput` (skip passes the input through). For same-shape tap/enrich steps the union collapses to a single type; when the shapes differ and you'd rather keep a single type, supply `otherwise` to produce a default.
+- **no `when`** → `TNextOutput`, exactly as before.
+
+`when` / `otherwise` throwing propagates as a normal step error (a downstream `.catch()` can observe it). A skipped step still fires the `onStepStart` / `onStepFinish` observability events with its passthrough/`otherwise` value as `output`.
+
 ### Predicate branching via `branch()`
 
 Route to different agents based on runtime conditions. The first matching `when` wins. A case without `when` acts as the default:

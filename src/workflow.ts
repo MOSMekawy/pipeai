@@ -354,12 +354,54 @@ export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
 
 // ── Step Options ────────────────────────────────────────────────────
 
-export type StepOptions<TContext, TOutput, TNextOutput> = AgentStepHooks<TContext, TOutput, TNextOutput> & {
-  /** Override the default step id (`agent.id`). Required when reusing the same
-   *  agent across multiple steps in one workflow — the construction-time
-   *  `(type, id)` walk rejects duplicates. */
-  id?: string;
-};
+/**
+ * Predicate gating whether a step runs. Receives the step's input. When it
+ * returns false the step is skipped — its body (agent / fn / sub-workflow) is
+ * never invoked.
+ */
+export type StepWhen<TContext, TOutput> = (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<boolean>;
+
+/**
+ * Produces the step's output when `when` returns false. With it, a skipped
+ * step's output is `otherwise(...)` (typed `TNextOutput`, so the step's output
+ * type stays `TNextOutput`). Without it, a skipped step passes its input
+ * through unchanged (output type widens to `TOutput | TNextOutput`).
+ */
+export type StepOtherwise<TContext, TOutput, TNextOutput> = (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
+
+/** Conditional-skip options shared by all `step` forms. */
+export interface ConditionalStepOptions<TContext, TOutput, TNextOutput> {
+  /** Run the step only when this returns true. Omit to always run. */
+  when?: StepWhen<TContext, TOutput>;
+  /** Skip value when `when` is false. Omit for passthrough (input unchanged). */
+  otherwise?: StepOtherwise<TContext, TOutput, TNextOutput>;
+}
+
+export type StepOptions<TContext, TOutput, TNextOutput> =
+  AgentStepHooks<TContext, TOutput, TNextOutput>
+  & ConditionalStepOptions<TContext, TOutput, TNextOutput>
+  & {
+    /** Override the default step id (`agent.id`). Required when reusing the same
+     *  agent across multiple steps in one workflow — the construction-time
+     *  `(type, id)` walk rejects duplicates. */
+    id?: string;
+  };
+
+/** Options for the inline `step(id, fn, options?)` form — conditional skip only. */
+export type InlineStepOptions<TContext, TOutput, TNextOutput> = ConditionalStepOptions<TContext, TOutput, TNextOutput>;
+
+/** Options for the nested `step(workflow, options?)` form — conditional skip + id override. */
+export type NestedStepOptions<TContext, TOutput, TNextOutput> =
+  ConditionalStepOptions<TContext, TOutput, TNextOutput> & { id?: string };
+
+/**
+ * A step that supplies `when` without `otherwise` may skip to passthrough, so
+ * its output widens to `TOutput | TNextOutput`. Supplying `otherwise` (which
+ * returns `TNextOutput`) — or omitting `when` — keeps the output `TNextOutput`.
+ */
+type SkipPassthrough<TContext, TOutput, TNextOutput> =
+  ConditionalStepOptions<TContext, TOutput, TNextOutput>
+  & { when: StepWhen<TContext, TOutput>; otherwise?: undefined };
 
 // ── Branch Types ────────────────────────────────────────────────────
 
@@ -1764,7 +1806,15 @@ export class Workflow<
   }
 
   // ── step: agent overload ──────────────────────────────────────
+  // `when` without `otherwise` may skip to passthrough → output widens to
+  // `TOutput | TNextOutput`. The fallback (no `when`, or `when` + `otherwise`)
+  // keeps `TNextOutput`. The passthrough overload is declared first so it wins
+  // when `otherwise` is absent.
 
+  step<TNextOutput>(
+    agent: Agent<TContext, TOutput, TNextOutput>,
+    options: StepOptions<TContext, TOutput, TNextOutput> & SkipPassthrough<TContext, TOutput, TNextOutput>
+  ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates>;
   step<TNextOutput>(
     agent: Agent<TContext, TOutput, TNextOutput>,
     options?: StepOptions<TContext, TOutput, TNextOutput>
@@ -1774,46 +1824,63 @@ export class Workflow<
 
   step<TNextOutput>(
     workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
+    options: NestedStepOptions<TContext, TOutput, TNextOutput> & SkipPassthrough<TContext, TOutput, TNextOutput>
+  ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates>;
+  step<TNextOutput>(
+    workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
+    options?: NestedStepOptions<TContext, TOutput, TNextOutput>
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
   // ── step: transform overload (replaces map + tap) ─────────────
 
   step<TNextOutput>(
     id: string,
-    fn: (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>
+    fn: (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>,
+    options: InlineStepOptions<TContext, TOutput, TNextOutput> & SkipPassthrough<TContext, TOutput, TNextOutput>
+  ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates>;
+  step<TNextOutput>(
+    id: string,
+    fn: (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>,
+    options?: InlineStepOptions<TContext, TOutput, TNextOutput>
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
   // ── step: implementation ──────────────────────────────────────
 
   step<TNextOutput>(
     target: Agent<TContext, TOutput, TNextOutput> | SealedWorkflow<TContext, TOutput, TNextOutput> | string,
-    optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>)
-  ): Workflow<TContext, TInput, TNextOutput, TGates> {
-    // Nested workflow overload: step(workflow)
+    optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | NestedStepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>),
+    inlineOptions?: InlineStepOptions<TContext, TOutput, TNextOutput>,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Workflow<TContext, TInput, any, TGates> {
+    // Nested workflow overload: step(workflow, options?)
     if (target instanceof SealedWorkflow) {
       const workflow = target;
+      const options = optionsOrFn as NestedStepOptions<TContext, TOutput, TNextOutput> | undefined;
       const node: StepNode = {
         type: "step",
-        id: workflow.id ?? "nested-workflow",
+        id: options?.id ?? workflow.id ?? "nested-workflow",
         nestedWorkflow: workflow,   // Feeds the recursive stepShapeHash walk.
         category: "nested",          // Observability event type.
         execute: async (state) => {
+          if (await this.shouldSkip(state, options)) return;
           await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
         },
       };
       return this.appendStep<TNextOutput>(node);
     }
 
-    // Transform overload: step(id, fn)
+    // Transform overload: step(id, fn, options?)
     if (typeof target === "string") {
       if (typeof optionsOrFn !== "function") {
         throw new Error(`Workflow step("${target}"): second argument must be a function`);
       }
       const fn = optionsOrFn as (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>;
+      const options = inlineOptions;
       const node: StepNode = {
         type: "step",
         id: target,
         execute: async (state) => {
+          if (await this.shouldSkip(state, options)) return;
           state.output = await fn({
             ctx: state.ctx as Readonly<TContext>,
             input: state.output as TOutput,
@@ -1833,11 +1900,34 @@ export class Workflow<
       type: "step",
       id: options?.id ?? agent.id,
       execute: async (state) => {
+        if (await this.shouldSkip(state, options)) return;
         const ctx = state.ctx as TContext;
         await this.executeAgent(state, agent, ctx, options);
       },
     };
     return this.appendStep<TNextOutput>(node);
+  }
+
+  /**
+   * Conditional-skip check shared by all `step` forms. Evaluates `when`; when
+   * it returns false the step is skipped — `otherwise` (if present) produces
+   * the output, otherwise the input passes through unchanged — and the body is
+   * never invoked. Returns true when the caller should skip the body.
+   */
+  private async shouldSkip(
+    state: RuntimeState,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    options: ConditionalStepOptions<TContext, TOutput, any> | undefined,
+  ): Promise<boolean> {
+    if (!options?.when) return false;
+    const ctx = state.ctx as Readonly<TContext>;
+    const input = state.output as TOutput;
+    if (await options.when({ ctx, input })) return false;
+    if (options.otherwise) {
+      state.output = await options.otherwise({ ctx, input });
+    }
+    // No `otherwise` → passthrough: leave state.output unchanged.
+    return true;
   }
 
   // ── gate: human-in-the-loop suspension point ────────────────
