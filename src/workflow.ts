@@ -34,9 +34,12 @@ export class WorkflowLoopError extends Error {
 export class NestedGateUnsupportedError extends Error {
   readonly gateId: string;
   readonly workflowId: string | undefined;
-  // Always present; non-gate rejections from concurrent foreach.
+  // Always present; non-gate rejections from a concurrent foreach OR parallel
+  // (both dispatch through runUnitsConcurrently).
   readonly siblingErrors: readonly unknown[];
-  // Always present; OTHER suspending items in concurrent foreach.
+  // Always present; OTHER suspending units in a concurrent foreach OR parallel.
+  // `index` is the 0-based unit position (foreach item index / parallel entry
+  // position) — NOT the record-form `parallel` branch key.
   readonly siblingSuspensions: readonly { index: number; gateId: string }[];
 
   constructor(
@@ -230,7 +233,9 @@ export interface RunOptions {
   /**
    * Cooperative cancellation signal. Checked at every step boundary inside
    * `execute()` and forwarded to agent calls in `executeAgent`, foreach
-   * workers, parallel branches, and nested workflows. When the signal aborts,
+   * workers, parallel branches, nested workflows, and the `onCheckpoint`
+   * callback's `signal` (so a cancelled run can tear down an in-flight
+   * checkpoint write, if the callback honors it). When the signal aborts,
    * the workflow tears down to `signal.reason` via the same pending-error path
    * as any other step failure, so `.catch()` handlers still get a chance to
    * observe the abort (e.g. for logging/cleanup) — but an abort is sticky and
@@ -597,7 +602,9 @@ export interface ParallelOptions<TContext, TOutput = unknown> {
    * Per-branch error handler. On the no-suspension path, called once per
    * rejected branch in index order after all settle. Return a value to
    * substitute, return `Workflow.SKIP` to leave the slot `undefined`, or
-   * rethrow to abort the parallel. SKIP works in both the record and tuple
+   * rethrow to abort the parallel. A throw (or rethrow) aborts immediately:
+   * rejected branches at indices AFTER the throwing one are neither recovered
+   * nor surfaced as warnings. SKIP works in both the record and tuple
    * forms (the slot stays `undefined` in place — it does not shift indices);
    * supplying `onError` widens the output values to `BranchOutput | undefined`
    * to reflect that a slot may be skipped.
@@ -759,28 +766,57 @@ async function emitCheckpoint(
   };
   if (willFreeze) deepFreeze(snap);
 
+  // The signal handed to onCheckpoint aborts on EITHER the checkpoint timeout
+  // OR a run-level abort, so a cancelled run can tear down an in-flight
+  // checkpoint write — provided the callback honors the signal (JS can't
+  // force-cancel a promise). Forwarding the run abort here only FIRES the
+  // callback's signal; it does not by itself reject this await — the run loop
+  // tears the pipeline down on its next iteration. The timeout, by contrast,
+  // rejects with CheckpointTimeoutError.
   const controller = new AbortController();
-  if (opts.checkpointTimeout !== undefined) {
+  const runSignal = state.abortSignal;
+  const onRunAbort = () => controller.abort(runSignal?.reason);
+  if (runSignal) {
+    if (runSignal.aborted) controller.abort(runSignal.reason);
+    else runSignal.addEventListener("abort", onRunAbort, { once: true });
+  }
+
+  try {
+    if (opts.checkpointTimeout === undefined) {
+      await opts.onCheckpoint(snap, { signal: controller.signal });
+      return;
+    }
     const timeoutMs = opts.checkpointTimeout;
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    // The timeout promise is rejected DIRECTLY by the setTimeout callback (not
+    // by listening to controller.signal), so a run-abort that also aborts the
+    // controller does not masquerade as a CheckpointTimeoutError.
+    let rejectTimeout!: (err: unknown) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject; });
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+      rejectTimeout(new CheckpointTimeoutError(timeoutMs));
+    }, timeoutMs);
     try {
       const callPromise = Promise.resolve(opts.onCheckpoint(snap, { signal: controller.signal }));
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        controller.signal.addEventListener(
-          "abort",
-          () => reject(new CheckpointTimeoutError(timeoutMs)),
-          { once: true },
-        );
+      // Swallow the loser to avoid an unhandled rejection on the race. A
+      // callback that rejects AFTER losing (timeout/abort already fired) would
+      // otherwise vanish — log it so a failed write isn't fully silent.
+      callPromise.catch((err) => {
+        if (controller.signal.aborted) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "pipeai: onCheckpoint rejected after its timeout/abort fired; the run already surfaced the timeout/abort, so this error is reported only here:",
+            err,
+          );
+        }
       });
-      // Swallow loser to avoid unhandled rejection on the race.
-      callPromise.catch(() => {});
       timeoutPromise.catch(() => {});
       await Promise.race([callPromise, timeoutPromise]);
     } finally {
       clearTimeout(timeoutId);
     }
-  } else {
-    await opts.onCheckpoint(snap, { signal: controller.signal });
+  } finally {
+    if (runSignal) runSignal.removeEventListener("abort", onRunAbort);
   }
 }
 
@@ -1174,6 +1210,46 @@ export class SealedWorkflow<
     }
   }
 
+  /**
+   * True when any per-item observability hook is registered. Lets `foreach` /
+   * `parallel` skip per-item `performance.now()` timing and event-object
+   * allocation entirely on hook-less runs — the scaling-sensitive path, since
+   * every one of N items/branches otherwise pays it for nothing.
+   */
+  protected hasItemHooks(): boolean {
+    const o = this.observability;
+    return !!o && !!(o.onItemStart || o.onItemFinish || o.onItemError);
+  }
+
+  /**
+   * Fire `onStepError` for a step-body failure and honor the documented
+   * cause-attachment contract uniformly across every firing path (step, gate,
+   * catch, finally, checkpoint). When the hook itself throws, its error is
+   * attached as `cause` on the ORIGINAL error so the original still reaches the
+   * caller with the failure trail attached. If the original error is frozen /
+   * non-extensible (cause assignment throws) or is not an object, the hook
+   * error is recorded as a warning instead — so an `onStepError` throw is never
+   * silently lost. (The suspension-wins tail fires `onStepError` separately, on
+   * its own demotion path.)
+   */
+  protected async fireStepErrorAndAttachCause(
+    state: RuntimeState,
+    event: { stepId: string; type: WorkflowStepType; ctx: unknown; error: unknown; durationMs: number },
+  ): Promise<void> {
+    const obsError = await this.fireHook(state, "onStepError", event);
+    if (obsError === undefined) return;
+    const e = event.error;
+    if (typeof e === "object" && e !== null) {
+      try {
+        (e as { cause?: unknown }).cause = obsError;
+        return;
+      } catch {
+        // Original error frozen / non-extensible — fall through to the warning.
+      }
+    }
+    pushWarning(state, "onStepError", event.stepId, obsError);
+  }
+
   // ── Execution ─────────────────────────────────────────────────
 
   async generate(
@@ -1361,7 +1437,10 @@ export class SealedWorkflow<
             durationMs: performance.now() - finStart, suspended: false,
           });
         } catch (e) {
-          await this.fireHook(state, "onStepError", {
+          // Honor the onStepError cause-attachment contract: if the hook
+          // throws, its error attaches as `cause` on this finally error e
+          // (which becomes pendingError below).
+          await this.fireStepErrorAndAttachCause(state, {
             stepId, type: "finally", ctx: state.ctx, error: e,
             durationMs: performance.now() - finStart,
           });
@@ -1392,7 +1471,7 @@ export class SealedWorkflow<
             durationMs: performance.now() - cStart, suspended: false,
           });
         } catch (e) {
-          await this.fireHook(state, "onStepError", {
+          await this.fireStepErrorAndAttachCause(state, {
             stepId, type: "catch", ctx: state.ctx, error: e,
             durationMs: performance.now() - cStart,
           });
@@ -1443,17 +1522,10 @@ export class SealedWorkflow<
           // tail also reports type "gate", not "step". If the onStepError hook
           // itself throws, attach its error as `cause`, exactly like a step.
           pendingError = { error: e, stepId: node.id, source: "gate" };
-          const obsError = await this.fireHook(state, "onStepError", {
+          await this.fireStepErrorAndAttachCause(state, {
             stepId: node.id, type: "gate", ctx: state.ctx, error: e,
             durationMs: performance.now() - gStart,
           });
-          if (obsError !== undefined && typeof e === "object" && e !== null) {
-            try {
-              (e as { cause?: unknown }).cause = obsError;
-            } catch {
-              // Some objects are frozen / non-extensible — ignore.
-            }
-          }
         }
         continue;
       }
@@ -1475,17 +1547,10 @@ export class SealedWorkflow<
         // onStepError special-cases: if the hook throws, attach the obsError as
         // `cause` on the original step error so the original reaches the caller
         // with the failure trail attached. Other hooks' throws become warnings.
-        const obsError = await this.fireHook(state, "onStepError", {
+        await this.fireStepErrorAndAttachCause(state, {
           stepId, type: obsType, ctx: state.ctx, error: e,
           durationMs: performance.now() - sStart,
         });
-        if (obsError !== undefined && typeof e === "object" && e !== null) {
-          try {
-            (e as { cause?: unknown }).cause = obsError;
-          } catch {
-            // Some objects are frozen / non-extensible — ignore.
-          }
-        }
       }
 
       // Defensive invariant: only gate nodes set state.suspension, and
@@ -1503,6 +1568,12 @@ export class SealedWorkflow<
       // (the step threw — no clean state to snapshot) or on suspension (gate
       // already won). Numeric `checkpointEvery` (default: max(1, ceil(count/4)))
       // uses the loop-hoisted `ckptCadence`; predicate form runs per step.
+      // Note: a `when:false`-skipped `type:"step"` node returns normally (its
+      // body never ran), so it still reaches this block — it advances
+      // `executableStepsSeen` and can itself be a checkpoint boundary whose
+      // snapshot.output is the passthrough/`otherwise` value. This keeps the
+      // cadence denominator (cachedCheckpointableStepCount, which counts every
+      // `type:"step"` node) consistent with the runtime counter.
       if (!pendingError && !state.suspension && opts?.onCheckpoint) {
         executableStepsSeen++;
         const shouldCheckpoint = opts.checkpointWhen
@@ -1522,7 +1593,7 @@ export class SealedWorkflow<
             state.checkpointFailed = true;
             // Route through onStepError with the synthetic CHECKPOINT_STEP_ID
             // and type: "step" (matches pendingErrorSourceToStepType("onCheckpoint")).
-            await this.fireHook(state, "onStepError", {
+            await this.fireStepErrorAndAttachCause(state, {
               stepId: CHECKPOINT_STEP_ID, type: "step", ctx: state.ctx, error: e,
               durationMs: performance.now() - ckptStart,
             });
@@ -1548,20 +1619,28 @@ export class SealedWorkflow<
     // Precedence: checkpointFailed > finally-wrap > original-step > suspension.
     if (pendingError && !state.suspension) {
       if (state.checkpointFailed) {
-        // Checkpoint error reaches caller bare; finally errors get console.warn
-        // because the rejection path can't carry warnings.
+        // The checkpoint error reaches the caller bare. Every OTHER error
+        // accumulated this run — step/gate/catch/finally errors demoted to
+        // warnings, plus a pending non-checkpoint error (e.g. a finally that
+        // threw after the checkpoint failed) — cannot ride the rejection (it
+        // carries a single error, not the warnings array), so surface them via
+        // console.warn rather than dropping them silently. (Previously only
+        // `finally`-source errors were logged; a demoted step/catch/gate error
+        // vanished entirely.)
         const warningsArr = state.warnings ?? [];
         const checkpointError = pendingError.source === "onCheckpoint"
           ? pendingError.error
           : warningsArr.find(w => w.source === "onCheckpoint")?.error;
-        const finallyErrors = warningsArr.filter(w => w.source === "finally").map(w => w.error);
-        const all = pendingError.source === "finally"
-          ? [...finallyErrors, pendingError.error]
-          : finallyErrors;
-        if (all.length > 0) {
+        const suppressed = warningsArr
+          .filter(w => w.error !== checkpointError)
+          .map(w => w.error);
+        if (pendingError.source !== "onCheckpoint" && pendingError.error !== checkpointError) {
+          suppressed.push(pendingError.error);
+        }
+        if (suppressed.length > 0) {
           console.warn(
-            `pipeai: ${all.length} .finally() error(s) suppressed by checkpoint-failure precedence:`,
-            all,
+            `pipeai: ${suppressed.length} error(s) suppressed by checkpoint-failure precedence:`,
+            suppressed,
           );
         }
         throw checkpointError ?? pendingError.error;
@@ -2322,10 +2401,15 @@ export class Workflow<
    *   Backed by a worker pool: as soon as one item completes, the next launches —
    *   no lockstep batching.
    * @param options.onError Per-iteration error handler. **Bypassed entirely on
-   *   the suspension path** (when any item hits a nested gate) — see the
+   *   the suspension path** (when any item hits a nested gate) **and on the
+   *   cancellation path** (the run was aborted — pre-abort failures become
+   *   `foreach-sibling` warnings and the abort reason rethrows) — see the
    *   foreach concurrency hazards in the README. Otherwise: return a
    *   `TNextOutput` value to substitute, return `Workflow.SKIP` to omit, throw
    *   to abort. Invoked sequentially in index order after all items settle.
+   *   A throw (or rethrow) from `onError` aborts the foreach immediately:
+   *   failures at indices AFTER the throwing one are neither recovered nor
+   *   surfaced as warnings.
    */
   foreach<TNextOutput>(
     target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput>,
@@ -2397,6 +2481,9 @@ export class Workflow<
         const results: unknown[] = new Array(items.length);
         const skipped = new Set<number>();
         const itemStates: (RuntimeState | undefined)[] = new Array(items.length);
+        // Skip per-item timing + event allocation when no item hook is set —
+        // every item would otherwise pay it for nothing (matters at scale).
+        const wantItemHooks = this.hasItemHooks();
 
         const executeItem = async (item: unknown, index: number) => {
           // itemState explicitly omits runOptions — per-run config never crosses
@@ -2410,10 +2497,12 @@ export class Workflow<
             abortSignal: state.abortSignal,
           };
           itemStates[index] = itemState;
-          const itemStart = performance.now();
-          await this.fireHook(state, "onItemStart", {
-            stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, input: item,
-          });
+          const itemStart = wantItemHooks ? performance.now() : 0;
+          if (wantItemHooks) {
+            await this.fireHook(state, "onItemStart", {
+              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, input: item,
+            });
+          }
           try {
             if (isWorkflow) {
               await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
@@ -2431,15 +2520,19 @@ export class Workflow<
               );
             }
             results[index] = itemState.output;
-            await this.fireHook(state, "onItemFinish", {
-              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, output: itemState.output,
-              durationMs: performance.now() - itemStart,
-            });
+            if (wantItemHooks) {
+              await this.fireHook(state, "onItemFinish", {
+                stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, output: itemState.output,
+                durationMs: performance.now() - itemStart,
+              });
+            }
           } catch (error) {
-            await this.fireHook(state, "onItemError", {
-              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, error,
-              durationMs: performance.now() - itemStart,
-            });
+            if (wantItemHooks) {
+              await this.fireHook(state, "onItemError", {
+                stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, error,
+                durationMs: performance.now() - itemStart,
+              });
+            }
             throw error;
           }
         };
@@ -2482,14 +2575,16 @@ export class Workflow<
 
   // ── parallel: fan-out combinator ────────────────────────────────
   //
-  // Same input fed to each branch. Generate mode only — writer is NOT threaded
-  // through (interleaving multiple agent streams into one writer is not
-  // supported). For SealedWorkflow branches, a nested gate throws
-  // NestedGateUnsupportedError (same machinery as foreach concurrent).
+  // Same input fed to each branch. Streaming: agent branches stream only when a
+  // `handleStream` is supplied (otherwise they run generate — N agent streams
+  // are never auto-merged into one writer); `SealedWorkflow` branches always
+  // inherit and stream transitively via their own steps. For SealedWorkflow
+  // branches, a nested gate throws NestedGateUnsupportedError (same machinery as
+  // foreach concurrent).
   //
-  // Default concurrency: `min(branches.length, 5)` — most users want fan-out,
-  // not lockstep batching. Warn-once when branch count exceeds the 5 cap so
-  // users notice unexpected rate-limit pressure.
+  // Default concurrency: **unbounded** (`Infinity` — every branch runs
+  // concurrently, clamped only by branch count). No rate-limit cap by default;
+  // pass an explicit `concurrency` to throttle against provider limits.
 
   // With `onError`, any branch may be SKIPped → output values widen to
   // `BranchOutput | undefined`. The with-onError overloads are declared first
@@ -2559,6 +2654,8 @@ export class Workflow<
         const input = state.output;
         const results: Record<string | number, unknown> = (isTuple ? new Array(branchCount) : {}) as Record<string | number, unknown>;
         const branchStates: (RuntimeState | undefined)[] = new Array(branchCount);
+        // Skip per-branch timing + event allocation when no item hook is set.
+        const wantItemHooks = this.hasItemHooks();
 
         const executeBranch = async ({ key, index, target }: { key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }) => {
           const isWorkflowBranch = target instanceof SealedWorkflow;
@@ -2577,12 +2674,14 @@ export class Workflow<
             abortSignal: state.abortSignal,
           };
           branchStates[index] = branchState;
-          const branchStart = performance.now();
+          const branchStart = wantItemHooks ? performance.now() : 0;
           // itemIndex is the key for record form, numeric index for tuple form.
           const itemIndex: string | number = isTuple ? index : (key as string);
-          await this.fireHook(state, "onItemStart", {
-            stepId: id, type: "parallel", itemIndex, ctx: state.ctx, input,
-          });
+          if (wantItemHooks) {
+            await this.fireHook(state, "onItemStart", {
+              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, input,
+            });
+          }
           try {
             if (isWorkflowBranch) {
               await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
@@ -2596,15 +2695,19 @@ export class Workflow<
               );
             }
             results[key] = branchState.output;
-            await this.fireHook(state, "onItemFinish", {
-              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, output: branchState.output,
-              durationMs: performance.now() - branchStart,
-            });
+            if (wantItemHooks) {
+              await this.fireHook(state, "onItemFinish", {
+                stepId: id, type: "parallel", itemIndex, ctx: state.ctx, output: branchState.output,
+                durationMs: performance.now() - branchStart,
+              });
+            }
           } catch (error) {
-            await this.fireHook(state, "onItemError", {
-              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, error,
-              durationMs: performance.now() - branchStart,
-            });
+            if (wantItemHooks) {
+              await this.fireHook(state, "onItemError", {
+                stepId: id, type: "parallel", itemIndex, ctx: state.ctx, error,
+                durationMs: performance.now() - branchStart,
+              });
+            }
             throw error;
           }
         };

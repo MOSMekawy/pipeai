@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
-import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
+import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, CheckpointTimeoutError, migrateSnapshot, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
 import { createMockModel, createReplayableMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
@@ -4577,6 +4577,354 @@ describe("Workflow", () => {
         .step("combine", ({ input }) => `${input.a}+${input.b}`);
       const { output } = expectComplete(await pipeline.generate(testCtx, "x"));
       expect(output).toBe("from-a+from-b");
+    });
+  });
+
+  // ── Multi-agent review follow-up fixes ──────────────────────────────
+  // Tests pinning the behavior changes and filling the coverage gaps
+  // identified by the workflow-class review.
+
+  describe("review fixes: onStepError cause-attachment across all firing paths", () => {
+    it("attaches a throwing onStepError's error as `cause` on a finally-body error", async () => {
+      const obsError = new Error("OBS");
+      const wf = Workflow.create<TestCtx, string>({
+        observability: { onStepError: () => { throw obsError; } },
+      })
+        .step("s", ({ input }) => input)
+        .finally("f", () => { throw new Error("F-boom"); });
+
+      try {
+        await wf.generate(testCtx, "x");
+        expect.unreachable("should reject");
+      } catch (e) {
+        // finally errors surface as an AggregateError; the finally error carries
+        // the obsError as cause (previously discarded on the finally path).
+        const agg = e as AggregateError;
+        const finallyErr = agg.errors.find((x) => (x as Error).message === "F-boom") as Error;
+        expect(finallyErr).toBeDefined();
+        expect(finallyErr.cause).toBe(obsError);
+      }
+    });
+
+    it("attaches a throwing onStepError's error as `cause` on a catch-body error", async () => {
+      const obsError = new Error("OBS");
+      const wf = Workflow.create<TestCtx, string>({
+        observability: { onStepError: () => { throw obsError; } },
+      })
+        .step("s", () => { throw new Error("step-boom"); })
+        .catch("c", () => { throw new Error("catch-boom"); });
+
+      await expect(wf.generate(testCtx, "x")).rejects.toMatchObject({
+        message: "catch-boom",
+        cause: obsError,
+      });
+    });
+
+    it("attaches a throwing onStepError's error as `cause` on a checkpoint failure", async () => {
+      const obsError = new Error("OBS");
+      const ckptError = new Error("ckpt-boom");
+      const wf = Workflow.create<TestCtx>({
+        observability: { onStepError: () => { throw obsError; } },
+      }).step("s", () => "x");
+
+      await expect(
+        wf.generate(testCtx, undefined, {
+          onCheckpoint: () => { throw ckptError; },
+          checkpointEvery: 1,
+        }),
+      ).rejects.toMatchObject({ message: "ckpt-boom", cause: obsError });
+    });
+
+    it("records the onStepError throw as a warning when the original error is frozen", async () => {
+      const obsError = new Error("OBS");
+      const frozen = Object.freeze(new Error("frozen-step"));
+      const wf = Workflow.create<TestCtx, string>({
+        observability: { onStepError: () => { throw obsError; } },
+      })
+        .step("s", (): string => { throw frozen; })
+        // catch recovers so the run completes and warnings are observable.
+        .catch("c", () => "recovered");
+
+      const { output, warnings } = expectComplete(await wf.generate(testCtx, "x"));
+      expect(output).toBe("recovered");
+      // cause could not attach to the frozen error → fell back to a warning.
+      expect(frozen.cause).toBeUndefined();
+      const w = warnings.find((x) => x.source === "onStepError");
+      expect(w?.error).toBe(obsError);
+    });
+  });
+
+  describe("review fixes: checkpoint-failure precedence surfaces all suppressed errors", () => {
+    it("console.warns a demoted non-finally warning (not just finally errors)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const hookError = new Error("hook-boom");
+        const wf = Workflow.create<TestCtx>({
+          // onStepFinish throws on step A → pushed as an onStepFinish warning.
+          observability: { onStepFinish: ({ stepId }) => { if (stepId === "A") throw hookError; } },
+        })
+          .step("A", () => "a")
+          .step("B", () => "b");
+
+        await expect(
+          wf.generate(testCtx, undefined, {
+            onCheckpoint: () => { throw new Error("ckpt-boom"); },
+            checkpointEvery: 2, // fires after B
+          }),
+        ).rejects.toThrow("ckpt-boom");
+
+        const logged = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("suppressed by checkpoint-failure"),
+        );
+        expect(logged).toBeDefined();
+        expect((logged![1] as unknown[]).some((x) => x === hookError)).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("console.warns a throwing .finally() error suppressed by a checkpoint failure", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const wf = Workflow.create<TestCtx>()
+          .step("s", () => "x")
+          .finally("f", () => { throw new Error("finally-boom"); });
+
+        await expect(
+          wf.generate(testCtx, undefined, {
+            onCheckpoint: () => { throw new Error("ckpt-boom"); },
+            checkpointEvery: 1,
+          }),
+        ).rejects.toThrow("ckpt-boom");
+
+        const logged = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("suppressed by checkpoint-failure"),
+        );
+        expect(logged).toBeDefined();
+        expect((logged![1] as Error[]).some((x) => x.message === "finally-boom")).toBe(true);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("review fixes: abortSignal forwarding into onCheckpoint", () => {
+    it("fires the onCheckpoint signal when the run is aborted", async () => {
+      const ac = new AbortController();
+      let sawAbortInCallback = false;
+      const wf = Workflow.create<TestCtx>()
+        .step("s1", () => "x")
+        .step("s2", () => "y");
+
+      await expect(
+        wf.generate(testCtx, undefined, {
+          abortSignal: ac.signal,
+          checkpointEvery: 1,
+          onCheckpoint: (_snap, { signal }) => {
+            ac.abort(new Error("cancel"));
+            sawAbortInCallback = signal.aborted;
+          },
+        }),
+      ).rejects.toThrow("cancel");
+      expect(sawAbortInCallback).toBe(true);
+    });
+
+    it("logs a post-timeout onCheckpoint rejection instead of swallowing it", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const late = defer<void>();
+        const wf = Workflow.create<TestCtx>().step("s", () => "x");
+        const run = wf.generate(testCtx, undefined, {
+          checkpointEvery: 1,
+          checkpointTimeout: 10,
+          // Ignores the signal; rejects only once we release `late` (after timeout).
+          onCheckpoint: () => late.promise.then(() => { throw new Error("late-write-fail"); }),
+        });
+        await expect(run).rejects.toBeInstanceOf(CheckpointTimeoutError);
+        late.resolve();
+        await new Promise((r) => setTimeout(r, 0));
+        const logged = warnSpy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("rejected after its timeout/abort"),
+        );
+        expect(logged).toBeDefined();
+        expect((logged![1] as Error).message).toBe("late-write-fail");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("review fixes: gate merge()", () => {
+    it("merges priorOutput + response into the seeded output", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .step("init", ({ input }) => input)
+        .gate("g", { merge: ({ priorOutput, response }) => `${priorOutput}+${response}` })
+        .step("after", ({ input }) => `done:${input}`);
+
+      const { snapshot } = expectSuspended(await wf.generate(testCtx, "PRIOR"));
+      const resumed = wf.loadState("g", snapshot);
+      const { output } = expectComplete(await resumed.generate(testCtx, "RESP"));
+      expect(output).toBe("done:PRIOR+RESP");
+    });
+
+    it("routes a throwing merge through .catch() as a GATE_RESUME error", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .step("init", ({ input }) => input)
+        .gate("g", { merge: (): string => { throw new Error("merge-boom"); } })
+        .step("after", ({ input }) => `after:${input}`)
+        .catch("c", ({ error }) => `recovered:${(error as Error).message}`);
+
+      const { snapshot } = expectSuspended(await wf.generate(testCtx, "P"));
+      const resumed = wf.loadState("g", snapshot);
+      const { output } = expectComplete(await resumed.generate(testCtx, "R"));
+      expect(output).toBe("recovered:merge-boom");
+    });
+
+    it("runs schema.parse then merge together", async () => {
+      const schema = { parse: (d: unknown) => String(d).toUpperCase() };
+      const wf = Workflow.create<TestCtx, string>()
+        .step("init", ({ input }) => input)
+        .gate("g", {
+          schema,
+          merge: ({ priorOutput, response }) => `${priorOutput}/${response}`,
+        })
+        .step("after", ({ input }) => `done:${input}`);
+
+      const { snapshot } = expectSuspended(await wf.generate(testCtx, "p"));
+      const resumed = wf.loadState("g", snapshot);
+      const { output } = expectComplete(await resumed.generate(testCtx, "resp"));
+      expect(output).toBe("done:p/RESP");
+    });
+  });
+
+  describe("review fixes: misc coverage gaps", () => {
+    it("WorkflowLoopError reports iterations === maxIterations (the cap)", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .repeat(createPassthroughAgent("r", "x"), { until: () => false, maxIterations: 3 });
+      try {
+        await wf.generate(testCtx, "seed");
+        expect.unreachable("should throw");
+      } catch (e) {
+        expect(e).toBeInstanceOf(WorkflowLoopError);
+        expect((e as WorkflowLoopError).iterations).toBe(3);
+        expect((e as WorkflowLoopError).maxIterations).toBe(3);
+      }
+    });
+
+    it("abort after a gate suspends rejects with the abort reason (suspension discarded)", async () => {
+      const ac = new AbortController();
+      const wf = Workflow.create<TestCtx, string>()
+        .step("a", ({ input }) => input)
+        .gate("g", { payload: () => { ac.abort(new Error("kill")); return "p"; } })
+        .step("after", ({ input }) => `after:${input}`);
+
+      await expect(
+        wf.generate(testCtx, "x", { abortSignal: ac.signal }),
+      ).rejects.toThrow("kill");
+    });
+
+    it("repeat over a SealedWorkflow body throws WorkflowLoopError when maxIterations is exceeded", async () => {
+      const sub = Workflow.create<TestCtx, string>().step("inc", ({ input }) => input);
+      const wf = Workflow.create<TestCtx, string>()
+        .repeat(sub, { until: () => false, maxIterations: 2 });
+      await expect(wf.generate(testCtx, "x")).rejects.toBeInstanceOf(WorkflowLoopError);
+    });
+
+    it("repeat over a SealedWorkflow body honors abort between iterations", async () => {
+      const ac = new AbortController();
+      let count = 0;
+      const sub = Workflow.create<TestCtx, string>().step("inc", ({ input }) => {
+        count++;
+        if (count === 1) ac.abort(new Error("stop"));
+        return input;
+      });
+      const wf = Workflow.create<TestCtx, string>()
+        .repeat(sub, { until: () => false, maxIterations: 5 });
+      await expect(
+        wf.generate(testCtx, "x", { abortSignal: ac.signal }),
+      ).rejects.toThrow("stop");
+      expect(count).toBe(1);
+    });
+
+    it("branch select fires fallback on an unknown key with no onUnknownKey", async () => {
+      const wf = Workflow.create<TestCtx, string>().branch({
+        select: () => "missing",
+        agents: { known: createPassthroughAgent("k", "K") },
+        fallback: createPassthroughAgent("fb", "FB"),
+      });
+      expect(expectComplete(await wf.generate(testCtx, "x")).output).toBe("FB");
+    });
+
+    it("branch select propagates a throwing onUnknownKey and passes ctx", async () => {
+      let seenUserId: string | undefined;
+      const wf = Workflow.create<TestCtx, string>().branch({
+        select: () => "missing",
+        agents: { known: createPassthroughAgent("k", "K") },
+        fallback: createPassthroughAgent("fb", "FB"),
+        onUnknownKey: ({ ctx }) => {
+          seenUserId = (ctx as TestCtx).userId;
+          throw new Error("uk-boom");
+        },
+      });
+      await expect(wf.generate(testCtx, "x")).rejects.toThrow("uk-boom");
+      expect(seenUserId).toBe("user-1");
+    });
+
+    it("migrateSnapshot throws on a non-v1 snapshot", () => {
+      expect(() => migrateSnapshot({ version: 2 } as never)).toThrow(/expected v1/);
+    });
+
+    it("freezeSnapshots freezes the snapshot and warnings on the suspended path", async () => {
+      const wf = Workflow.create<TestCtx, string>()
+        .step("a", ({ input }) => input)
+        .gate("g");
+      const { snapshot, warnings } = expectSuspended(
+        await wf.generate(testCtx, "x", { freezeSnapshots: true }),
+      );
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      expect(Object.isFrozen(warnings)).toBe(true);
+    });
+  });
+
+  describe("review fixes: when:false skip observability for agent / nested steps", () => {
+    it("a skipped agent step brackets start/finish with type 'step' and the skip output", async () => {
+      const events: Array<{ phase: string; type: string; output?: unknown; suspended?: boolean }> = [];
+      const wf = Workflow.create<TestCtx, string>({
+        observability: {
+          onStepStart: ({ stepId, type }) => { if (stepId === "a") events.push({ phase: "start", type }); },
+          onStepFinish: ({ stepId, type, output, suspended }) => {
+            if (stepId === "a") events.push({ phase: "finish", type, output, suspended });
+          },
+        },
+      }).step(createPassthroughAgent("a", "AGENT"), {
+        when: () => false,
+        otherwise: () => "SKIP",
+      });
+
+      await wf.generate(testCtx, "x");
+      expect(events).toEqual([
+        { phase: "start", type: "step" },
+        { phase: "finish", type: "step", output: "SKIP", suspended: false },
+      ]);
+    });
+
+    it("a skipped nested-workflow step brackets with type 'nested' and the passthrough output", async () => {
+      const sub = Workflow.create<TestCtx, string>().step(createPassthroughAgent("inner", "INNER"));
+      const events: Array<{ phase: string; type: string; output?: unknown }> = [];
+      const wf = Workflow.create<TestCtx, string>({
+        observability: {
+          onStepStart: ({ stepId, type }) => { if (stepId !== "outer-only") events.push({ phase: "start", type }); },
+          onStepFinish: ({ stepId, type, output }) => { if (stepId !== "outer-only") events.push({ phase: "finish", type, output }); },
+        },
+      }).step(sub, { id: "nested-step", when: () => false });
+
+      await wf.generate(testCtx, "x");
+      expect(events).toEqual([
+        { phase: "start", type: "nested" },
+        { phase: "finish", type: "nested", output: "x" },
+      ]);
     });
   });
 });
