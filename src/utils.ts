@@ -14,33 +14,23 @@ export function runWithWriter<T>(writer: UIMessageStreamWriter, fn: () => T): T 
 }
 
 /**
+ * @internal — NOT part of the public API. Do not export from `index.ts`.
+ *
  * Returns the active `UIMessageStreamWriter` if the current async context is
  * running inside a streaming workflow, or `undefined` otherwise.
  *
- * Use from inside a custom `IToolProvider`'s returned `Tool.execute` callback
- * to forward incremental output to the workflow's UI message stream:
+ * This is the internal mechanism that powers the writer hand-off to user code.
+ * Consumers should reach the writer through the supported, explicit paths
+ * instead of calling this directly:
+ *   - `defineTool` / `ToolProvider` inject `writer` into the `execute(input,
+ *     ctx, { writer })` options.
+ *   - Agent `onStepFinish` / `onFinish` / `onError` callbacks receive `writer`.
+ *   - Inline `Workflow.step(id, fn)` handlers receive `writer` in their params.
  *
- * ```ts
- * import { getActiveWriter, type IToolProvider, TOOL_PROVIDER_BRAND } from "pipeai";
- *
- * const myProvider: IToolProvider<MyCtx> = {
- *   [TOOL_PROVIDER_BRAND]: true,
- *   createTool(ctx) {
- *     return tool({
- *       execute: async (input) => {
- *         const writer = getActiveWriter();
- *         // ...stream incremental progress to writer if present...
- *         return result;
- *       },
- *     });
- *   },
- * };
- * ```
- *
- * **Important timing note:** call this from *inside* the `Tool.execute`
- * callback, not from inside `createTool` itself. `createTool` runs during
- * agent setup (before the workflow has set the writer); `Tool.execute` runs
- * during tool invocation (when the writer is live).
+ * **Timing note (for internal callers):** must be read from *inside* the live
+ * execution callback (e.g. `Tool.execute`), not at construction/`createTool`
+ * time — the writer is only set on the async context while an agent stream
+ * call is in flight.
  */
 export function getActiveWriter(): UIMessageStreamWriter | undefined {
   return writerStorage.getStore();
@@ -74,36 +64,6 @@ export function resolveValue<TCtx, TInput, TValue>(
     return (value as (ctx: TCtx, input: TInput) => TValue | Promise<TValue>)(ctx, input);
   }
   return value;
-}
-
-/**
- * Minimal counting semaphore. Up to `permits` callers can hold a permit
- * concurrently; further `acquire()` calls queue FIFO until one is released.
- */
-export class Semaphore {
-  private available: number;
-  private waiters: Array<() => void> = [];
-
-  constructor(permits: number) {
-    if (!Number.isInteger(permits) || permits < 1) {
-      throw new Error(`Semaphore: permits must be a positive integer, got ${permits}`);
-    }
-    this.available = permits;
-  }
-
-  async acquire(): Promise<void> {
-    if (this.available > 0) {
-      this.available--;
-      return;
-    }
-    await new Promise<void>(resolve => this.waiters.push(resolve));
-  }
-
-  release(): void {
-    const next = this.waiters.shift();
-    if (next) next();
-    else this.available++;
-  }
 }
 
 /**

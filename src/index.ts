@@ -11,9 +11,9 @@ export {
   Workflow,
   WorkflowBranchError,
   WorkflowLoopError,
-  NestedGateUnsupportedError,
-  CheckpointTimeoutError,
   CHECKPOINT_STEP_ID,
+  ABORT_STEP_ID,
+  GATE_RESUME_STEP_ID,
   migrateSnapshot,
 } from "./workflow";
 
@@ -51,5 +51,4 @@ export type {
 export { defineTool, ToolProvider, isToolProvider, TOOL_PROVIDER_BRAND } from "./tool-provider";
 export type { ToolProviderConfig, ToolExecuteOptions, IToolProvider } from "./tool-provider";
 
-export { getActiveWriter } from "./utils";
 export type { MaybePromise, Resolvable } from "./utils";

@@ -81,15 +81,16 @@ describe("isToolProvider", () => {
   });
 });
 
-describe("getActiveWriter (public API for custom IToolProvider)", () => {
+describe("getActiveWriter (internal stream-writer context)", () => {
   it("returns undefined when not inside a streaming context", () => {
     expect(getActiveWriter()).toBeUndefined();
   });
 
-  it("custom IToolProvider can reach the workflow writer from inside Tool.execute", async () => {
-    // The built-in ToolProvider does this internally. This test demonstrates
-    // that a user-implemented IToolProvider (one that does NOT use defineTool/
-    // ToolProvider) can do the same via the public getActiveWriter export.
+  it("resolves the active workflow writer from inside Tool.execute", async () => {
+    // getActiveWriter is internal (not exported from pipeai). It is the
+    // mechanism the built-in ToolProvider uses to inject `writer` into
+    // execute(input, ctx, { writer }). This test exercises that internal
+    // contract directly via the ../utils import.
     let seenWriter: UIMessageStreamWriter | undefined;
     const customProvider: IToolProvider<TestCtx> = {
       [TOOL_PROVIDER_BRAND]: true,

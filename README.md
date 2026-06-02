@@ -4,7 +4,7 @@ A typed multi-agent workflow pipeline built on top of the [Vercel AI SDK v6](htt
 
 Agents are pure AI SDK wrappers that return native `GenerateTextResult` / `StreamTextResult`. Workflows chain agents into pipelines with automatic stream merging, deterministic agent routing, and typed output extraction.
 
-The library is ~1000 lines across 4 files. It's designed to be read, understood, and modified — a thin composition layer over AI SDK, not a framework to learn around.
+It's a lean composition layer over the Vercel AI SDK — not a framework to learn around. Agents return native AI SDK results and workflows merge native streams, so anything you can do with the AI SDK still works underneath; pipeai stays out of the way and stays fully compatible.
 
 ## Core Concepts
 
@@ -366,6 +366,31 @@ const pipeline = Workflow.create<Ctx>()
 
 Nested workflows can be arbitrarily deep — a workflow step can contain another workflow that itself contains nested workflows.
 
+### Conditional steps via `when` / `otherwise`
+
+Any `step` form — agent, inline `step(id, fn)`, or nested `step(workflow)` — accepts a `when` predicate. When it returns false the step is **skipped** and its body never runs:
+
+```ts
+const pipeline = Workflow.create<Ctx, Input>()
+  // skip → passthrough: input is forwarded unchanged
+  .step(enrichAgent, { when: ({ input }) => input.needsEnrichment })
+  // skip → `otherwise` produces the value
+  .step("search", runSearch, {
+    when: ({ input }) => input.intent === "search",
+    otherwise: ({ input }) => ({ ...input, results: [] }),
+  })
+  // conditionally run a whole sub-pipeline
+  .step(productPipeline, { when: ({ input }) => input.intent === "product" });
+```
+
+The output type reflects what can actually happen — this is deliberate, so a skipped step can't be mistaken for one that always ran:
+
+- **`when` + `otherwise`** → output stays `TNextOutput` (`otherwise` returns it).
+- **`when` without `otherwise`** → output widens to `TOutput | TNextOutput` (skip passes the input through). For same-shape tap/enrich steps the union collapses to a single type; when the shapes differ and you'd rather keep a single type, supply `otherwise` to produce a default.
+- **no `when`** → `TNextOutput`, exactly as before.
+
+`when` / `otherwise` throwing propagates as a normal step error (a downstream `.catch()` can observe it). A skipped step still fires the `onStepStart` / `onStepFinish` observability events with its passthrough/`otherwise` value as `output`.
+
 ### Predicate branching via `branch()`
 
 Route to different agents based on runtime conditions. The first matching `when` wins. A case without `when` acts as the default:
@@ -494,7 +519,7 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Array iteration via `foreach()`
 
-`foreach()` maps each element of an array output through an agent or workflow. Items run in generate mode to avoid interleaved streams:
+`foreach()` maps each element of an array output through an agent or workflow. By default items run in generate mode — `foreach` never auto-merges, since merging N concurrent streams would interleave into a garbled message (see [Streaming items](#streaming-foreach--parallel-items) to opt in via `handleStream`):
 
 ```ts
 const summarizer = new Agent<Ctx, string, string>({
@@ -511,14 +536,16 @@ const pipeline = Workflow.create<Ctx>()
   .step("combine", ({ input }) => input.join("\n\n"));
 ```
 
-Concurrent processing with bounded parallelism:
+By default `foreach` is **unbounded** — every item runs concurrently. Pass `concurrency` to throttle (e.g. against provider rate limits):
 
 ```ts
-// Up to 3 items run simultaneously; the next launches as soon as one finishes.
+// Cap at 3 items in flight; the next launches as soon as one finishes.
 .foreach(summarizer, { concurrency: 3 })
 ```
 
-`concurrency` is the **maximum number of items in flight at any moment** — backed by a semaphore. There's no lockstep batching: a slow item never blocks a finished slot from picking up the next pending one.
+`concurrency` is the **maximum number of items in flight at any moment** — backed by a worker pool. There's no lockstep batching: a slow item never blocks a finished slot from picking up the next pending one.
+
+> **Rate-limit hazard:** the unbounded default fires all items at once. For large arrays against a rate-limited provider, set an explicit `concurrency`.
 
 Works with nested workflows too:
 
@@ -531,6 +558,33 @@ const pipeline = Workflow.create<Ctx>()
   .step("fetch-items", async ({ ctx }) => ctx.db.items.getAll())
   .foreach(processItem, { concurrency: 5 });
 ```
+
+#### Streaming `foreach` / `parallel` items
+
+When the workflow is run with `.stream(...)`, pass `handleStream` to `foreach` or `parallel` to run each **agent** item/branch in stream mode and control how it surfaces to the writer — the same hook as a single `.step(agent)`, plus an `itemIndex`:
+
+```ts
+// foreach: itemIndex is the numeric item index
+.foreach(summarizer, {
+  handleStream: ({ result, writer, input, itemIndex }) => {
+    writer.write({ type: "data-item-start", data: { itemIndex } });
+    writer.merge(result.toUIMessageStream());
+  },
+})
+
+// parallel record form: itemIndex is the branch key
+.parallel({ summary: summarizer, sentiment: classifier }, {
+  handleStream: ({ result, writer, itemIndex }) => {
+    if (itemIndex === "summary") writer.merge(result.toUIMessageStream());
+  },
+})
+```
+
+- **No `handleStream`** → agent items run in generate mode (no auto-merge). `foreach`/`parallel` never auto-merge; you opt into surfacing explicitly.
+- **`SealedWorkflow` items/branches** stream transitively via their own steps when the parent streams — `handleStream` is not called for them.
+- `itemIndex`: `number` for `foreach` and tuple `parallel`; the key (`string`) for record `parallel`. `branch` threads the matched key (select) / case index (predicate) into its existing `handleStream`.
+- Both default to unbounded concurrency, so streamed parts **interleave** (id-keyed, non-corrupting, but nondeterministic order). Set `concurrency: 1` if you want each item/branch to stream sequentially in order.
+- Generate-mode runs (`.generate(...)`) never call `handleStream`.
 
 #### Per-item error recovery via `onError`
 
@@ -572,7 +626,9 @@ const pipeline = Workflow.create<Ctx, string>()
   .parallel([researcher, critic] as const);
 ```
 
-The same input (`state.output`) is fed to each branch. Default concurrency is `min(branches.length, 5)` — most users want fan-out, but the cap protects against rate-limit pressure. Pass `concurrency: Infinity` (or `branches.length`) to opt out.
+The same input (`state.output`) is fed to each branch. By default `parallel` is **unbounded** — all branches run concurrently. Pass an explicit `concurrency` to throttle against rate-limit pressure.
+
+Like `foreach`, `parallel` runs agent branches in generate mode and never auto-merges; pass `handleStream` to surface branch streams in a `.stream(...)` run — see [Streaming items](#streaming-foreach--parallel-items).
 
 ```ts
 .parallel({ a, b, c, d, e, f, g, h }, { concurrency: 3 })     // explicit override
@@ -599,7 +655,7 @@ The same input (`state.output`) is fed to each branch. Default concurrency is `m
 
 Gates inside parallel branches throw `NestedGateUnsupportedError`, same as `foreach` concurrent. The lowest-index suspending branch wins the marker; others contribute to `siblingSuspensions`. Multi-branch suspension semantics are finalized in F0.6 alongside `cancelOnFirstSuspend` — until then, all branches run to completion (or sibling-failure) before the marker reaches the caller.
 
-> **Rate-limit hazard:** `parallel`'s default `min(N, 5)` assumes ≥5 RPS headroom on your model provider. Symptoms of overflow: 429s and stair-stepped latency.
+> **Rate-limit hazard:** `parallel`'s unbounded default fires all branches at once. With many branches on a rate-limited provider, set an explicit `concurrency`. Symptoms of overflow: 429s and stair-stepped latency.
 
 > **Concurrent ctx-mutation hazard:** branches share the `ctx` object by reference. Treat `ctx` as immutable inside parallel branches.
 
@@ -635,6 +691,8 @@ Use `while` for the opposite condition (repeat while true, stop when false):
 ```
 
 The `until` and `while` options are mutually exclusive — TypeScript enforces this at compile time.
+
+Both forms are **do-while**: the body always runs at least once, then the predicate is checked against its `output`. So `while: () => false` still runs the body once — it is not a pre-check.
 
 When `maxIterations` is exceeded, a `WorkflowLoopError` is thrown — catchable by `.catch()`:
 
@@ -692,7 +750,7 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
 | `.step(id, fn)`           | Transform the output. `fn` receives `{ ctx, input }` and returns the new output. |
 | `.branch([...cases])`     | Predicate routing. First `when` match wins; case without `when` is default. |
 | `.branch({ select, agents })` | Key routing. `select` returns a key, runs the matching agent.          |
-| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: 1). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
+| `.foreach(target, opts?)` | Map each array element through an agent or workflow. `opts.concurrency` is the max items in flight (default: unbounded). `opts.onError` recovers per-item failures; return `Workflow.SKIP` to drop an index. |
 | `.repeat(target, opts)`   | Loop an agent or workflow. Use `{ until }` or `{ while }` (mutually exclusive). `maxIterations` defaults to 10. |
 | `.gate(id, opts?)`        | Human-in-the-loop suspension point. Returns a result with `status: "suspended"` carrying a serializable snapshot. Resume via `loadState(gateId, snapshot)`. |
 | `.catch(id, fn)`          | Handle errors. `fn` receives `{ error, ctx, lastOutput, stepId }` and returns a recovery value. Bypassed on suspension. |
@@ -971,9 +1029,9 @@ const final = await resumed.generate(ctx);   // no response arg — state is see
 
 ### Cadence
 
-- `checkpointEvery: N` — fire every N executable steps. Defaults to `max(1, ceil(executableCount / 4))` — 4 checkpoints across the run, floor of every step on tiny pipelines.
+- `checkpointEvery: N` — fire every N executable steps. Defaults to `max(1, ceil(stepCount / 4))` — 4 checkpoints across the run, floor of every step on tiny pipelines.
 - `checkpointWhen({ stepIndex, stepId, ctx }) => boolean` — predicate variant. Mutually exclusive with `checkpointEvery`.
-- `.catch()` and `.finally()` nodes are NOT counted as executable, so adding cleanup doesn't surprise you with extra checkpoints.
+- The default-cadence denominator counts only checkpointable steps (`step` / `branch` / `foreach` / `repeat` / `parallel` / nested). `gate` nodes suspend or skip and never checkpoint, and `.catch()` / `.finally()` are cleanup — none of them count, so adding them doesn't shift the cadence.
 
 ### Timeout via `AbortSignal`
 
@@ -1068,9 +1126,12 @@ Pass an `observability` object to `Workflow.create()` to receive lifecycle event
 ```ts
 import { Workflow, type WorkflowObservability } from "pipeai";
 
-const obs: WorkflowObservability = {
+// `WorkflowObservability<Ctx>` types `ctx` in every hook as your context.
+// It defaults to `unknown`, so the bare `WorkflowObservability` form still
+// works for context-agnostic hooks.
+const obs: WorkflowObservability<Ctx> = {
   onStepStart: ({ stepId, type, ctx, input }) => {
-    console.log(`step ${stepId} (${type}) starting`);
+    console.log(`[${ctx.requestId}] step ${stepId} (${type}) starting`);
   },
   onStepFinish: ({ stepId, type, output, durationMs, suspended }) => {
     console.log(`step ${stepId} (${type}) finished in ${durationMs}ms, suspended=${suspended}`);
@@ -1084,6 +1145,8 @@ const pipeline = Workflow.create<Ctx, string>({ observability: obs })
   .step("classify", classifier)
   .step("respond", responder);
 ```
+
+`ctx` is typed as the workflow's context: pass `WorkflowObservability<Ctx>` (or just inline the object into `Workflow.create<Ctx>({ observability: { ... } })` and let `Ctx` flow in). The `input` / `output` fields stay `unknown` — they differ at every step in the chain, so only `ctx` (constant across the run) can be typed.
 
 The hooks are threaded through every builder return, so any chain following `Workflow.create({ observability })` keeps the same hooks. `ResumedWorkflow` (gate resume via `loadState`) and `CheckpointResumedWorkflow` (checkpoint resume via `resumeFrom`) ALSO inherit it — events fire on resumed runs without re-wiring.
 

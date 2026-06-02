@@ -35,6 +35,64 @@ export function createMockModel(text: string) {
   });
 }
 
+// ── Replayable streaming mock model ────────────────────────────────
+// createMockModel's `doStream` is a single ReadableStream created once, so it
+// can only be consumed ONCE. That's fine for a single-use agent, but when one
+// agent is reused across multiple stream-mode invocations (e.g. a foreach over
+// N items with one target), the first call drains the stream and the rest get
+// an empty one. A real model produces a fresh stream per `.stream()` call —
+// this mock mirrors that by building the stream inside a `doStream` function.
+export function createReplayableMockModel(text: string) {
+  const doGenerate: LanguageModelV3GenerateResult = {
+    content: [{ type: "text", text }],
+    finishReason,
+    usage: mockUsage,
+    warnings: [],
+  };
+  return new MockLanguageModelV3({
+    doGenerate,
+    doStream: async () => ({
+      stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+        { type: "text-start", id: "text-1" },
+        { type: "text-delta", id: "text-1", delta: text },
+        { type: "text-end", id: "text-1" },
+        { type: "finish", finishReason, usage: mockUsage },
+      ]),
+    }),
+  });
+}
+
+// ── Signal-probe mock model ─────────────────────────────────────────
+// createMockModel ignores abortSignal, so whether a caller forwards the signal
+// to the model call is invisible. This model records the abortSignal it
+// receives in `doGenerate` (via the `onCall` callback) and then returns
+// normally — letting a test assert the signal was actually threaded into the
+// model call WITHOUT having to abort (which would otherwise be masked by the
+// run loop's own abort promotion).
+export function createSignalProbeModel(text: string, onCall: (signal: AbortSignal | undefined) => void) {
+  return new MockLanguageModelV3({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    doGenerate: ((options: { abortSignal?: AbortSignal }): Promise<any> => {
+      onCall(options?.abortSignal);
+      return Promise.resolve({
+        content: [{ type: "text", text }],
+        finishReason,
+        usage: mockUsage,
+        warnings: [],
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any,
+    doStream: {
+      stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+        { type: "text-start", id: "text-1" },
+        { type: "text-delta", id: "text-1", delta: text },
+        { type: "text-end", id: "text-1" },
+        { type: "finish", finishReason, usage: mockUsage },
+      ]),
+    },
+  });
+}
+
 export type TestCtx = {
   userId: string;
 };
