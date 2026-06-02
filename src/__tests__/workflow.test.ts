@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Agent } from "../agent";
-import { Workflow, WorkflowLoopError, NestedGateUnsupportedError, CheckpointTimeoutError, migrateSnapshot, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
+import { Workflow, WorkflowLoopError, migrateSnapshot, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
 import { createMockModel, createReplayableMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
 
 // Agents that produce string output (auto-extracted as text by workflow)
@@ -881,7 +881,9 @@ describe("Workflow", () => {
       );
     });
 
-    it("catch handler that throws chains to the next catch", async () => {
+    it("catch handler that throws bubbles out — no chaining to a later catch", async () => {
+      // New semantics: a throwing recovery handler is non-recoverable. It does
+      // not chain to a downstream `.catch()`; it bubbles straight out of the run.
       const failingModel = createMockModel("x");
       failingModel.doGenerate = async () => {
         throw new Error("original");
@@ -901,18 +903,13 @@ describe("Workflow", () => {
         })
         .catch("second-catch", secondCatchFn);
 
-      const { output } = expectComplete(await pipeline.generate(testCtx));
-
-      expect(output).toBe("final recovery");
-      expect(secondCatchFn).toHaveBeenCalledWith(
-        expect.objectContaining({
-          error: expect.objectContaining({ message: "catch also failed" }),
-          stepId: "first-catch",
-        })
-      );
+      await expect(pipeline.generate(testCtx)).rejects.toThrow("catch also failed");
+      expect(secondCatchFn).not.toHaveBeenCalled();
     });
 
-    it("catch handler that throws with no next catch runs finally and re-throws", async () => {
+    it("catch handler that throws bubbles out immediately — a following finally does not run", async () => {
+      // New semantics: "bubble out immediately" — the throw rejects the run
+      // right away, so cleanup nodes after the catch never execute.
       const failingModel = createMockModel("x");
       failingModel.doGenerate = async () => {
         throw new Error("original");
@@ -933,7 +930,7 @@ describe("Workflow", () => {
         .finally("cleanup", finallySpy);
 
       await expect(pipeline.generate(testCtx)).rejects.toThrow("catch also failed");
-      expect(finallySpy).toHaveBeenCalledOnce();
+      expect(finallySpy).not.toHaveBeenCalled();
     });
 
     it("catch without preceding steps throws at build time", () => {
@@ -2022,7 +2019,7 @@ describe("Workflow", () => {
       expect(() => pipeline.loadState("review", badSnapshot)).toThrow("gate ID mismatch");
     });
 
-    it("gate inside step(workflow) throws NestedGateUnsupportedError", async () => {
+    it("gate inside step(workflow) propagates the suspension up to the parent", async () => {
       const sub = Workflow.create<TestCtx>()
         .step(createTextAgent("inner", "value"))
         .gate("inner-gate");
@@ -2030,31 +2027,113 @@ describe("Workflow", () => {
       const pipeline = Workflow.create<TestCtx>()
         .step(sub);
 
-      await expect(pipeline.generate(testCtx)).rejects.toThrow(NestedGateUnsupportedError);
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx));
+      expect(snapshot.gateId).toBe("inner-gate");
+      // `.step(sub)` is at parent index 0; the gate is at index 1 inside `sub`.
+      expect((snapshot as GateSnapshot).nestedPath).toEqual([0]);
+      expect(snapshot.resumeFromIndex).toBe(1);
     });
 
-    it("gate inside foreach throws NestedGateUnsupportedError", async () => {
+    it("resumes the parent through a nested gate (single level)", async () => {
+      const sub = Workflow.create<TestCtx, string>()
+        .step("inner-pre", ({ input }) => `${input}-pre`)
+        .gate("inner-gate")
+        .step("inner-post", ({ input }) => `${input}-post`);
+
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("outer-pre", ({ input }) => `${input}-outer`)
+        .step(sub)
+        .step("outer-post", ({ input }) => `${input}-final`);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx, "x"));
+      expect(snapshot.gateId).toBe("inner-gate");
+      expect(snapshot.output).toBe("x-outer-pre");
+      expect((snapshot as GateSnapshot).nestedPath).toEqual([1]);
+
+      const resumed = await pipeline.loadState("inner-gate", snapshot).generate(testCtx, "RESPONSE");
+      // Default gate merge: response replaces output → inner-post then outer-post.
+      expect(resumed.status).toBe("complete");
+      if (resumed.status === "complete") expect(resumed.output).toBe("RESPONSE-post-final");
+    });
+
+    it("resumes through two levels of nesting", async () => {
+      const deepest = Workflow.create<TestCtx, string>()
+        .step("d-pre", ({ input }) => `${input}-d`)
+        .gate("deep-gate")
+        .step("d-post", ({ input }) => `${input}-D`);
+      const mid = Workflow.create<TestCtx, string>()
+        .step("m-pre", ({ input }) => `${input}-m`)
+        .step(deepest)
+        .step("m-post", ({ input }) => `${input}-M`);
+      const pipeline = Workflow.create<TestCtx, string>()
+        .step("root-pre", ({ input }) => `${input}-r`)
+        .step(mid)
+        .step("root-post", ({ input }) => `${input}-R`);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx, "x"));
+      expect(snapshot.gateId).toBe("deep-gate");
+      // mid is at root index 1; deepest is at mid index 1.
+      expect((snapshot as GateSnapshot).nestedPath).toEqual([1, 1]);
+
+      const resumed = await pipeline.loadState("deep-gate", snapshot).generate(testCtx, "GO");
+      expect(resumed.status).toBe("complete");
+      if (resumed.status === "complete") expect(resumed.output).toBe("GO-D-M-R");
+    });
+
+    it("nested gate resume applies the innermost gate's schema + merge", async () => {
+      const schema = { parse: (v: unknown) => { if (typeof v !== "number") throw new Error("not a number"); return v; } };
+      const sub = Workflow.create<TestCtx, number>()
+        .step("pre", ({ input }) => input + 1)
+        .gate("g", {
+          schema,
+          merge: ({ priorOutput, response }) => (priorOutput as number) + (response as number),
+        })
+        .step("post", ({ input }) => (input as number) * 10);
+      const pipeline = Workflow.create<TestCtx, number>().step(sub);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx, 5));
+      expect(snapshot.output).toBe(6);   // pre: 5 + 1
+
+      const resumed = await pipeline.loadState("g", snapshot).generate(testCtx, 4);
+      // merge: 6 + 4 = 10; post: 10 * 10 = 100.
+      expect(resumed.status).toBe("complete");
+      if (resumed.status === "complete") expect(resumed.output).toBe(100);
+    });
+
+    it("nested gate snapshot is JSON-serializable and round-trips", async () => {
+      const sub = Workflow.create<TestCtx, string>()
+        .step("inner", ({ input }) => input)
+        .gate("inner-gate", { payload: ({ input }) => ({ draft: input }) });
+      const pipeline = Workflow.create<TestCtx, string>().step(sub);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx, "data"));
+      const roundTripped = JSON.parse(JSON.stringify(snapshot)) as GateSnapshot;
+      expect(roundTripped).toEqual(snapshot);
+      expect(roundTripped.nestedPath).toEqual([0]);
+
+      const resumed = await pipeline.loadState("inner-gate", roundTripped).generate(testCtx, "approved");
+      expect(resumed.status).toBe("complete");
+      if (resumed.status === "complete") expect(resumed.output).toBe("approved");
+    });
+
+    it("forbids a gated workflow as a foreach target at build time", () => {
       const sub = Workflow.create<TestCtx, string>()
         .step(createPassthroughAgent("inner", "processed"))
         .gate("inner-gate");
 
-      const pipeline = Workflow.create<TestCtx>()
-        .step("items", () => ["a", "b"])
-        .foreach(sub);
-
-      await expect(pipeline.generate(testCtx)).rejects.toThrow(NestedGateUnsupportedError);
+      const pipeline = Workflow.create<TestCtx>().step("items", () => ["a", "b"]);
+      // @ts-expect-error — a workflow with gate(s) cannot be a foreach target.
+      pipeline.foreach(sub);
     });
 
-    it("gate inside repeat throws NestedGateUnsupportedError", async () => {
+    it("forbids a gated workflow as a repeat target at build time", () => {
       const sub = Workflow.create<TestCtx, string>()
         .step(createPassthroughAgent("inner", "refined"))
         .gate("inner-gate");
 
-      const pipeline = Workflow.create<TestCtx>()
-        .step("init", () => "draft")
-        .repeat(sub, { until: () => true });
-
-      await expect(pipeline.generate(testCtx)).rejects.toThrow(NestedGateUnsupportedError);
+      const pipeline = Workflow.create<TestCtx, string>().step("init", () => "draft");
+      // @ts-expect-error — a workflow with gate(s) cannot be a repeat target.
+      pipeline.repeat(sub, { until: () => true });
     });
 
     it("snapshot is JSON-serializable and round-trips", async () => {
@@ -2734,7 +2813,10 @@ describe("Workflow", () => {
         expect(finallySpy).toHaveBeenCalledOnce();
       });
 
-      it("multi-finally: throwing finally does not abort subsequent finallys", async () => {
+      it("throwing finally aborts subsequent finallys and bubbles, even under suspension", async () => {
+        // New semantics: a throwing finally bubbles straight out. It does not
+        // aggregate, subsequent finallys do not run, and a pending suspension
+        // does NOT win — the run rejects with the finally error.
         const second = vi.fn();
         const pipeline = Workflow.create<TestCtx>()
           .step(createTextAgent("a1", "draft"))
@@ -2742,59 +2824,47 @@ describe("Workflow", () => {
           .finally("first", () => { throw new Error("boom"); })
           .finally("second", second);
 
-        const result = await pipeline.generate(testCtx);
-        expect(result.status).toBe("suspended");
-        expect(second).toHaveBeenCalledOnce();
-        // The first error becomes a warning on the suspended path.
-        const sources = result.warnings.map(w => w.source);
-        expect(sources).toContain("finally");
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("boom");
+        expect(second).not.toHaveBeenCalled();
       });
 
-      it("throwing finally on suspension produces snapshot + warning", async () => {
+      it("throwing finally on suspension bubbles out (rejects, no snapshot)", async () => {
         const pipeline = Workflow.create<TestCtx>()
           .step(createTextAgent("a1", "draft"))
           .gate("review")
           .finally("cleanup", () => { throw new Error("cleanup-fail"); });
 
-        const result = await pipeline.generate(testCtx);
-        expect(result.status).toBe("suspended");
-        expect(result.warnings).toHaveLength(1);
-        expect(result.warnings[0].source).toBe("finally");
-        expect(result.warnings[0].stepId).toBe("cleanup");
-        expect((result.warnings[0].error as Error).message).toBe("cleanup-fail");
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("cleanup-fail");
       });
     });
 
-    describe("AggregateError on completion path with throwing finally", () => {
-      it("single throwing finally on completion path yields AggregateError", async () => {
+    describe("throwing finally on completion path bubbles the raw error", () => {
+      it("single throwing finally bubbles the raw error (no AggregateError)", async () => {
         const pipeline = Workflow.create<TestCtx>()
           .step(createTextAgent("a1", "ok"))
           .finally("cleanup", () => { throw new Error("cleanup-fail"); });
 
-        await expect(pipeline.generate(testCtx)).rejects.toThrow(AggregateError);
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("cleanup-fail");
         try {
           await pipeline.generate(testCtx);
         } catch (e) {
-          expect(e).toBeInstanceOf(AggregateError);
-          expect((e as AggregateError).errors).toHaveLength(1);
-          expect(((e as AggregateError).errors[0] as Error).message).toBe("cleanup-fail");
+          expect(e).not.toBeInstanceOf(AggregateError);
+          expect((e as Error).message).toBe("cleanup-fail");
         }
       });
 
-      it("three-finally-throws preserves all in source order", async () => {
+      it("first throwing finally bubbles; later finallys do not run", async () => {
+        const f2 = vi.fn();
+        const f3 = vi.fn();
         const pipeline = Workflow.create<TestCtx>()
           .step(createTextAgent("a1", "ok"))
           .finally("f1", () => { throw new Error("E1"); })
-          .finally("f2", () => { throw new Error("E2"); })
-          .finally("f3", () => { throw new Error("E3"); });
+          .finally("f2", f2)
+          .finally("f3", f3);
 
-        try {
-          await pipeline.generate(testCtx);
-        } catch (e) {
-          expect(e).toBeInstanceOf(AggregateError);
-          const messages = ((e as AggregateError).errors as Error[]).map(x => x.message);
-          expect(messages).toEqual(["E1", "E2", "E3"]);
-        }
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("E1");
+        expect(f2).not.toHaveBeenCalled();
+        expect(f3).not.toHaveBeenCalled();
       });
 
       it("step throw with no finally preserves original instanceof", async () => {
@@ -2812,26 +2882,25 @@ describe("Workflow", () => {
         }
       });
 
-      it("pendingError.source dispatch: step + same-id finally — finally throw -> AggregateError", async () => {
+      it("step + same-id finally — finally throw bubbles the raw error", async () => {
         // Step id "review" + finally id "review" is legal under (type, id) uniqueness:
         // step:review and finally:review are different (type, id) pairs.
         const pipeline = Workflow.create<TestCtx>()
           .step("review", () => "value")
           .finally("review", () => { throw new Error("finally-throw"); });
 
+        await expect(pipeline.generate(testCtx)).rejects.toThrow("finally-throw");
         try {
           await pipeline.generate(testCtx);
         } catch (e) {
-          expect(e).toBeInstanceOf(AggregateError);
-          const errs = (e as AggregateError).errors as Error[];
-          expect(errs).toHaveLength(1);
-          expect(errs[0].message).toBe("finally-throw");
+          expect(e).not.toBeInstanceOf(AggregateError);
+          expect((e as Error).message).toBe("finally-throw");
         }
       });
     });
 
-    describe("nested-workflow finally + NestedGateUnsupportedError ordering", () => {
-      it("inner finally runs before NestedGateUnsupportedError fires", async () => {
+    describe("nested-workflow finally + gate propagation ordering", () => {
+      it("inner finally runs before the suspension propagates up", async () => {
         const innerFinally = vi.fn();
         const sub = Workflow.create<TestCtx>()
           .step(createTextAgent("inner", "x"))
@@ -2839,7 +2908,8 @@ describe("Workflow", () => {
           .finally("inner-cleanup", innerFinally);
         const pipeline = Workflow.create<TestCtx>().step(sub);
 
-        await expect(pipeline.generate(testCtx)).rejects.toThrow(NestedGateUnsupportedError);
+        const result = await pipeline.generate(testCtx);
+        expect(result.status).toBe("suspended");
         expect(innerFinally).toHaveBeenCalledOnce();
       });
     });
@@ -2862,122 +2932,27 @@ describe("Workflow", () => {
         expect(Array.isArray(result.warnings)).toBe(true);
       });
 
-      it("finally-throw + observer-throw on suspension path → both warnings present", async () => {
+      it("finally-throw on suspension bubbles; a throwing observer attaches as cause", async () => {
+        // New semantics: the throwing finally bubbles out (suspension does not
+        // win). onStepError still fires; its throw attaches as `cause` on the
+        // finally error per the cause-attachment contract.
         const pipeline = Workflow.create<TestCtx>()
           .step(createTextAgent("a1", "draft"))
           .gate("review")
           .finally("f", () => { throw new Error("f-fail"); });
 
         // Inject a throwing observer via the protected field.
+        const obsErr = new Error("obs-fail");
         const observer: WorkflowObservability = {
-          onStepError: () => { throw new Error("obs-fail"); },
+          onStepError: () => { throw obsErr; },
         };
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (pipeline as any).observability = observer;
 
-        const result = await pipeline.generate(testCtx);
-        expect(result.status).toBe("suspended");
-        const sources = result.warnings.map(w => w.source).sort();
-        expect(sources).toContain("finally");
-        expect(sources).toContain("onStepError");
-      });
-    });
-
-    describe("foreach concurrent suspension", () => {
-      it("3 items, suspending at indices [2,0,1] → caller sees lowest-index marker", async () => {
-        // Inner workflow with a gate keyed by item to force suspension on every call.
-        const innerSub = Workflow.create<TestCtx, string>()
-          .step((createPassthroughAgent("inner", "x")))
-          .gate("g");
-
-        const pipeline = Workflow.create<TestCtx>()
-          .step("items", () => ["a", "b", "c"])
-          .foreach(innerSub, { concurrency: 3 });
-
-        try {
-          await pipeline.generate(testCtx);
-        } catch (e) {
-          expect(e).toBeInstanceOf(NestedGateUnsupportedError);
-          const err = e as NestedGateUnsupportedError;
-          expect(err.gateId).toBe("g");
-          // Two other items also suspended; lowest-index won, others land in siblingSuspensions.
-          expect(err.siblingSuspensions).toHaveLength(2);
-        }
-      });
-
-      it("foreach with item 0 suspending and items 1,2 throwing → marker carries siblingErrors + warnings", async () => {
-        const failing = createMockModel("x");
-        failing.doGenerate = async () => { throw new Error("item-fail"); };
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const failingAgent = new Agent<TestCtx, any, any>({ id: "fag", model: failing, prompt: () => "go" });
-
-        const subSuspends = Workflow.create<TestCtx, string>()
-          .step(createPassthroughAgent("inner", "x"))
-          .gate("g");
-        const subThrows = Workflow.create<TestCtx, string>()
-          .step(failingAgent);
-
-        // We can't mix: foreach takes ONE target. Use a transform that picks per index.
-        // Build by branching: a sub-workflow that switches on index via state.output (which is the item).
-        // Simpler: use a single sub with conditional gate.
-        const sub = Workflow.create<TestCtx, string>()
-          .step("dispatch", ({ input }) => input)
-          .branch([
-            { when: ({ input }) => input === "go-suspend", agent: createPassthroughAgent("a", "ok") },
-            { agent: failingAgent },
-          ])
-          .gate("g", { condition: ({ input }) => input === "ok" });
-
-        // Items: index 0 → go-suspend (passes through to gate), 1,2 → throw.
-        const pipeline = Workflow.create<TestCtx>()
-          .step("items", () => ["go-suspend", "f1", "f2"])
-          .foreach(sub, { concurrency: 3 });
-
-        try {
-          await pipeline.generate(testCtx);
-        } catch (e) {
-          expect(e).toBeInstanceOf(NestedGateUnsupportedError);
-          const err = e as NestedGateUnsupportedError;
-          expect(err.siblingErrors.length).toBeGreaterThanOrEqual(2);
-        }
-      });
-
-      it("item warnings merged into parent under namespace `<id>[index]:<inner-stepId>`", async () => {
-        // The contract: foreach merges per-item itemState.warnings into the
-        // parent state.warnings, namespaced as `${id}[${index}]:${w.stepId}`,
-        // on BOTH branches (suspension + completion).
-        //
-        // F0 has no path where an inner workflow completes cleanly with
-        // non-empty state.warnings (the only thing that pushes is "step error
-        // pushed when finally also throws" — which leaves pendingError set,
-        // triggering an inner throw at the tail). So we exercise the merge on
-        // the SUSPENSION branch instead: inner suspends + has a throwing
-        // finally → inner's state.warnings carries the finally error → foreach
-        // merges into parent state.warnings → foreach throws
-        // NestedGateUnsupportedError → outer .catch() swallows it →
-        // result.status === "complete" and result.warnings contains the
-        // namespaced entry.
-        const innerSuspends = Workflow.create<TestCtx, string>()
-          .step(createPassthroughAgent("inner-step", "x"))
-          .gate("inner-g")
-          .finally("inner-fin", () => { throw new Error("inner-fin-fail"); });
-
-        const pipeline = Workflow.create<TestCtx>()
-          .step("items", () => ["a"])
-          .foreach(innerSuspends, { id: "fe" })
-          .catch("rec", () => ["recovered-outer"]);
-
-        const result = await pipeline.generate(testCtx);
-        expect(result.status).toBe("complete");
-        // The namespaced warning from the inner finally must have been merged
-        // into the parent's warnings BEFORE the foreach threw the marker. If
-        // mergeItemWarnings() were removed, this assertion would fail —
-        // proving the test exercises the contract.
-        const stepIds = result.warnings.map(w => w.stepId);
-        expect(stepIds).toContain("fe[0]:inner-fin");
-        const innerFin = result.warnings.find(w => w.stepId === "fe[0]:inner-fin");
-        expect(innerFin?.source).toBe("finally");
-        expect((innerFin?.error as Error).message).toBe("inner-fin-fail");
+        await expect(pipeline.generate(testCtx)).rejects.toMatchObject({
+          message: "f-fail",
+          cause: obsErr,
+        });
       });
     });
 
@@ -3121,11 +3096,8 @@ describe("Workflow", () => {
       });
 
       it("runOptions does not propagate into nested workflows", async () => {
-        // Parent uses freezeSnapshots: true. Inner workflow's gate snapshot path
-        // is moot (NestedGateUnsupportedError fires), but we can verify the
-        // executeNestedWorkflow contract by reading state through observation.
-        // Simpler: verify foreach itemState doesn't carry runOptions by ensuring
-        // a successful run with freezeSnapshots: true doesn't freeze inner state.
+        // Verify foreach itemState doesn't carry runOptions by ensuring a
+        // successful run with freezeSnapshots: true doesn't freeze inner state.
         const pipeline = Workflow.create<TestCtx>()
           .step("items", () => ["a", "b"])
           .foreach(createPassthroughAgent("p", "ok"));
@@ -3647,16 +3619,6 @@ describe("Workflow", () => {
         }
       });
 
-      it("validateRunOptions throws on bad checkpointTimeout values", async () => {
-        const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
-        for (const bad of [0, -1, NaN, Infinity]) {
-          await expect(pipeline.generate(testCtx, undefined, {
-            onCheckpoint: () => {},
-            checkpointTimeout: bad,
-          })).rejects.toThrow(/checkpointTimeout/);
-        }
-      });
-
       it("auto-cadence: 4-step pipeline fires at every step (ceil(4/4) = 1)", async () => {
         const pipeline = Workflow.create<TestCtx>()
           .step("s1", () => "a")
@@ -3740,37 +3702,27 @@ describe("Workflow", () => {
       });
     });
 
-    describe("checkpoint timeout via AbortSignal", () => {
-      it("aborts onCheckpoint via AbortSignal on timeout, throws CheckpointTimeoutError", async () => {
-        const { CheckpointTimeoutError } = await import("../workflow");
+    describe("onCheckpoint signal forwarding", () => {
+      it("forwards the run's abortSignal into onCheckpoint", async () => {
+        const ac = new AbortController();
+        let received: AbortSignal | undefined | "unset" = "unset";
         const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
-        await expect(pipeline.generate(testCtx, undefined, {
-          onCheckpoint: async (_snap, { signal }) => {
-            // Wait for abort or 1s — whichever comes first.
-            await new Promise<void>((resolve, reject) => {
-              signal.addEventListener("abort", () => reject(new Error("aborted-but-ignored")), { once: true });
-              setTimeout(resolve, 1000);
-            });
-          },
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (_snap, { signal }) => { received = signal; },
           checkpointEvery: 1,
-          checkpointTimeout: 25,
-        })).rejects.toBeInstanceOf(CheckpointTimeoutError);
+          abortSignal: ac.signal,
+        });
+        expect(received).toBe(ac.signal);
       });
 
-      it("signal is passed and not aborted when onCheckpoint completes within timeout", async () => {
-        let signalAborted = false;
+      it("passes signal: undefined when the run has no abortSignal", async () => {
+        let received: AbortSignal | undefined | "unset" = "unset";
         const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
-        const result = await pipeline.generate(testCtx, undefined, {
-          onCheckpoint: async (_snap, { signal }) => {
-            // Trivial fast op — signal must NOT be aborted.
-            await new Promise(r => setTimeout(r, 5));
-            signalAborted = signal.aborted;
-          },
+        await pipeline.generate(testCtx, undefined, {
+          onCheckpoint: (_snap, { signal }) => { received = signal; },
           checkpointEvery: 1,
-          checkpointTimeout: 200,
         });
-        expect(result.status).toBe("complete");
-        expect(signalAborted).toBe(false);
+        expect(received).toBeUndefined();
       });
     });
 
@@ -4133,50 +4085,24 @@ describe("Workflow", () => {
       });
     });
 
-    describe("suspension under parallel (reuses NestedGateUnsupportedError)", () => {
-      it("gate inside a parallel branch throws NestedGateUnsupportedError", async () => {
+    describe("gates forbidden in parallel branches (build time)", () => {
+      it("forbids a gated workflow as a record-form parallel branch", () => {
         const sub = Workflow.create<TestCtx, string>()
           .step(createPassthroughAgent("inner", "x"))
           .gate("inner-gate");
         const ok = createPassthroughAgent("ok", "from-ok");
-        const pipeline = Workflow.create<TestCtx, string>()
-          .step("init", ({ input }) => input)
-          .parallel({ a: sub, b: ok });
-        await expect(pipeline.generate(testCtx, "x")).rejects.toThrow(NestedGateUnsupportedError);
+        const pipeline = Workflow.create<TestCtx, string>().step("init", ({ input }) => input);
+        // @ts-expect-error — a workflow with gate(s) cannot be a parallel branch.
+        pipeline.parallel({ a: sub, b: ok });
       });
 
-      it("multi-branch suspension: lowest-index marker wins; others in siblingSuspensions", async () => {
-        const sub = (gateId: string) => Workflow.create<TestCtx, string>()
-          .step(createPassthroughAgent(`inner-${gateId}`, "x"))
-          .gate(gateId);
-        const pipeline = Workflow.create<TestCtx, string>()
-          .step("init", ({ input }) => input)
-          .parallel([sub("g1"), sub("g2"), sub("g3")] as const, { concurrency: 3 });
-        try {
-          await pipeline.generate(testCtx, "x");
-        } catch (e) {
-          expect(e).toBeInstanceOf(NestedGateUnsupportedError);
-          const err = e as NestedGateUnsupportedError;
-          expect(err.gateId).toBe("g1");   // lowest index wins
-          expect(err.siblingSuspensions.map(s => s.gateId).sort()).toEqual(["g2", "g3"]);
-        }
-      });
-    });
-
-    describe("per-branch warnings merge", () => {
-      it("inner warnings merged into parent under namespace `${id}[key]:<inner-stepId>`", async () => {
+      it("forbids a gated workflow as a tuple-form parallel branch", () => {
         const sub = Workflow.create<TestCtx, string>()
-          .step(createPassthroughAgent("inner-step", "x"))
-          .gate("inner-g")
-          .finally("inner-fin", () => { throw new Error("inner-fin-fail"); });
-        const ok = createPassthroughAgent("ok", "from-ok");
-        const pipeline = Workflow.create<TestCtx, string>()
-          .step("init", ({ input }) => input)
-          .parallel({ a: sub, b: ok }, { id: "para" })
-          .catch("rec", () => ({ a: "recovered", b: "recovered" }) as never);
-        const result = expectComplete(await pipeline.generate(testCtx, "x"));
-        const ids = result.warnings.map(w => w.stepId);
-        expect(ids).toContain("para[a]:inner-fin");
+          .step(createPassthroughAgent("inner", "x"))
+          .gate("g1");
+        const pipeline = Workflow.create<TestCtx, string>().step("init", ({ input }) => input);
+        // @ts-expect-error — a workflow with gate(s) cannot be a parallel branch.
+        pipeline.parallel([sub] as const, { concurrency: 1 });
       });
     });
   });
@@ -4593,17 +4519,12 @@ describe("Workflow", () => {
         .step("s", ({ input }) => input)
         .finally("f", () => { throw new Error("F-boom"); });
 
-      try {
-        await wf.generate(testCtx, "x");
-        expect.unreachable("should reject");
-      } catch (e) {
-        // finally errors surface as an AggregateError; the finally error carries
-        // the obsError as cause (previously discarded on the finally path).
-        const agg = e as AggregateError;
-        const finallyErr = agg.errors.find((x) => (x as Error).message === "F-boom") as Error;
-        expect(finallyErr).toBeDefined();
-        expect(finallyErr.cause).toBe(obsError);
-      }
+      // A throwing finally bubbles out raw (no AggregateError); the throwing
+      // onStepError attaches as `cause` on the finally error.
+      await expect(wf.generate(testCtx, "x")).rejects.toMatchObject({
+        message: "F-boom",
+        cause: obsError,
+      });
     });
 
     it("attaches a throwing onStepError's error as `cause` on a catch-body error", async () => {
@@ -4685,28 +4606,19 @@ describe("Workflow", () => {
       }
     });
 
-    it("console.warns a throwing .finally() error suppressed by a checkpoint failure", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        const wf = Workflow.create<TestCtx>()
-          .step("s", () => "x")
-          .finally("f", () => { throw new Error("finally-boom"); });
+    it("a throwing .finally() bubbles out even when a checkpoint failure is pending", async () => {
+      // New semantics: the finally body bubbles immediately, so it wins over a
+      // pending checkpoint failure (the checkpoint error is abandoned).
+      const wf = Workflow.create<TestCtx>()
+        .step("s", () => "x")
+        .finally("f", () => { throw new Error("finally-boom"); });
 
-        await expect(
-          wf.generate(testCtx, undefined, {
-            onCheckpoint: () => { throw new Error("ckpt-boom"); },
-            checkpointEvery: 1,
-          }),
-        ).rejects.toThrow("ckpt-boom");
-
-        const logged = warnSpy.mock.calls.find(
-          (c) => typeof c[0] === "string" && c[0].includes("suppressed by checkpoint-failure"),
-        );
-        expect(logged).toBeDefined();
-        expect((logged![1] as Error[]).some((x) => x.message === "finally-boom")).toBe(true);
-      } finally {
-        warnSpy.mockRestore();
-      }
+      await expect(
+        wf.generate(testCtx, undefined, {
+          onCheckpoint: () => { throw new Error("ckpt-boom"); },
+          checkpointEvery: 1,
+        }),
+      ).rejects.toThrow("finally-boom");
     });
   });
 
@@ -4724,35 +4636,11 @@ describe("Workflow", () => {
           checkpointEvery: 1,
           onCheckpoint: (_snap, { signal }) => {
             ac.abort(new Error("cancel"));
-            sawAbortInCallback = signal.aborted;
+            sawAbortInCallback = signal?.aborted ?? false;
           },
         }),
       ).rejects.toThrow("cancel");
       expect(sawAbortInCallback).toBe(true);
-    });
-
-    it("logs a post-timeout onCheckpoint rejection instead of swallowing it", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        const late = defer<void>();
-        const wf = Workflow.create<TestCtx>().step("s", () => "x");
-        const run = wf.generate(testCtx, undefined, {
-          checkpointEvery: 1,
-          checkpointTimeout: 10,
-          // Ignores the signal; rejects only once we release `late` (after timeout).
-          onCheckpoint: () => late.promise.then(() => { throw new Error("late-write-fail"); }),
-        });
-        await expect(run).rejects.toBeInstanceOf(CheckpointTimeoutError);
-        late.resolve();
-        await new Promise((r) => setTimeout(r, 0));
-        const logged = warnSpy.mock.calls.find(
-          (c) => typeof c[0] === "string" && c[0].includes("rejected after its timeout/abort"),
-        );
-        expect(logged).toBeDefined();
-        expect((logged![1] as Error).message).toBe("late-write-fail");
-      } finally {
-        warnSpy.mockRestore();
-      }
     });
   });
 

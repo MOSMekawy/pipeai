@@ -2,12 +2,49 @@ import {
   createUIMessageStream,
   type UIMessage,
   type UIMessageStreamWriter,
-  type UIMessageStreamOnFinishCallback,
-  type IdGenerator,
   type ToolSet,
 } from "ai";
 import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
-import { computeStepShapeHash, deepFreeze, extractOutput, runWithWriter, warnOnce, type MaybePromise } from "./utils";
+import { computeStepShapeHash, deepFreeze, warnOnce, type MaybePromise } from "./utils";
+import { TransformStep } from "./steps/transform-step";
+import { AgentStep } from "./steps/agent-step";
+import { PredicateBranchStep, SelectBranchStep } from "./steps/branch-step";
+import { ForeachStep } from "./steps/foreach-step";
+import { ParallelStep } from "./steps/parallel-step";
+import { GateStep } from "./steps/gate-step";
+import { CatchStep } from "./steps/catch-step";
+import { FinallyStep } from "./steps/finally-step";
+import { NestedWorkflowStep } from "./steps/nested-workflow-step";
+import { RepeatStep } from "./steps/repeat-step";
+
+// The public type / API surface lives in ./types. Re-export it so existing
+// `from "./workflow"` consumers (the step subclasses, index.ts) are unchanged,
+// and import the subset this file references internally.
+export type * from "./types";
+import type {
+  GateSnapshot, CheckpointSnapshot, LegacyGateSnapshotV1, WorkflowSnapshot,
+  WorkflowWarning, WorkflowStepType, WorkflowObservability, RunOptions,
+  StepOptions, InlineStepOptions, ConditionalStepOptions, NestedStepOptions,
+  BranchCase, BranchSelect, WorkflowResult, WorkflowStreamResult,
+  WorkflowStreamOptions, LoopPredicate, RepeatOptions, ParallelTarget,
+  ParallelOptions, ParallelOutputRecord, ParallelOutputTuple,
+  ParallelOutputRecordPartial, ParallelOutputTuplePartial, SchemaWithParse,
+  SkipPassthrough, ElementOf, NoGates, GatelessBranch,
+} from "./types";
+
+// Runtime plumbing (state construction, observability dispatch, warnings,
+// checkpoint sink) lives in ./runtime. Imported for internal use here, and the
+// subset the `./steps` subclasses + tests reach for is re-exported so their
+// `from "../workflow"` imports stay unchanged.
+import {
+  resolveFreezeSnapshots, pendingErrorSourceToStepType, emitCheckpoint,
+  __resetStreamOnErrorOnSuspendWarnForTests, pushWarning, fireHook, hasItemHooks,
+  demotePendingError, maybeWarnStreamOnErrorOnSuspend, makeRuntimeState,
+} from "./runtime";
+export {
+  resolveFreezeSnapshots, pushWarning, fireHook, hasItemHooks,
+  __resetStreamOnErrorOnSuspendWarnForTests,
+};
 
 // ── Error Types ─────────────────────────────────────────────────────
 
@@ -29,235 +66,6 @@ export class WorkflowLoopError extends Error {
     super(`Loop exceeded maximum iterations (${maxIterations})`);
     this.name = "WorkflowLoopError";
   }
-}
-
-export class NestedGateUnsupportedError extends Error {
-  readonly gateId: string;
-  readonly workflowId: string | undefined;
-  // Always present; non-gate rejections from a concurrent foreach OR parallel
-  // (both dispatch through runUnitsConcurrently).
-  readonly siblingErrors: readonly unknown[];
-  // Always present; OTHER suspending units in a concurrent foreach OR parallel.
-  // `index` is the 0-based unit position (foreach item index / parallel entry
-  // position) — NOT the record-form `parallel` branch key.
-  readonly siblingSuspensions: readonly { index: number; gateId: string }[];
-
-  constructor(
-    gateId: string,
-    workflowId: string | undefined,
-    siblingErrors: readonly unknown[] = [],
-    siblingSuspensions: readonly { index: number; gateId: string }[] = [],
-  ) {
-    super(`Gate "${gateId}" hit inside nested workflow "${workflowId ?? "(anonymous)"}". Nested gates are not yet supported.`);
-    this.name = "NestedGateUnsupportedError";
-    this.gateId = gateId;
-    this.workflowId = workflowId;
-    this.siblingErrors = siblingErrors;
-    this.siblingSuspensions = siblingSuspensions;
-  }
-}
-
-// ── Snapshot / Warnings / Run options ────────────────────────────────
-
-/**
- * v2 gate snapshot. The `kind` discriminant differentiates it from
- * checkpoint snapshots. The legacy v1 form is still accepted by `loadState`.
- */
-export interface GateSnapshot {
-  readonly version: 2;
-  readonly kind: "gate";
-  readonly resumeFromIndex: number;
-  readonly output: unknown;
-  readonly gateId: string;
-  readonly gatePayload: unknown;
-}
-
-/**
- * v2 checkpoint snapshot. Carries a step-shape hash; resume verifies the
- * workflow definition hasn't drifted before continuing.
- */
-export interface CheckpointSnapshot {
-  readonly version: 2;
-  readonly kind: "checkpoint";
-  readonly resumeFromIndex: number;   // index of the NEXT step to run
-  readonly output: unknown;
-  readonly stepShapeHash: string;     // SHA-256 hex of canonical recursive shape
-}
-
-/**
- * Legacy v0.4.0 gate-only snapshot. Accepted by `loadState` for one release
- * via the shim path. `kind?: undefined` makes runtime narrowing on
- * `kind === undefined` reachable — JSON round-trips strip the property.
- * Migrate via `migrateSnapshot()` before v0.8.0+.
- */
-export interface LegacyGateSnapshotV1 {
-  readonly version: 1;
-  readonly kind?: undefined;
-  readonly resumeFromIndex: number;
-  readonly output: unknown;
-  readonly gateId: string;
-  readonly gatePayload: unknown;
-}
-
-export type WorkflowSnapshot = GateSnapshot | CheckpointSnapshot | LegacyGateSnapshotV1;
-
-export interface WorkflowWarning {
-  readonly source:
-    | "step"
-    | "gate"
-    | "finally"
-    | "catch"
-    | "onCheckpoint"
-    | "onStepStart"
-    | "onStepFinish"
-    | "onStepError"
-    | "onItemStart"
-    | "onItemFinish"
-    | "onItemError"
-    | "foreach-sibling";
-  readonly stepId: string;
-  readonly error: unknown;
-}
-
-export type WorkflowStepType =
-  | "step"
-  | "nested"
-  | "gate"
-  | "catch"
-  | "finally"
-  | "branch"
-  | "foreach"
-  | "repeat"
-  | "parallel";
-
-/**
- * Workflow observability hooks. All optional. Errors thrown inside hooks
- * are captured into `result.warnings` with a matching `source` tag, except
- * `onStepError`, which causes the run to throw the ORIGINAL step error with
- * `error.cause = obsError` (preserving `instanceof` on the original).
- *
- * Per-node firing rules (where "step-like" = step / nested / branch /
- * foreach / parallel / repeat):
- *   - step-like / gate (cond-true → suspends): onStepStart always; onStepFinish
- *     when body returns (suspended: true for gate, false otherwise); onStepError
- *     on body throw.
- *   - step-like (`when` → false → skip): onStepStart, onStepFinish({ suspended:
- *     false }) with the passthrough/`otherwise` value as `output`. A skipped
- *     step's body never runs, but it is still bracketed by start/finish.
- *   - gate (cond false → skip): onStepStart, onStepFinish({ suspended: false }).
- *   - catch: onStepStart only when pendingError set; onStepFinish when catchFn
- *     returns; onStepError when catchFn throws.
- *   - finally: onStepStart always (runs even after suspension); onStepFinish
- *     always; onStepError when body throws.
- *   - foreach / parallel: emit ALSO per-item events (onItemStart/Finish/Error).
- *   - repeat: emit ONLY combinator-level events (no per-iteration events —
- *     iteration count is data-dependent and per-item would be misleading).
- *
- * Skip-checked nodes (`state.suspension || pendingError` already set on entry)
- * emit nothing — `.finally()` is the exception.
- */
-export interface WorkflowObservability<TContext = unknown> {
-  onStepStart?: (event: {
-    stepId: string;
-    type: WorkflowStepType;
-    ctx: TContext;
-    input: unknown;
-  }) => MaybePromise<void>;
-  onStepFinish?: (event: {
-    stepId: string;
-    type: WorkflowStepType;
-    ctx: TContext;
-    output: unknown;
-    durationMs: number;
-    suspended: boolean;
-  }) => MaybePromise<void>;
-  onStepError?: (event: {
-    stepId: string;
-    type: WorkflowStepType;
-    ctx: TContext;
-    error: unknown;
-    durationMs: number;
-  }) => MaybePromise<void>;
-  onItemStart?: (event: {
-    stepId: string;
-    type: "foreach" | "parallel";
-    itemIndex: number | string;
-    ctx: TContext;
-    input: unknown;
-  }) => MaybePromise<void>;
-  onItemFinish?: (event: {
-    stepId: string;
-    type: "foreach" | "parallel";
-    itemIndex: number | string;
-    ctx: TContext;
-    output: unknown;
-    durationMs: number;
-  }) => MaybePromise<void>;
-  onItemError?: (event: {
-    stepId: string;
-    type: "foreach" | "parallel";
-    itemIndex: number | string;
-    ctx: TContext;
-    error: unknown;
-    durationMs: number;
-  }) => MaybePromise<void>;
-}
-
-export interface RunOptions {
-  /**
-   * Step-level checkpoint sink. Called after each successful step body when
-   * `checkpointEvery` cadence or `checkpointWhen` predicate fires. Receives a
-   * v2 `CheckpointSnapshot` and an `AbortSignal` that aborts on
-   * `checkpointTimeout` expiration. Throwing here propagates to the caller
-   * as an error — workflow `.catch()` is bypassed for checkpoint failures.
-   */
-  readonly onCheckpoint?: (snapshot: CheckpointSnapshot, opts: { signal: AbortSignal }) => MaybePromise<void>;
-  /**
-   * Fire `onCheckpoint` every N executable steps. Mutually exclusive with
-   * `checkpointWhen`. Default: `max(1, ceil(executableCount / 4))` —
-   * 4 checkpoints across the run, with a floor of every step on tiny pipelines.
-   */
-  readonly checkpointEvery?: number;
-  /**
-   * Predicate variant — fire `onCheckpoint` exactly when this returns true.
-   * Mutually exclusive with `checkpointEvery`.
-   */
-  readonly checkpointWhen?: (params: { stepIndex: number; stepId: string; ctx: unknown }) => boolean;
-  /**
-   * When truthy, deeply freeze the gate / checkpoint snapshot and the
-   * `result.warnings` array. Default false. Pass `"iAcceptThePerformanceCost"`
-   * to bypass `validateRunOptions`' catastrophic-combo guard
-   * (freezeSnapshots: true + checkpointEvery: 1 + steps.length >= 8).
-   */
-  readonly freezeSnapshots?: boolean | "iAcceptThePerformanceCost";
-  /**
-   * Cooperative cancellation signal. Checked at every step boundary inside
-   * `execute()` and forwarded to agent calls in `executeAgent`, foreach
-   * workers, parallel branches, nested workflows, and the `onCheckpoint`
-   * callback's `signal` (so a cancelled run can tear down an in-flight
-   * checkpoint write, if the callback honors it). When the signal aborts,
-   * the workflow tears down to `signal.reason` via the same pending-error path
-   * as any other step failure, so `.catch()` handlers still get a chance to
-   * observe the abort (e.g. for logging/cleanup) — but an abort is sticky and
-   * non-recoverable: even a terminal `.catch()` that returns a value cannot
-   * make the run complete; it still rejects with `signal.reason`. `.finally()`
-   * bodies still run on the abort path. Unlike `freezeSnapshots`, this option DOES
-   * propagate into nested workflows, foreach items, parallel branches, and
-   * repeat loops — cancellation should be transitive.
-   */
-  readonly abortSignal?: AbortSignal;
-  /**
-   * Maximum ms `onCheckpoint` is allowed to run before its AbortSignal fires.
-   * On timeout, a `CheckpointTimeoutError` is raised on the run (catch is
-   * bypassed; original error reaches the caller). Default: no timeout.
-   *
-   * Note: the timeout abandons the *await*, not the *work*. The callback's
-   * AbortSignal fires, but JavaScript can't forcibly cancel an in-flight
-   * promise — a callback that ignores the signal (e.g. a blind S3/Postgres
-   * write) will still complete its side effect after the run has thrown.
-   * Honor the passed `signal` inside `onCheckpoint` to make the timeout real.
-   */
-  readonly checkpointTimeout?: number;
 }
 
 /**
@@ -283,20 +91,14 @@ export const ABORT_STEP_ID = "::pipeai::abort" as const;
 export const GATE_RESUME_STEP_ID = "::pipeai::gate:resume" as const;
 
 /**
- * Thrown internally when `onCheckpoint` exceeds `RunOptions.checkpointTimeout`.
- * Surfaces to the caller as the rejection error.
+ * Prepend a nested-workflow step index to a propagating gate suspension so
+ * resume can descend back to the gate. Returns a fresh snapshot (re-frozen when
+ * `freezeSnapshots` is on) since the original may be frozen.
  */
-export class CheckpointTimeoutError extends Error {
-  readonly timeoutMs: number;
-  constructor(timeoutMs: number) {
-    super(`onCheckpoint exceeded ${timeoutMs}ms timeout`);
-    this.name = "CheckpointTimeoutError";
-    this.timeoutMs = timeoutMs;
-  }
-}
-
-function resolveFreezeSnapshots(state: RuntimeState): boolean {
-  return state.runOptions?.freezeSnapshots ? true : false;
+export function prependNestedPath(snapshot: GateSnapshot, index: number, state: RuntimeState): GateSnapshot {
+  const next: GateSnapshot = { ...snapshot, nestedPath: [index, ...(snapshot.nestedPath ?? [])] };
+  if (resolveFreezeSnapshots(state)) deepFreeze(next);
+  return next;
 }
 
 /**
@@ -318,335 +120,6 @@ export function migrateSnapshot(legacy: LegacyGateSnapshotV1): GateSnapshot {
   };
 }
 
-// ── Shared Agent Step Hooks ─────────────────────────────────────────
-
-/**
- * Discriminated union describing one agent invocation's result.
- *
- * - `mode: "generate"` — `result` is a `GenerateTextResult`; `.text`, `.output`,
- *   `.usage` etc. are synchronous (already-resolved).
- * - `mode: "stream"` — `result` is a `StreamTextResult`; the same fields are
- *   `Promise`s that you must `await` before reading.
- *
- * The shared field set (`ctx`, `input`) is identical across both modes;
- * narrowing on `mode` is only necessary when you need to touch a
- * mode-specific shape.
- */
-export type AgentResultParams<TContext, TOutput, TNextOutput> =
-  | {
-      readonly mode: "generate";
-      readonly result: GenerateTextResult<ToolSet, OutputType<TNextOutput>>;
-      readonly ctx: Readonly<TContext>;
-      readonly input: TOutput;
-    }
-  | {
-      readonly mode: "stream";
-      readonly result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
-      readonly ctx: Readonly<TContext>;
-      readonly input: TOutput;
-    };
-
-export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
-  /**
-   * Transform the agent's result into the next step's input. Fires once per
-   * step regardless of generate-vs-stream mode; discriminate on `mode` if you
-   * need a mode-specific field. Returning the agent's `result.text` works
-   * for both modes (string vs Promise<string>) because `MaybePromise` accepts
-   * either.
-   *
-   * If omitted, the workflow's default extraction is used:
-   *   - With `agent.output` declared → `extractOutput(result, agent.validateOutput)`
-   *   - Without `agent.output` → `result.text` (awaited if stream)
-   */
-  mapResult?: (params: AgentResultParams<TContext, TOutput, TNextOutput>) => MaybePromise<TNextOutput>;
-
-  /**
-   * Observe the agent's result without changing the step's downstream value.
-   * Fires once per step regardless of mode. Use for logging, telemetry,
-   * usage accounting, side-effects that should not affect pipeline data
-   * flow.
-   */
-  onResult?: (params: AgentResultParams<TContext, TOutput, TNextOutput>) => MaybePromise<void>;
-
-  /**
-   * **Stream-mode only.** Override the workflow's default
-   * `writer.merge(result.toUIMessageStream())` call so YOU control how the
-   * agent's stream reaches the outer workflow's UI message stream. Useful
-   * for buffering, transforming, fan-out to multiple writers, or injecting
-   * custom UI messages around the agent's output.
-   *
-   * Has no generate-mode analog because in generate mode there is no stream
-   * to merge. If both `handleStream` and `mapResult`/`onResult` are
-   * configured, `handleStream` runs first.
-   *
-   * `itemIndex` identifies the execution when this hook runs inside a
-   * multi-execution combinator: the numeric index for `foreach` and tuple
-   * `parallel`, the key for record `parallel`, and the matched key / case
-   * index for `branch`. It is `undefined` for a plain single `.step(agent)`.
-   */
-  handleStream?: (params: {
-    result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
-    writer: UIMessageStreamWriter;
-    ctx: Readonly<TContext>;
-    input: TOutput;
-    itemIndex?: number | string;
-  }) => MaybePromise<void>;
-}
-
-// ── Step Options ────────────────────────────────────────────────────
-
-/**
- * Predicate gating whether a step runs. Receives the step's input. When it
- * returns false the step is skipped — its body (agent / fn / sub-workflow) is
- * never invoked.
- */
-export type StepWhen<TContext, TOutput> = (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<boolean>;
-
-/**
- * Produces the step's output when `when` returns false. With it, a skipped
- * step's output is `otherwise(...)` (typed `TNextOutput`, so the step's output
- * type stays `TNextOutput`). Without it, a skipped step passes its input
- * through unchanged (output type widens to `TOutput | TNextOutput`).
- */
-export type StepOtherwise<TContext, TOutput, TNextOutput> = (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TNextOutput>;
-
-/** Conditional-skip options shared by all `step` forms. */
-export interface ConditionalStepOptions<TContext, TOutput, TNextOutput> {
-  /** Run the step only when this returns true. Omit to always run. */
-  when?: StepWhen<TContext, TOutput>;
-  /**
-   * Skip value when `when` is false. Omit for passthrough (input unchanged).
-   * Has no effect without `when` — a lone `otherwise` is never invoked.
-   */
-  otherwise?: StepOtherwise<TContext, TOutput, TNextOutput>;
-}
-
-export type StepOptions<TContext, TOutput, TNextOutput> =
-  AgentStepHooks<TContext, TOutput, TNextOutput>
-  & ConditionalStepOptions<TContext, TOutput, TNextOutput>
-  & {
-    /** Override the default step id (`agent.id`). Required when reusing the same
-     *  agent across multiple steps in one workflow — the construction-time
-     *  `(type, id)` walk rejects duplicates. */
-    id?: string;
-  };
-
-/** Options for the inline `step(id, fn, options?)` form — conditional skip only. */
-export type InlineStepOptions<TContext, TOutput, TNextOutput> = ConditionalStepOptions<TContext, TOutput, TNextOutput>;
-
-/** Options for the nested `step(workflow, options?)` form — conditional skip + id override. */
-export type NestedStepOptions<TContext, TOutput, TNextOutput> =
-  ConditionalStepOptions<TContext, TOutput, TNextOutput> & { id?: string };
-
-/**
- * A step that supplies `when` without `otherwise` may skip to passthrough, so
- * its output widens to `TOutput | TNextOutput`. Supplying `otherwise` (which
- * returns `TNextOutput`) — or omitting `when` — keeps the output `TNextOutput`.
- */
-type SkipPassthrough<TContext, TOutput, TNextOutput> =
-  ConditionalStepOptions<TContext, TOutput, TNextOutput>
-  & { when: StepWhen<TContext, TOutput>; otherwise?: undefined };
-
-// ── Branch Types ────────────────────────────────────────────────────
-
-export interface BranchCase<TContext, TOutput, TNextOutput> extends AgentStepHooks<TContext, TOutput, TNextOutput> {
-  when?: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<boolean>;
-  agent: Agent<TContext, TOutput, TNextOutput>;
-}
-
-export interface BranchSelect<TContext, TOutput, TKeys extends string, TNextOutput> extends AgentStepHooks<TContext, TOutput, TNextOutput> {
-  select: (params: { ctx: Readonly<TContext>; input: TOutput }) => MaybePromise<TKeys>;
-  agents: Record<TKeys, Agent<TContext, TOutput, TNextOutput>>;
-  fallback?: Agent<TContext, TOutput, TNextOutput>;
-  /**
-   * Diagnostic hook invoked when `select` returns a key that has no matching
-   * entry in `agents`. Fires BEFORE `fallback` is applied or
-   * `WorkflowBranchError` is thrown, regardless of whether a `fallback` is
-   * configured. Useful for logging typos / unexpected classifier output.
-   */
-  onUnknownKey?: (params: { key: string; availableKeys: TKeys[]; ctx: Readonly<TContext> }) => void;
-}
-
-// ── Result Types ────────────────────────────────────────────────────
-
-export type WorkflowResult<TOutput> =
-  | { readonly status: "complete"; readonly output: TOutput; readonly warnings: readonly WorkflowWarning[] }
-  | { readonly status: "suspended"; readonly snapshot: GateSnapshot; readonly warnings: readonly WorkflowWarning[] };
-
-export interface WorkflowStreamResult<TOutput> {
-  stream: ReadableStream;
-  output: Promise<WorkflowResult<TOutput>>;   // never rejects on suspension; rejects on real errors
-}
-
-/**
- * Options for `Workflow.stream` / `ResumedWorkflow.stream` /
- * `CheckpointResumedWorkflow.stream`. Forwarded verbatim to the AI SDK's
- * `createUIMessageStream`.
- *
- * Generic over the UI message shape so consumers with a custom
- * `UIMessage<METADATA, DATA_PARTS, TOOLS>` get their narrowed type in
- * `onFinish` / `originalMessages` instead of the unparameterized default.
- *
- * Note: AI SDK's `createUIMessageStream` ALSO accepts an `onStepFinish`
- * (per-token-step) callback. We intentionally do NOT expose it here — there
- * are already two clearer step-finish callbacks at different granularities:
- * - `Agent.onStepFinish` for per-model-call observation, and
- * - `WorkflowObservability.onStepFinish` for per-workflow-step observation.
- * Adding a third one named the same thing on `WorkflowStreamOptions` would
- * be confusing. Reach for one of the two above instead.
- */
-export interface WorkflowStreamOptions<UI_MESSAGE extends UIMessage = UIMessage> {
-  /**
-   * Map an unknown error into a user-visible string. Forwarded as-is to
-   * `createUIMessageStream`'s `onError`. Returning `string` is required by
-   * the AI SDK — the string is what the stream emits to clients.
-   */
-  onError?: (error: unknown) => string;
-  /**
-   * Prior `UIMessage`s the stream should continue from. When provided, the
-   * AI SDK assumes persistence mode and assigns a response-message id.
-   * Used for chat resumption / continuation flows.
-   */
-  originalMessages?: UI_MESSAGE[];
-  /**
-   * Fires once the stream finishes, with the full payload the AI SDK
-   * delivers: the updated `messages` array, the freshly-emitted
-   * `responseMessage`, `isAborted` / `isContinuation` flags, and the
-   * `finishReason`. Use this for persistence, analytics, or downstream
-   * notification.
-   */
-  onFinish?: UIMessageStreamOnFinishCallback<UI_MESSAGE>;
-  /**
-   * Override the response message-id generator. Forwarded to
-   * `createUIMessageStream`'s `generateId` option. Useful for deterministic
-   * IDs in tests or coordinating with a server-side ID space.
-   */
-  generateId?: IdGenerator;
-}
-
-// ── Loop Types ──────────────────────────────────────────────────────
-
-type LoopPredicate<TContext, TOutput> = (params: {
-  output: TOutput;
-  ctx: Readonly<TContext>;
-  iterations: number;
-}) => MaybePromise<boolean>;
-
-/**
- * Loop control for `repeat`. Exactly one of `until` / `while` — never both.
- *
- * Both forms are **do-while**: the body always runs at least once, then the
- * predicate is checked. This is intentional — the predicate receives the
- * body's `output`, which doesn't exist until the body has run — but it means
- * `while: () => false` still executes the body once (it is not a pre-check).
- */
-export type RepeatOptions<TContext, TOutput> =
-  | { until: LoopPredicate<TContext, TOutput>; while?: never; maxIterations?: number }
-  | { while: LoopPredicate<TContext, TOutput>; until?: never; maxIterations?: number };
-
-// Extracts the element type from an array type. Resolves to `never` for non-arrays,
-// making foreach uncallable at compile time when the previous step doesn't produce an array.
-type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
-
-// ── parallel() supporting types ─────────────────────────────────────
-
-/** A target for a `parallel()` branch — agent or sealed workflow. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type ParallelTarget<TContext, TInput> =
-  | Agent<TContext, TInput, any>
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  | SealedWorkflow<TContext, TInput, any>;
-
-/** Extract the output type of a single parallel branch target. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type BranchOutput<T> = T extends Agent<any, any, infer O>
-  ? O
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  : T extends SealedWorkflow<any, any, infer O>
-  ? O
-  : never;
-
-/** Output shape for the record form: `{ [K]: BranchOutput<T[K]> }`. */
-export type ParallelOutputRecord<T extends Record<string, unknown>> = {
-  [K in keyof T]: BranchOutput<T[K]>;
-};
-
-/** Output shape for the tuple form: `[O1, O2, ...]`. */
-export type ParallelOutputTuple<T extends ReadonlyArray<unknown>> = {
-  [K in keyof T]: BranchOutput<T[K]>;
-};
-
-/**
- * Record output when `onError` is supplied: any branch may be `SKIP`ped,
- * leaving its slot `undefined`, so every value is widened to `| undefined`.
- */
-export type ParallelOutputRecordPartial<T extends Record<string, unknown>> = {
-  [K in keyof T]: BranchOutput<T[K]> | undefined;
-};
-
-/** Tuple counterpart of `ParallelOutputRecordPartial` — each slot `| undefined`. */
-export type ParallelOutputTuplePartial<T extends ReadonlyArray<unknown>> = {
-  [K in keyof T]: BranchOutput<T[K]> | undefined;
-};
-
-export interface ParallelOptions<TContext, TOutput = unknown> {
-  /** Override the default step id. Default: `parallel:record` or `parallel:tuple`. */
-  id?: string;
-  /**
-   * Max branches in flight at any moment. **Default: unbounded** (`Infinity` —
-   * all branches run concurrently, clamped only by branch count). Pass an
-   * integer to throttle against provider rate limits.
-   */
-  concurrency?: number;
-  /**
-   * Per-branch error handler. On the no-suspension path, called once per
-   * rejected branch in index order after all settle. Return a value to
-   * substitute, return `Workflow.SKIP` to leave the slot `undefined`, or
-   * rethrow to abort the parallel. A throw (or rethrow) aborts immediately:
-   * rejected branches at indices AFTER the throwing one are neither recovered
-   * nor surfaced as warnings. SKIP works in both the record and tuple
-   * forms (the slot stays `undefined` in place — it does not shift indices);
-   * supplying `onError` widens the output values to `BranchOutput | undefined`
-   * to reflect that a slot may be skipped.
-   *
-   * **Bypassed entirely on the suspension path** (any branch hit a nested
-   * gate) and on the cancellation path (the run was aborted). See README's
-   * "Suspension under `parallel()`" section.
-   */
-  onError?: (params: {
-    error: unknown;
-    /** Branch key in the record form; `undefined` in the tuple form. */
-    key?: string;
-    /** Branch index in the tuple form; `undefined` in the record form. */
-    index?: number;
-    ctx: Readonly<TContext>;
-  }) => unknown | typeof Workflow.SKIP | Promise<unknown | typeof Workflow.SKIP>;
-  /**
-   * **Stream-mode + agent-branch only.** When the workflow is run via
-   * `.stream(...)`, each agent branch runs in stream mode and this hook decides
-   * how its stream surfaces to the writer (`itemIndex` = the record key or the
-   * tuple index). Without it, agent branches run in generate mode (no
-   * auto-merge). Not invoked for `SealedWorkflow` branches (which stream
-   * transitively via their own steps) nor in generate mode.
-   */
-  handleStream?: (params: {
-    // Branch output types vary across the record/tuple, so the result is loosely
-    // typed here — narrow inside the handler if needed.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    result: StreamTextResult<ToolSet, any>;
-    writer: UIMessageStreamWriter;
-    ctx: Readonly<TContext>;
-    input: TOutput;
-    itemIndex: number | string;
-  }) => MaybePromise<void>;
-}
-
-// ── Schema type (structural — works with Zod, Valibot, ArkType, etc.) ──
-
-interface SchemaWithParse<T = unknown> {
-  parse(data: unknown): T;
-}
-
 // ── Step Node ───────────────────────────────────────────────────────
 
 // `nestedWorkflow` is consumed by the recursive `stepShapeHash` walk; runtime
@@ -665,9 +138,13 @@ type StepNode =
       /** Disambiguates observability events. Default `"step"`. */
       readonly category?: StepCategory;
     }
-  | { readonly type: "catch"; readonly id: string; readonly catchFn: (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown> }
+  // catch / finally / gate are `Step` subclasses now; the run loop dispatches
+  // them through `execute` like any other node. Only the fields read OUTSIDE
+  // execute survive on the union: a gate's `schema` / `merge` (read by
+  // `loadState` during resume).
+  | { readonly type: "catch"; readonly id: string; readonly execute: (state: RuntimeState) => MaybePromise<void> }
   | { readonly type: "finally"; readonly id: string; readonly execute: (state: RuntimeState) => MaybePromise<void> }
-  | { readonly type: "gate"; readonly id: string; readonly payload: (state: RuntimeState) => MaybePromise<unknown>; readonly schema?: SchemaWithParse; readonly condition?: (state: RuntimeState) => MaybePromise<boolean>; readonly merge?: (params: { priorOutput: unknown; response: unknown }) => MaybePromise<unknown> };
+  | { readonly type: "gate"; readonly id: string; readonly execute: (state: RuntimeState) => MaybePromise<void>; readonly schema?: SchemaWithParse; readonly merge?: (params: { priorOutput: unknown; response: unknown }) => MaybePromise<unknown> };
 
 /**
  * Maps a step node's category (or non-step type) to the observability event
@@ -692,7 +169,10 @@ function getNestedWorkflows(node: StepNode): readonly SealedWorkflow<any, any, a
   }
 }
 
-interface RuntimeState {
+// Exported at module scope so the extracted `Step` subclasses in `./steps` can
+// type their `execute(state)` bodies. NOT re-exported from `index.ts`, so it
+// stays out of the public package API.
+export interface RuntimeState {
   ctx: unknown;
   output: unknown;
   mode: "generate" | "stream";
@@ -701,6 +181,12 @@ interface RuntimeState {
   suspension?: GateSnapshot;
   warnings?: WorkflowWarning[];
   checkpointFailed?: boolean;
+  // Error channel for the fat-step model and the single source of truth for the
+  // in-flight error: a `Step#execute` body parks its thrown error here instead
+  // of letting it escape, and the run loop + `catch`/`finally` steps read and
+  // clear it. (`catch`/`finally` bodies are the exception — their throws bubble
+  // straight out of `execute` rather than parking here.)
+  pendingError?: PendingError;
   // Same RunOptions seen by execute(); reset to undefined inside nested
   // workflows and omitted from foreach itemState so per-run config doesn't
   // leak into nested execution.
@@ -709,273 +195,45 @@ interface RuntimeState {
   // because — unlike freezeSnapshots — abortSignal SHOULD propagate into
   // nested workflows and foreach items.
   abortSignal?: AbortSignal;
+  // Index of the node the run loop is currently executing. Set per iteration
+  // so a `GateStep` can stamp `resumeFromIndex` into its suspension snapshot
+  // without the loop reaching into the node.
+  stepIndex?: number;
+  // Set only when resuming a NESTED gate: the descent a `NestedWorkflowStep`
+  // follows back down to the suspended child. Consumed (and cleared) one
+  // nesting level at a time. See `ResumeDescent`.
+  resumeDescent?: ResumeDescent;
 }
+
+/**
+ * Drives resume re-entry for a gate that suspended inside nested workflows.
+ * `remaining` is the list of child start-indices to descend through, one per
+ * nesting level, ending with the innermost gate's `resumeFromIndex + 1`. When a
+ * `NestedWorkflowStep` consumes the LAST entry it first seeds `state.output`
+ * with `seedOutput` (the merged gate response) before running the innermost
+ * child from that index.
+ */
+export type ResumeDescent = {
+  readonly remaining: readonly number[];
+  readonly seedOutput: unknown;
+};
 
 // Pending error tracked through a single execute() pass. The `source`
 // discriminant drives the precedence tail
 // (checkpointFailed > finally-wrap > step > suspension) and the onStepError
 // type mapping below.
-type PendingError = {
+export type PendingError = {
   error: unknown;
   stepId: string;
   source: "step" | "gate" | "finally" | "catch" | "onCheckpoint";
 };
 
-/**
- * Map `PendingError.source` to the `WorkflowStepType` value that
- * `onStepError` should report. `onCheckpoint` is mapped to `"step"`,
- * consistent with the `{ stepId: CHECKPOINT_STEP_ID, type: "step" }` contract.
- * Exhaustive switch — adding a new `source` variant is a compile error.
- */
-function pendingErrorSourceToStepType(source: PendingError["source"]): WorkflowStepType {
-  switch (source) {
-    case "step": return "step";
-    case "gate": return "gate";
-    case "finally": return "finally";
-    case "catch": return "catch";
-    case "onCheckpoint": return "step";
-  }
-}
-
-/**
- * Invoke `opts.onCheckpoint(snapshot, { signal })` with optional timeout via
- * AbortSignal. Throws on onCheckpoint failure or timeout
- * (CheckpointTimeoutError). The run loop catches and sets
- * `state.checkpointFailed`, which routes through the precedence tail
- * (checkpointFailed > finally-wrap > original-step > suspension).
- */
-async function emitCheckpoint(
-  state: RuntimeState,
-  opts: RunOptions,
-  resumeFromIndex: number,
-  stepShapeHash: string,
-): Promise<void> {
-  if (!opts.onCheckpoint) return;
-  // When freezing, the checkpoint path keeps executing — so deep-freezing
-  // `state.output` directly would hand the next step a frozen input. Snapshot
-  // an independent clone instead, leaving the live value mutable. (Snapshots
-  // are meant to be serializable for Redis/S3/Postgres persistence, so a
-  // structured clone is sound here.) Without freeze we alias as before.
-  const willFreeze = resolveFreezeSnapshots(state);
-  const snap: CheckpointSnapshot = {
-    version: 2,
-    kind: "checkpoint",
-    resumeFromIndex,
-    output: willFreeze ? structuredClone(state.output) : state.output,
-    stepShapeHash,
-  };
-  if (willFreeze) deepFreeze(snap);
-
-  // The signal handed to onCheckpoint aborts on EITHER the checkpoint timeout
-  // OR a run-level abort, so a cancelled run can tear down an in-flight
-  // checkpoint write — provided the callback honors the signal (JS can't
-  // force-cancel a promise). Forwarding the run abort here only FIRES the
-  // callback's signal; it does not by itself reject this await — the run loop
-  // tears the pipeline down on its next iteration. The timeout, by contrast,
-  // rejects with CheckpointTimeoutError.
-  const controller = new AbortController();
-  const runSignal = state.abortSignal;
-  const onRunAbort = () => controller.abort(runSignal?.reason);
-  if (runSignal) {
-    if (runSignal.aborted) controller.abort(runSignal.reason);
-    else runSignal.addEventListener("abort", onRunAbort, { once: true });
-  }
-
-  try {
-    if (opts.checkpointTimeout === undefined) {
-      await opts.onCheckpoint(snap, { signal: controller.signal });
-      return;
-    }
-    const timeoutMs = opts.checkpointTimeout;
-    // The timeout promise is rejected DIRECTLY by the setTimeout callback (not
-    // by listening to controller.signal), so a run-abort that also aborts the
-    // controller does not masquerade as a CheckpointTimeoutError.
-    let rejectTimeout!: (err: unknown) => void;
-    const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject; });
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-      rejectTimeout(new CheckpointTimeoutError(timeoutMs));
-    }, timeoutMs);
-    try {
-      const callPromise = Promise.resolve(opts.onCheckpoint(snap, { signal: controller.signal }));
-      // Swallow the loser to avoid an unhandled rejection on the race. A
-      // callback that rejects AFTER losing (timeout/abort already fired) would
-      // otherwise vanish — log it so a failed write isn't fully silent.
-      callPromise.catch((err) => {
-        if (controller.signal.aborted) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            "pipeai: onCheckpoint rejected after its timeout/abort fired; the run already surfaced the timeout/abort, so this error is reported only here:",
-            err,
-          );
-        }
-      });
-      timeoutPromise.catch(() => {});
-      await Promise.race([callPromise, timeoutPromise]);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  } finally {
-    if (runSignal) runSignal.removeEventListener("abort", onRunAbort);
-  }
-}
-
-// One-time stream-mode warning when a gate fires with options.onError set.
-let warnedStreamOnErrorOnSuspend = false;
-
-/**
- * @internal — test-only reset of the one-time stream-mode warn dedup.
- */
-export function __resetStreamOnErrorOnSuspendWarnForTests(): void {
-  warnedStreamOnErrorOnSuspend = false;
-}
-
-/**
- * Push an entry onto state.warnings, allocating the array lazily on first use.
- * Centralizes the `(state.warnings ??= []).push({source, stepId, error})` idiom.
- */
-function pushWarning(
-  state: RuntimeState,
-  source: WorkflowWarning["source"],
-  stepId: string,
-  error: unknown,
-): void {
-  (state.warnings ??= []).push({ source, stepId, error });
-}
-
-/**
- * Demote a pendingError into a warning. Used everywhere a new pendingError is
- * about to overwrite the prior one (finally/catch errors after a step error,
- * abort promoted over an in-flight error, suspension-wins tail).
- */
-function demotePendingError(state: RuntimeState, pe: PendingError): void {
-  pushWarning(state, pe.source, pe.stepId, pe.error);
-}
-
-/** A unit (foreach item / parallel branch) that rejected. */
-type UnitFailure = { key: string | number; index: number; error: unknown };
-
-/**
- * Shared concurrent-dispatch core for `foreach` and `parallel`. Runs `count`
- * units through `runUnit(index)` — sequentially when `concurrency <= 1`,
- * otherwise via a worker pool of `min(concurrency, count)` closures sharing a
- * counter (`Infinity` → full fan-out, since `Math.min(Infinity, count) === count`).
- *
- * Both callers share the same post-dispatch contract, handled here:
- *   1. Cooperative cancellation — bail before launching each unit; in-flight
- *      units forwarded the signal so the SDK tears them down.
- *   2. Merge each unit's warnings into the parent, namespaced `id[key]:stepId`.
- *   3. Abort wins over onError AND suspension: pre-abort failures become
- *      `foreach-sibling` warnings, then the abort reason rethrows.
- *   4. A nested-gate rejection suspends (bypassing onError): non-gate failures
- *      become warnings and the lowest-index gate marker rethrows, carrying the
- *      others as sibling errors / suspensions.
- *
- * Returns the non-gate failures (index-sorted) for the caller's `onError`
- * handling. Throws on abort or suspension — callers must run no other cleanup
- * after this resolves on those paths.
- */
-async function runUnitsConcurrently(
-  state: RuntimeState,
-  id: string,
-  count: number,
-  concurrency: number,
-  keyAt: (index: number) => string | number,
-  unitStates: ReadonlyArray<RuntimeState | undefined>,
-  runUnit: (index: number) => Promise<void>,
-): Promise<UnitFailure[]> {
-  const signal = state.abortSignal;
-  const failures: UnitFailure[] = [];
-
-  if (concurrency <= 1) {
-    for (let i = 0; i < count; i++) {
-      if (signal?.aborted) break;
-      try {
-        await runUnit(i);
-      } catch (error) {
-        failures.push({ key: keyAt(i), index: i, error });
-      }
-    }
-  } else {
-    // Worker pool: K closures share `nextIndex` rather than N closures queuing
-    // on a semaphore. The read+increment is synchronous (JS is single-threaded)
-    // and the following `await` yields only AFTER the index is captured.
-    let nextIndex = 0;
-    const worker = async () => {
-      while (true) {
-        const i = nextIndex++;
-        if (i >= count) return;
-        if (signal?.aborted) return;
-        try {
-          await runUnit(i);
-        } catch (error) {
-          failures.push({ key: keyAt(i), index: i, error });
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(concurrency, count) }, () => worker()));
-  }
-
-  failures.sort((a, b) => a.index - b.index);
-
-  // Merge per-unit warnings into the parent (every exit path, once).
-  for (let i = 0; i < count; i++) {
-    const us = unitStates[i];
-    if (!us?.warnings) continue;
-    for (const w of us.warnings) {
-      pushWarning(state, w.source, `${id}[${keyAt(i)}]:${w.stepId}`, w.error);
-    }
-  }
-
-  // Cooperative cancellation wins over onError and suspension (mirror `repeat`,
-  // which rethrows the abort reason rather than routing it through recovery).
-  if (signal?.aborted) {
-    for (const f of failures) {
-      pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
-    }
-    throw signal.reason ?? new Error("Workflow aborted");
-  }
-
-  // Partition gate vs non-gate. `failures` is already index-sorted, so each
-  // partition preserves index order.
-  const gateFailures: UnitFailure[] = [];
-  const nonGateFailures: UnitFailure[] = [];
-  for (const f of failures) {
-    if (f.error instanceof NestedGateUnsupportedError) gateFailures.push(f);
-    else nonGateFailures.push(f);
-  }
-
-  if (gateFailures.length > 0) {
-    // Suspension path — onError is bypassed; non-gate rejections become
-    // warnings and the lowest-index gate marker wins.
-    for (const nr of nonGateFailures) {
-      pushWarning(state, "foreach-sibling", `${id}[${nr.key}]`, nr.error);
-    }
-    const lowest = gateFailures[0].error as NestedGateUnsupportedError;
-    const otherSuspensions = gateFailures.slice(1).map(g => ({
-      index: g.index,
-      gateId: (g.error as NestedGateUnsupportedError).gateId,
-    }));
-    const siblingErrors = nonGateFailures.map(nr => nr.error);
-    throw new NestedGateUnsupportedError(lowest.gateId, lowest.workflowId, siblingErrors, otherSuspensions);
-  }
-
-  return nonGateFailures;
-}
-
-/**
- * Emit the one-shot stream-onError-on-suspend warning if applicable.
- */
-function maybeWarnStreamOnErrorOnSuspend(
-  result: WorkflowResult<unknown>,
-  options: { onError?: (error: unknown) => string } | undefined,
-): void {
-  if (result.status !== "suspended" || !options?.onError || warnedStreamOnErrorOnSuspend) return;
-  warnedStreamOnErrorOnSuspend = true;
-  console.warn(
-    "pipeai: stream() with options.onError suspended at a gate — onError will NOT be invoked for suspension. Discriminate via the resolved output Promise."
-  );
-}
+// Concurrent foreach/parallel dispatch is inlined in each step
+// (`./steps/foreach-step.ts`, `./steps/parallel-step.ts`) over the `Semaphore`
+// primitive; the shared post-settle warning-merge + abort precedence lives in
+// `./steps/concurrent.ts` (`reconcileUnits`). The per-run state, observability
+// dispatch, warning, and checkpoint helpers live in `./runtime` (imported +
+// selectively re-exported at the top of this file).
 
 /**
  * Seed for a run: the initial pipeline `output` plus an optional pre-execute
@@ -983,30 +241,7 @@ function maybeWarnStreamOnErrorOnSuspend(
  * schema-parse + merge vs. plain snapshot output), but every entry point then
  * funnels through the same `runGenerate` / `runStream` machinery.
  */
-type StateSeed = { output: unknown; initialError: PendingError | null };
-
-/**
- * Build the per-run `RuntimeState`. Centralizes the shape every entry point
- * (generate/stream + gate/checkpoint resume) used to hand-construct. `abortSignal`
- * is always sourced from `opts` so cancellation is honored uniformly — the
- * checkpoint-resume path previously omitted it.
- */
-function makeRuntimeState(
-  ctx: unknown,
-  output: unknown,
-  mode: "generate" | "stream",
-  opts: RunOptions | undefined,
-  writer?: UIMessageStreamWriter,
-): RuntimeState {
-  return {
-    ctx,
-    output,
-    mode,
-    ...(writer ? { writer } : {}),
-    runOptions: opts,
-    abortSignal: opts?.abortSignal,
-  };
-}
+type StateSeed = { output: unknown; initialError: PendingError | null; resumeDescent?: ResumeDescent };
 
 // ── Sealed Workflow (returned by finally — execution only) ───────────
 
@@ -1135,9 +370,6 @@ export class SealedWorkflow<
     if (opts.checkpointEvery !== undefined && (!Number.isInteger(opts.checkpointEvery) || opts.checkpointEvery < 1)) {
       throw new Error(`RunOptions: checkpointEvery must be a positive integer, got ${opts.checkpointEvery}`);
     }
-    if (opts.checkpointTimeout !== undefined && (!Number.isFinite(opts.checkpointTimeout) || opts.checkpointTimeout < 1)) {
-      throw new Error(`RunOptions: checkpointTimeout must be a finite positive number (ms), got ${opts.checkpointTimeout}`);
-    }
     const length = this.cachedExecutableStepCount;
     // Cadence is computed from the checkpointable-step count (gates excluded)
     // so this guard predicts the actual runtime cadence; `length` stays the
@@ -1173,6 +405,10 @@ export class SealedWorkflow<
    * `await` the result — `await undefined` is sync, so the no-hook path
    * stays allocation-free.
    */
+  // Thin delegates to the free `fireHook` / `hasItemHooks` (which take an
+  // explicit observability). Kept as methods so the loop's many `this.fireHook`
+  // call sites stay unchanged; bare `fireHook` / `hasItemHooks` below resolve to
+  // the module-level functions, not these members.
   protected fireHook<
     K extends keyof WorkflowObservability,
     E extends Parameters<NonNullable<WorkflowObservability[K]>>[0],
@@ -1181,44 +417,11 @@ export class SealedWorkflow<
     name: K,
     event: E,
   ): MaybePromise<unknown> {
-    const hook = this.observability?.[name];
-    if (!hook) return undefined;
-    return this.fireHookSlow(state, name, event, hook);
+    return fireHook(this.observability, state, name, event);
   }
 
-  private async fireHookSlow<K extends keyof WorkflowObservability>(
-    state: RuntimeState,
-    name: K,
-    event: unknown,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    hook: any,
-  ): Promise<unknown> {
-    try {
-      await hook(event);
-      return undefined;
-    } catch (e) {
-      if (name !== "onStepError") {
-        const stepId = (event as { stepId: string }).stepId;
-        // No cast: every WorkflowObservability hook name (onStep* / onItem*)
-        // is a member of WorkflowWarning["source"], so the type checker
-        // verifies the warning source is representable in the public union.
-        pushWarning(state, name, stepId, e);
-        // eslint-disable-next-line no-console
-        console.error(`pipeai: ${name} hook threw for stepId "${stepId}":`, e);
-      }
-      return e;
-    }
-  }
-
-  /**
-   * True when any per-item observability hook is registered. Lets `foreach` /
-   * `parallel` skip per-item `performance.now()` timing and event-object
-   * allocation entirely on hook-less runs — the scaling-sensitive path, since
-   * every one of N items/branches otherwise pays it for nothing.
-   */
   protected hasItemHooks(): boolean {
-    const o = this.observability;
-    return !!o && !!(o.onItemStart || o.onItemFinish || o.onItemError);
+    return hasItemHooks(this.observability);
   }
 
   /**
@@ -1306,9 +509,10 @@ export class SealedWorkflow<
     seed: () => MaybePromise<StateSeed>,
   ): Promise<WorkflowResult<TOutput>> {
     this.validateRunOptions(opts);
-    const { output, initialError } = await seed();
-    const state = makeRuntimeState(ctx, output, "generate", opts);
-    await this.execute(state, startIndex, opts, initialError);
+    const seeded = await seed();
+    const state = makeRuntimeState(ctx, seeded.output, "generate", opts);
+    if (seeded.resumeDescent) state.resumeDescent = seeded.resumeDescent;
+    await this.execute(state, startIndex, opts, seeded.initialError);
     return this.buildResult(state);
   }
 
@@ -1337,9 +541,10 @@ export class SealedWorkflow<
         // not escape synchronously from `.stream(...)`. The resume seeds catch
         // their own errors into `initialError` so `.catch()` can observe them.
         try {
-          const { output, initialError } = await seed();
-          const state = makeRuntimeState(ctx, output, "stream", opts, writer);
-          await this.execute(state, startIndex, opts, initialError);
+          const seeded = await seed();
+          const state = makeRuntimeState(ctx, seeded.output, "stream", opts, writer);
+          if (seeded.resumeDescent) state.resumeDescent = seeded.resumeDescent;
+          await this.execute(state, startIndex, opts, seeded.initialError);
           const result = this.buildResult(state);
           maybeWarnStreamOnErrorOnSuspend(result, options);
           resolveOutput(result);
@@ -1386,11 +591,13 @@ export class SealedWorkflow<
     // block, so they don't advance this counter — unlike the raw index `i`).
     let executableStepsSeen = 0;
 
-    // `initialError` lets callers (e.g. ResumedWorkflow.stream) seed the
-    // pipeline already-in-error so a pre-execute failure (schema.parse,
-    // merge throw) flows through downstream `.catch()` like any other step
-    // failure instead of escaping synchronously.
-    let pendingError: PendingError | null = initialError;
+    // `state.pendingError` is the single source of truth for the in-flight
+    // error — steps park their captured throws there, and `catch`/`finally`
+    // steps read/clear it. `initialError` lets callers (e.g.
+    // ResumedWorkflow.stream) seed the pipeline already-in-error so a
+    // pre-execute failure (schema.parse, merge throw) flows through downstream
+    // `.catch()` like any other step failure instead of escaping synchronously.
+    state.pendingError = initialError ?? undefined;
 
     // Tracks whether the abort signal has already been promoted into
     // pendingError in this execute() pass. On first observation we discard
@@ -1414,167 +621,96 @@ export class SealedWorkflow<
         if (!abortPromoted) {
           abortPromoted = true;
           state.suspension = undefined;
-          if (pendingError) demotePendingError(state, pendingError);
-          pendingError = makeAbortError(state.abortSignal);
-        } else if (!pendingError) {
+          if (state.pendingError) demotePendingError(state, state.pendingError);
+          state.pendingError = makeAbortError(state.abortSignal);
+        } else if (!state.pendingError) {
           // A catch handler swallowed the abort. Re-promote so downstream
           // steps still see the signal as the "stop" condition the caller
           // requested.
-          pendingError = makeAbortError(state.abortSignal);
+          state.pendingError = makeAbortError(state.abortSignal);
         }
       }
 
       const node = this.steps[i];
 
-      if (node.type === "finally") {
-        const stepId = node.id;
-        const finStart = performance.now();
-        await this.fireHook(state, "onStepStart", { stepId, type: "finally", ctx: state.ctx, input: state.output });
-        try {
-          await node.execute(state);
-          await this.fireHook(state, "onStepFinish", {
-            stepId, type: "finally", ctx: state.ctx, output: state.output,
-            durationMs: performance.now() - finStart, suspended: false,
-          });
-        } catch (e) {
-          // Honor the onStepError cause-attachment contract: if the hook
-          // throws, its error attaches as `cause` on this finally error e
-          // (which becomes pendingError below).
-          await this.fireStepErrorAndAttachCause(state, {
-            stepId, type: "finally", ctx: state.ctx, error: e,
-            durationMs: performance.now() - finStart,
-          });
-          // Multi-error preservation: never silently overwrite a prior pendingError —
-          // push it to warnings before promoting this finally error.
-          if (pendingError) demotePendingError(state, pendingError);
-          pendingError = { error: e, stepId, source: "finally" };
-        }
-        continue;
-      }
+      // Run policy per kind — skipped nodes fire NO hooks (preserves the prior
+      // per-branch `continue`s). `finally` always runs (cleanup); `catch` runs
+      // only on a pending error and never while suspended / after a checkpoint
+      // failure; every other kind is skipped while suspended or in error. The
+      // step subclasses encode the same policy in their own `shouldSkip`; this
+      // mirror is what gates hook-firing, which is the loop's concern.
+      const skip =
+        node.type === "finally" ? false
+        : node.type === "catch" ? (!!state.suspension || !state.pendingError || !!state.checkpointFailed)
+        : (!!state.suspension || !!state.pendingError);
+      if (skip) continue;
 
-      if (node.type === "catch") {
-        // .catch() bypassed on suspension AND on checkpoint failure (checkpoint failure propagates to caller).
-        if (state.suspension || !pendingError || state.checkpointFailed) continue;
-        const stepId = node.id;
-        const cStart = performance.now();
-        await this.fireHook(state, "onStepStart", { stepId, type: "catch", ctx: state.ctx, input: state.output });
-        try {
-          state.output = await node.catchFn({
-            error: pendingError.error,
-            ctx: state.ctx,
-            lastOutput: state.output,
-            stepId: pendingError.stepId,
-          });
-          pendingError = null;
-          await this.fireHook(state, "onStepFinish", {
-            stepId, type: "catch", ctx: state.ctx, output: state.output,
-            durationMs: performance.now() - cStart, suspended: false,
-          });
-        } catch (e) {
-          await this.fireStepErrorAndAttachCause(state, {
-            stepId, type: "catch", ctx: state.ctx, error: e,
-            durationMs: performance.now() - cStart,
-          });
-          if (pendingError) demotePendingError(state, pendingError);
-          pendingError = { error: e, stepId, source: "catch" };
-        }
-        continue;
-      }
-
-      // Skip remaining non-finally/non-catch nodes when suspended or in error state.
-      if (state.suspension || pendingError) continue;
-
-      if (node.type === "gate") {
-        // Capture errors from condition/payload callbacks into pendingError so
-        // they route through the workflow's .catch() pipeline like any other
-        // step error. Without this, a throwing gate callback escapes execute()
-        // entirely and bypasses all downstream catch nodes.
-        const stepId = node.id;
-        const gStart = performance.now();
-        await this.fireHook(state, "onStepStart", { stepId, type: "gate", ctx: state.ctx, input: state.output });
-        try {
-          if (node.condition && !(await node.condition(state))) {
-            // Cond returned false — skip the gate. Fire onStepFinish({ suspended: false }).
-            await this.fireHook(state, "onStepFinish", {
-              stepId, type: "gate", ctx: state.ctx, output: state.output,
-              durationMs: performance.now() - gStart, suspended: false,
-            });
-            continue;
-          }
-          const snapshot: GateSnapshot = {
-            version: 2,
-            kind: "gate",
-            resumeFromIndex: i,
-            output: state.output,
-            gateId: node.id,
-            gatePayload: await node.payload(state),
-          };
-          state.suspension = snapshot;
-          if (resolveFreezeSnapshots(state)) deepFreeze(snapshot);
-          await this.fireHook(state, "onStepFinish", {
-            stepId, type: "gate", ctx: state.ctx, output: state.output,
-            durationMs: performance.now() - gStart, suspended: true,
-          });
-        } catch (e) {
-          // A throwing gate condition/payload is a gate body failure: fire
-          // onStepError with type "gate" (parity with the step path below)
-          // and tag the pending error source "gate" so the suspension-wins
-          // tail also reports type "gate", not "step". If the onStepError hook
-          // itself throws, attach its error as `cause`, exactly like a step.
-          pendingError = { error: e, stepId: node.id, source: "gate" };
-          await this.fireStepErrorAndAttachCause(state, {
-            stepId: node.id, type: "gate", ctx: state.ctx, error: e,
-            durationMs: performance.now() - gStart,
-          });
-        }
-        continue;
-      }
-
-      // type === "step" — driven by `category` for observability type reporting.
+      // Uniform dispatch: every node is a `Step`. A normal step runs its body
+      // and parks any error on `state.pendingError` (recoverable by `.catch()`).
+      // The error-handling layer is different: a `catch`/`finally` body that
+      // throws does NOT park — it bubbles out of `execute`. We surface it to
+      // observers via onStepError, then re-throw so it leaves the run (no
+      // `.catch()`, no aggregation). Observability type comes from the category.
       const obsType = getObservabilityType(node);
       const stepId = node.id;
       const sStart = performance.now();
-      const stepInput = state.output;
-      await this.fireHook(state, "onStepStart", { stepId, type: obsType, ctx: state.ctx, input: stepInput });
+      const errBefore = state.pendingError;
+      // A `finally` runs while a gate's suspension is still parked; only the
+      // gate that NEWLY parks one reports `suspended: true`. Capture the prior
+      // state so the finish hook attributes suspension to the right node.
+      const suspendedBefore = !!state.suspension;
+      state.stepIndex = i;   // consumed by GateStep for `resumeFromIndex`.
+      await this.fireHook(state, "onStepStart", { stepId, type: obsType, ctx: state.ctx, input: state.output });
       try {
         await node.execute(state);
-        await this.fireHook(state, "onStepFinish", {
-          stepId, type: obsType, ctx: state.ctx, output: state.output,
-          durationMs: performance.now() - sStart, suspended: false,
-        });
       } catch (e) {
-        pendingError = { error: e, stepId: node.id, source: "step" };
-        // onStepError special-cases: if the hook throws, attach the obsError as
-        // `cause` on the original step error so the original reaches the caller
-        // with the failure trail attached. Other hooks' throws become warnings.
         await this.fireStepErrorAndAttachCause(state, {
           stepId, type: obsType, ctx: state.ctx, error: e,
           durationMs: performance.now() - sStart,
         });
+        throw e;
       }
 
-      // Defensive invariant: only gate nodes set state.suspension, and
-      // executeNestedWorkflow/foreach clear inner suspension before rethrowing.
-      // A non-undefined value here means a coding bug bypassed that contract.
-      // The cast is needed because TS narrowed suspension to undefined at the
-      // top-of-loop falsy check and doesn't know the await may have mutated it.
-      const leaked = (state as { suspension?: GateSnapshot }).suspension;
-      if (leaked) {
+      // Reconcile observability against what the step did. A newly-parked error
+      // (distinct from the one we entered with) routes to onStepError, typed by
+      // the node's category and honoring the cause-attachment contract;
+      // otherwise the step finished — `suspended` reflects a gate parking.
+      const newError = state.pendingError && state.pendingError !== errBefore ? state.pendingError : null;
+      if (newError) {
+        await this.fireStepErrorAndAttachCause(state, {
+          stepId, type: obsType, ctx: state.ctx, error: newError.error,
+          durationMs: performance.now() - sStart,
+        });
+      } else {
+        await this.fireHook(state, "onStepFinish", {
+          stepId, type: obsType, ctx: state.ctx, output: state.output,
+          durationMs: performance.now() - sStart, suspended: !suspendedBefore && !!state.suspension,
+        });
+      }
+
+      // Defensive invariant: only a gate — or a `nested` step propagating a
+      // child gate's suspension up — may park a suspension. A `type:"step"` node
+      // is skipped while suspended (above), so a suspension present after any
+      // OTHER category's body leaked from a coding bug. (foreach/parallel run
+      // branches on separate item states, so they never set the parent's
+      // suspension; repeat forbids gated targets at build time.)
+      if (node.type === "step" && node.category !== "nested" && state.suspension) {
+        const leaked = state.suspension;
         state.suspension = undefined;
         throw new Error(`internal: suspension bubbled from non-gate step "${node.id}" (gate "${leaked.gateId}").`);
       }
 
-      // Emit a checkpoint after a successful step body. Skipped on pendingError
-      // (the step threw — no clean state to snapshot) or on suspension (gate
-      // already won). Numeric `checkpointEvery` (default: max(1, ceil(count/4)))
-      // uses the loop-hoisted `ckptCadence`; predicate form runs per step.
-      // Note: a `when:false`-skipped `type:"step"` node returns normally (its
-      // body never ran), so it still reaches this block — it advances
-      // `executableStepsSeen` and can itself be a checkpoint boundary whose
-      // snapshot.output is the passthrough/`otherwise` value. This keeps the
-      // cadence denominator (cachedCheckpointableStepCount, which counts every
-      // `type:"step"` node) consistent with the runtime counter.
-      if (!pendingError && !state.suspension && opts?.onCheckpoint) {
+      // Emit a checkpoint after a successful `type:"step"` body. Skipped on
+      // pendingError (no clean state to snapshot), on suspension (gate already
+      // won), and for catch/finally/gate nodes (not checkpointable). Numeric
+      // `checkpointEvery` (default: max(1, ceil(count/4))) uses the loop-hoisted
+      // `ckptCadence`; predicate form runs per step. Note: a `when:false`-skipped
+      // `type:"step"` node returns normally (its body never ran), so it still
+      // reaches this block — it advances `executableStepsSeen` and can itself be
+      // a checkpoint boundary. This keeps the cadence denominator
+      // (cachedCheckpointableStepCount, which counts every `type:"step"` node)
+      // consistent with the runtime counter.
+      if (node.type === "step" && !state.pendingError && !state.suspension && opts?.onCheckpoint) {
         executableStepsSeen++;
         const shouldCheckpoint = opts.checkpointWhen
           ? opts.checkpointWhen({ stepIndex: i, stepId: node.id, ctx: state.ctx })
@@ -1589,7 +725,7 @@ export class SealedWorkflow<
               this.cachedStepShapeHash,
             );
           } catch (e) {
-            pendingError = { error: e, stepId: CHECKPOINT_STEP_ID, source: "onCheckpoint" };
+            state.pendingError = { error: e, stepId: CHECKPOINT_STEP_ID, source: "onCheckpoint" };
             state.checkpointFailed = true;
             // Route through onStepError with the synthetic CHECKPOINT_STEP_ID
             // and type: "step" (matches pendingErrorSourceToStepType("onCheckpoint")).
@@ -1611,31 +747,31 @@ export class SealedWorkflow<
     // Guarded by `abortPromoted`: only re-promote an abort already observed
     // during this pass (a catch cleared it), not one whose checkpointFailed
     // precedence must win below.
-    if (abortPromoted && !pendingError && !state.suspension && state.abortSignal?.aborted) {
-      pendingError = makeAbortError(state.abortSignal);
+    if (abortPromoted && !state.pendingError && !state.suspension && state.abortSignal?.aborted) {
+      state.pendingError = makeAbortError(state.abortSignal);
     }
 
     // Tail — mutually exclusive branches.
-    // Precedence: checkpointFailed > finally-wrap > original-step > suspension.
-    if (pendingError && !state.suspension) {
+    // Precedence: checkpointFailed > original-step error > suspension.
+    // (A throwing catch/finally never reaches here — it bubbles straight out of
+    // the loop, so there is no finally-aggregation branch.)
+    if (state.pendingError && !state.suspension) {
+      const pe = state.pendingError;
       if (state.checkpointFailed) {
         // The checkpoint error reaches the caller bare. Every OTHER error
-        // accumulated this run — step/gate/catch/finally errors demoted to
-        // warnings, plus a pending non-checkpoint error (e.g. a finally that
-        // threw after the checkpoint failed) — cannot ride the rejection (it
-        // carries a single error, not the warnings array), so surface them via
-        // console.warn rather than dropping them silently. (Previously only
-        // `finally`-source errors were logged; a demoted step/catch/gate error
-        // vanished entirely.)
+        // accumulated this run — step/gate errors demoted to warnings (e.g. by
+        // abort promotion) — cannot ride the rejection (it carries a single
+        // error, not the warnings array), so surface them via console.warn
+        // rather than dropping them silently.
         const warningsArr = state.warnings ?? [];
-        const checkpointError = pendingError.source === "onCheckpoint"
-          ? pendingError.error
+        const checkpointError = pe.source === "onCheckpoint"
+          ? pe.error
           : warningsArr.find(w => w.source === "onCheckpoint")?.error;
         const suppressed = warningsArr
           .filter(w => w.error !== checkpointError)
           .map(w => w.error);
-        if (pendingError.source !== "onCheckpoint" && pendingError.error !== checkpointError) {
-          suppressed.push(pendingError.error);
+        if (pe.source !== "onCheckpoint" && pe.error !== checkpointError) {
+          suppressed.push(pe.error);
         }
         if (suppressed.length > 0) {
           console.warn(
@@ -1643,141 +779,56 @@ export class SealedWorkflow<
             suppressed,
           );
         }
-        throw checkpointError ?? pendingError.error;
+        throw checkpointError ?? pe.error;
       }
-      const isFinallyPath = pendingError.source === "finally"
-        || (state.warnings?.some(w => w.source === "finally") ?? false);
-      if (isFinallyPath) {
-        // Source order: warnings were pushed in the order errors occurred (step
-        // before finally, earlier finally before later finally), so this preserves
-        // the chronological sequence the plan specifies. Single-error case included
-        // — once any finally is in the picture, the contract is AggregateError.
-        const all = [...(state.warnings ?? []).map(w => w.error), pendingError.error];
-        throw new AggregateError(all, `Workflow failed with ${all.length} error(s) from .finally() bodies`);
-      }
-      throw pendingError.error;
-    } else if (pendingError && state.suspension) {
+      throw pe.error;
+    } else if (state.pendingError && state.suspension) {
       // Suspension wins; preserve the step error as a warning.
-      demotePendingError(state, pendingError);
+      const pe = state.pendingError;
+      demotePendingError(state, pe);
       // Also emit onStepError so observers can see the loss.
       try {
         await this.observability?.onStepError?.({
-          stepId: pendingError.stepId,
-          type: pendingErrorSourceToStepType(pendingError.source),
+          stepId: pe.stepId,
+          type: pendingErrorSourceToStepType(pe.source),
           ctx: state.ctx,
-          error: pendingError.error,
+          error: pe.error,
           durationMs: 0,
         });
       } catch (obsError) {
-        pushWarning(state, "onStepError", pendingError.stepId, obsError);
+        pushWarning(state, "onStepError", pe.stepId, obsError);
       }
-      pendingError = null;
+      state.pendingError = undefined;
     }
   }
 
-  // ── Internal: execute a nested workflow within a step/loop ─────
-  // Defined on SealedWorkflow (not Workflow) because TypeScript's protected
-  // access rules only allow calling workflow.execute() from the same class.
-  //
-  // Contract: clears any inner suspension before re-throwing as
-  // NestedGateUnsupportedError. The outer execute() therefore never observes
-  // a leaked `state.suspension` from non-gate nodes (defensive invariant).
-
-  protected async executeNestedWorkflow(
-    state: RuntimeState,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    workflow: SealedWorkflow<TContext, unknown, unknown, any>,
-  ): Promise<void> {
-    // RunOptions is run-scoped — child never inherits parent's runOptions.
-    // state.warnings IS propagated (asymmetric on purpose: telemetry > config).
+  /**
+   * Run THIS sealed workflow as a nested step on the caller's run `state`.
+   * Public (internal; not re-exported from index) so `Step` subclasses —
+   * `nested` / `repeat` / `foreach` / `parallel` with `SealedWorkflow` targets
+   * — can run a sub-workflow without reaching the protected `execute`.
+   *
+   * Contract: RunOptions is run-scoped, so the child never inherits the
+   * parent's (`state.warnings` IS propagated — telemetry > config). A gate
+   * inside the child leaves `state.suspension` set so it propagates up (only a
+   * `.step(workflow)` ever does this — concurrent/looped combinators forbid
+   * gated targets at build time).
+   */
+  async executeAsNested(state: RuntimeState, startIndex: number = 0): Promise<void> {
     const savedRunOptions = state.runOptions;
     state.runOptions = undefined;
     try {
-      await workflow.execute(state);
+      await this.execute(state, startIndex);
     } finally {
       state.runOptions = savedRunOptions;
     }
-    if (state.suspension) {
-      const gateId = state.suspension.gateId;
-      state.suspension = undefined;   // clear before throw (load-bearing invariant 1)
-      throw new NestedGateUnsupportedError(gateId, workflow.id);
-    }
-  }
-
-  // ── Internal: execute an agent within a step/branch ───────────
-  // In stream mode, output extraction awaits the full stream before returning.
-  // Streaming benefits the client (incremental output), not pipeline throughput —
-  // each step still runs sequentially.
-
-  protected async executeAgent<TAgentInput, TNextOutput>(
-    state: RuntimeState,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: Agent<TContext, any, TNextOutput>,
-    ctx: TContext,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    options?: AgentStepHooks<TContext, any, TNextOutput>,
-    // Identifies the execution to `handleStream` inside foreach / parallel /
-    // branch (numeric index, record key, or matched case). Undefined for a
-    // plain single `.step(agent)`.
-    itemIndex?: number | string,
-  ): Promise<void> {
-    const input = state.output as TAgentInput;
-    const hasStructuredOutput = agent.hasOutput;
-
-    const abortSignal = state.abortSignal;
-    const agentCallOpts = abortSignal ? { abortSignal } : undefined;
-
-    if (state.mode === "stream" && state.writer) {
-      const writer = state.writer;
-      // Run inside writer context so tools accessed via getActiveWriter() pick it up.
-      await runWithWriter(writer, async () => {
-        const result = await (agent.stream as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<StreamTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
-
-        if (options?.handleStream) {
-          await options.handleStream({ result, writer, ctx, input, itemIndex });
-        } else {
-          writer.merge(result.toUIMessageStream());
-        }
-
-        const hookParams = {
-          mode: "stream",
-          result,
-          ctx: ctx as Readonly<TContext>,
-          input,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        } as AgentResultParams<TContext, any, TNextOutput>;
-
-        if (options?.onResult) {
-          await options.onResult(hookParams);
-        }
-
-        if (options?.mapResult) {
-          state.output = await options.mapResult(hookParams);
-        } else {
-          state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
-        }
-      });
-    } else {
-      const result = await (agent.generate as (ctx: TContext, input: unknown, opts?: { abortSignal?: AbortSignal }) => Promise<GenerateTextResult<ToolSet, OutputType<TNextOutput>>>)(ctx, state.output, agentCallOpts);
-
-      const hookParams = {
-        mode: "generate",
-        result,
-        ctx: ctx as Readonly<TContext>,
-        input,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as AgentResultParams<TContext, any, TNextOutput>;
-
-      if (options?.onResult) {
-        await options.onResult(hookParams);
-      }
-
-      if (options?.mapResult) {
-        state.output = await options.mapResult(hookParams);
-      } else {
-        state.output = await extractOutput(result, hasStructuredOutput, agent.validateOutput);
-      }
-    }
+    // A gate inside this nested workflow leaves `state.suspension` set; it
+    // propagates up as a first-class suspension (NOT an error). The calling
+    // `NestedWorkflowStep` prepends its own step index to the snapshot path so
+    // resume can descend back here, and the run loop relaxes its
+    // leaked-suspension invariant for `nested` nodes. (Concurrent/looped
+    // combinators — foreach / parallel / repeat — forbid gated targets at build
+    // time, so they never observe a propagated suspension.)
   }
 
   // ── Gate: load persisted state for resumption ──────────────────
@@ -1797,6 +848,39 @@ export class SealedWorkflow<
       );
     }
     this.ensureDuplicateCheck();
+
+    const nestedPath = (gateLike as GateSnapshot).nestedPath;
+    if (nestedPath && nestedPath.length > 0) {
+      // Nested gate: walk the path to the innermost workflow that owns the gate
+      // (for its schema/merge), then resume the ROOT at the first nested step
+      // and descend back down (see `ResumeDescent`).
+      let steps: ReadonlyArray<StepNode> = this.steps;
+      for (const idx of nestedPath) {
+        const node = steps[idx];
+        const child = node?.type === "step" ? node.nestedWorkflow : undefined;
+        if (!child) {
+          throw new Error(`loadState: nested gate "${gateId}" path is stale — step ${idx} is not a nested workflow.`);
+        }
+        steps = child.getStepsForShapeHash();
+      }
+      const innerGate = steps[gateLike.resumeFromIndex];
+      if (innerGate?.type !== "gate" || innerGate.id !== gateId) {
+        throw new Error(`loadState: nested gate "${gateId}" not found at the recorded path.`);
+      }
+      // Descent: root resumes from nestedPath[0]; each nested step descends the
+      // next path index; the innermost runs from gate+1 with the merged response.
+      const remaining = [...nestedPath.slice(1), gateLike.resumeFromIndex + 1];
+      return new ResumedWorkflow<TContext, TGates[K], TOutput>(this.steps, nestedPath[0], {
+        mode: "gate",
+        schema: innerGate.schema as SchemaWithParse<TGates[K]> | undefined,
+        mergeFn: innerGate.merge,
+        priorOutput: gateLike.output,
+        snapshot: gateLike,
+        observability: this.observability,
+        nestedRemaining: remaining,
+      });
+    }
+
     const gateIndex = this.findGateIndex(gateLike);
     const gateNode = this.steps[gateIndex] as Extract<StepNode, { type: "gate" }>;
     return new ResumedWorkflow<TContext, TGates[K], TOutput>(this.steps, gateIndex + 1, {
@@ -1806,7 +890,7 @@ export class SealedWorkflow<
       priorOutput: gateLike.output,
       snapshot: gateLike,
       observability: this.observability,
-    }); 
+    });
   }
 
   // ── Checkpoint resume ──────────────────────────────────────────
@@ -1864,19 +948,15 @@ export class SealedWorkflow<
   /**
    * Append a `.finally()` body to a sealed workflow, returning another sealed
    * workflow. Allows multi-finally chains (`.finally().finally()`). A throwing
-   * `.finally` body does NOT abort subsequent ones — they all run.
+   * `.finally` body bubbles straight out of the run: it is non-recoverable, does
+   * NOT aggregate with a prior error, and subsequent `.finally()` bodies do not
+   * run. (See {@link FinallyStep} for the full contract.)
    */
   finally(
     id: string,
     fn: (params: { ctx: Readonly<TContext> }) => MaybePromise<void>,
   ): SealedWorkflow<TContext, TInput, TOutput, TGates> {
-    const node: StepNode = {
-      type: "finally",
-      id,
-      execute: async (state) => {
-        await fn({ ctx: state.ctx as Readonly<TContext> });
-      },
-    };
+    const node = new FinallyStep(id, fn as (params: { ctx: Readonly<unknown> }) => MaybePromise<void>);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return new SealedWorkflow<TContext, TInput, TOutput, TGates>([...this.steps, node] as any, this.id, this.observability);
   }
@@ -1921,6 +1001,13 @@ interface ResumedWorkflowConfig {
   readonly priorOutput?: unknown;
   readonly snapshot?: WorkflowSnapshot;
   readonly observability?: WorkflowObservability;
+  /**
+   * Set only for a NESTED gate resume: the descent (child start-indices per
+   * level, innermost-last) the merged gate response rides down to the suspended
+   * child. When present, `startIndex` is the ROOT's nested-step index and the
+   * seed sets `state.resumeDescent` instead of the root `output`.
+   */
+  readonly nestedRemaining?: readonly number[];
 }
 
 export class ResumedWorkflow<
@@ -1932,6 +1019,7 @@ export class ResumedWorkflow<
   private readonly schema?: SchemaWithParse<TResponse>;
   private readonly mergeFn?: (params: { priorOutput: unknown; response: unknown }) => MaybePromise<unknown>;
   private readonly priorOutput: unknown;
+  private readonly nestedRemaining?: readonly number[];
 
   /** @internal */
   constructor(
@@ -1944,6 +1032,7 @@ export class ResumedWorkflow<
     this.schema = config.schema as SchemaWithParse<TResponse> | undefined;
     this.mergeFn = config.mergeFn;
     this.priorOutput = config.priorOutput;
+    this.nestedRemaining = config.nestedRemaining;
   }
 
   private validateResponse(response: TResponse): TResponse {
@@ -1963,10 +1052,20 @@ export class ResumedWorkflow<
   private async seedFromResponse(rawResponse: TResponse): Promise<StateSeed> {
     try {
       const response = this.validateResponse(rawResponse);
-      const output = this.mergeFn
+      const merged = this.mergeFn
         ? await this.mergeFn({ priorOutput: this.priorOutput, response })
         : response;
-      return { output, initialError: null };
+      if (this.nestedRemaining) {
+        // Nested gate: the merged response rides the descent down to the
+        // suspended child. The root output is unused (the first node executed is
+        // the descent's nested step), so park `priorOutput` there.
+        return {
+          output: this.priorOutput,
+          initialError: null,
+          resumeDescent: { remaining: this.nestedRemaining, seedOutput: merged },
+        };
+      }
+      return { output: merged, initialError: null };
     } catch (error) {
       return { output: this.priorOutput, initialError: { error, stepId: GATE_RESUME_STEP_ID, source: "step" } };
     }
@@ -2117,15 +1216,19 @@ export class Workflow<
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
   // ── step: nested workflow overload ─────────────────────────────
+  // The child's gates fold into the parent's `TGates` (`TGates & TChildGates`),
+  // so a nested gate is resumable by id via `loadState` AND surfaces to the
+  // build-time guard on `foreach`/`parallel`/`repeat` (which forbid gated
+  // targets at any nesting depth).
 
-  step<TNextOutput>(
-    workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
+  step<TNextOutput, TChildGates extends Record<string, unknown> = {}>(
+    workflow: SealedWorkflow<TContext, TOutput, TNextOutput, TChildGates>,
     options: NestedStepOptions<TContext, TOutput, TNextOutput> & SkipPassthrough<TContext, TOutput, TNextOutput>
-  ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates>;
-  step<TNextOutput>(
-    workflow: SealedWorkflow<TContext, TOutput, TNextOutput>,
+  ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates & TChildGates>;
+  step<TNextOutput, TChildGates extends Record<string, unknown> = {}>(
+    workflow: SealedWorkflow<TContext, TOutput, TNextOutput, TChildGates>,
     options?: NestedStepOptions<TContext, TOutput, TNextOutput>
-  ): Workflow<TContext, TInput, TNextOutput, TGates>;
+  ): Workflow<TContext, TInput, TNextOutput, TGates & TChildGates>;
 
   // ── step: transform overload (replaces map + tap) ─────────────
 
@@ -2152,16 +1255,12 @@ export class Workflow<
     if (target instanceof SealedWorkflow) {
       const workflow = target;
       const options = optionsOrFn as NestedStepOptions<TContext, TOutput, TNextOutput> | undefined;
-      const node: StepNode = {
-        type: "step",
-        id: options?.id ?? workflow.id ?? "nested-workflow",
-        nestedWorkflow: workflow,   // Feeds the recursive stepShapeHash walk.
-        category: "nested",          // Observability event type.
-        execute: async (state) => {
-          if (await this.shouldSkip(state, options)) return;
-          await this.executeNestedWorkflow(state, workflow as SealedWorkflow<TContext, unknown, unknown, any>);
-        },
-      };
+      const node = new NestedWorkflowStep(
+        options?.id ?? workflow.id ?? "nested-workflow",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        workflow as SealedWorkflow<any, any, any, any>,
+        options as ConditionalStepOptions<unknown, unknown, unknown> | undefined,
+      );
       return this.appendStep<TNextOutput>(node);
     }
 
@@ -2171,59 +1270,25 @@ export class Workflow<
         throw new Error(`Workflow step("${target}"): second argument must be a function`);
       }
       const fn = optionsOrFn as (params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>;
-      const options = inlineOptions;
-      const node: StepNode = {
-        type: "step",
-        id: target,
-        execute: async (state) => {
-          if (await this.shouldSkip(state, options)) return;
-          state.output = await fn({
-            ctx: state.ctx as Readonly<TContext>,
-            input: state.output as TOutput,
-            // Present in stream mode (undefined in generate mode), letting the
-            // inline step emit UIMessageChunk parts onto the workflow's stream.
-            writer: state.writer,
-          });
-        },
-      };
+      const node = new TransformStep(
+        target,
+        fn as (params: { ctx: unknown; input: unknown; writer?: UIMessageStreamWriter }) => MaybePromise<unknown>,
+        inlineOptions as ConditionalStepOptions<unknown, unknown, unknown> | undefined,
+      );
       return this.appendStep<TNextOutput>(node);
     }
 
     // Agent overload: step(agent, options?)
     const agent = target;
     const options = optionsOrFn as StepOptions<TContext, TOutput, TNextOutput> | undefined;
-    const node: StepNode = {
-      type: "step",
-      id: options?.id ?? agent.id,
-      execute: async (state) => {
-        if (await this.shouldSkip(state, options)) return;
-        const ctx = state.ctx as TContext;
-        await this.executeAgent(state, agent, ctx, options);
-      },
-    };
+    const node = new AgentStep(
+      options?.id ?? agent.id,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      agent as Agent<any, any, any>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      options as StepOptions<any, any, any> | undefined,
+    );
     return this.appendStep<TNextOutput>(node);
-  }
-
-  /**
-   * Conditional-skip check shared by all `step` forms. Evaluates `when`; when
-   * it returns false the step is skipped — `otherwise` (if present) produces
-   * the output, otherwise the input passes through unchanged — and the body is
-   * never invoked. Returns true when the caller should skip the body.
-   */
-  private async shouldSkip(
-    state: RuntimeState,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    options: ConditionalStepOptions<TContext, TOutput, any> | undefined,
-  ): Promise<boolean> {
-    if (!options?.when) return false;
-    const ctx = state.ctx as Readonly<TContext>;
-    const input = state.output as TOutput;
-    if (await options.when({ ctx, input })) return false;
-    if (options.otherwise) {
-      state.output = await options.otherwise({ ctx, input });
-    }
-    // No `otherwise` → passthrough: leave state.output unchanged.
-    return true;
   }
 
   // ── gate: human-in-the-loop suspension point ────────────────
@@ -2240,20 +1305,9 @@ export class Workflow<
     if (this.steps.some(s => s.type === "gate" && s.id === id)) {
       throw new Error(`Workflow: duplicate gate ID "${id}". Each gate must have a unique identifier.`);
     }
-    const node: StepNode = {
-      type: "gate",
+    const node = new GateStep(
       id,
-      schema: options?.schema,
-      condition: options?.condition
-        ? async (state) => options.condition!({
-            ctx: state.ctx as Readonly<TContext>,
-            input: state.output as TOutput,
-          })
-        : undefined,
-      merge: options?.merge
-        ? (params) => options.merge!(params as { priorOutput: TOutput; response: TResponse })
-        : undefined,
-      payload: async (state) => {
+      async (state) => {
         if (options?.payload) {
           return options.payload({
             ctx: state.ctx as Readonly<TContext>,
@@ -2262,7 +1316,17 @@ export class Workflow<
         }
         return state.output;
       },
-    };
+      options?.schema as SchemaWithParse | undefined,
+      options?.condition
+        ? async (state) => options.condition!({
+            ctx: state.ctx as Readonly<TContext>,
+            input: state.output as TOutput,
+          })
+        : undefined,
+      options?.merge
+        ? (params) => options.merge!(params as { priorOutput: TOutput; response: TResponse })
+        : undefined,
+    );
     return this.appendStep<TResponse, TGates & Record<Id, TResponse>>(node);
   }
 
@@ -2296,39 +1360,8 @@ export class Workflow<
     cases: BranchCase<TContext, TOutput, TNextOutput>[],
     explicitId?: string,
   ): Workflow<TContext, TInput, TNextOutput, TGates> {
-    const node: StepNode = {
-      type: "step",
-      id: explicitId ?? "branch:predicate",
-      category: "branch",
-      execute: async (state) => {
-        const ctx = state.ctx as TContext;
-        const input = state.output as TOutput;
-
-        for (let caseIndex = 0; caseIndex < cases.length; caseIndex++) {
-          const branchCase = cases[caseIndex];
-          if (branchCase.when) {
-            const match = await branchCase.when({ ctx, input });
-            if (!match) continue;
-          }
-
-          // Matched (or no `when` = default). itemIndex = matched case index.
-          await this.executeAgent(state, branchCase.agent, ctx, branchCase, caseIndex);
-          return;
-        }
-
-        // Render the input defensively — JSON.stringify throws on cyclic /
-        // BigInt / function-valued inputs, which would mask the real branch
-        // mismatch with a serialization error.
-        let inputRepr: string;
-        try {
-          inputRepr = JSON.stringify(input);
-          if (inputRepr === undefined) inputRepr = String(input);
-        } catch {
-          inputRepr = `[unserializable ${typeof input}]`;
-        }
-        throw new WorkflowBranchError("predicate", `No branch matched and no default branch (a case without \`when\`) was provided. Input: ${inputRepr}`);
-      },
-    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const node = new PredicateBranchStep(explicitId ?? "branch:predicate", cases as BranchCase<any, any, any>[]);
     return this.appendStep<TNextOutput>(node);
   }
 
@@ -2336,53 +1369,8 @@ export class Workflow<
     config: BranchSelect<TContext, TOutput, TKeys, TNextOutput>,
     explicitId?: string,
   ): Workflow<TContext, TInput, TNextOutput, TGates> {
-    const node: StepNode = {
-      type: "step",
-      id: explicitId ?? "branch:select",
-      category: "branch",
-      execute: async (state) => {
-        const ctx = state.ctx as TContext;
-        const input = state.output as TOutput;
-        const key = await config.select({ ctx, input });
-
-        // Distinguish "key not declared at all" from "key present but value
-        // is `undefined`" (e.g. `agents: { bug: cond ? agentA : undefined }`).
-        // The latter is a user-side bug — fail loud rather than silently
-        // falling back, since the fallback obscures the misconfiguration.
-        //
-        // Use Object.prototype.hasOwnProperty.call (not `in`) so untrusted
-        // classifier output like "toString"/"constructor"/"__proto__" doesn't
-        // resolve to a Object.prototype method and crash executeAgent with an
-        // opaque "agent.generate is not a function".
-        const keyDeclared = Object.prototype.hasOwnProperty.call(config.agents, key);
-        if (keyDeclared && (config.agents as Record<string, unknown>)[key] === undefined) {
-          throw new WorkflowBranchError(
-            "select",
-            `Agent for key "${key}" was declared but the value is undefined. ` +
-            `This usually means a conditional spread set the value to undefined. ` +
-            `Available keys: ${Object.keys(config.agents).join(", ")}`,
-          );
-        }
-        let agent = keyDeclared ? config.agents[key] : undefined;
-        if (!agent) {
-          if (config.onUnknownKey) {
-            config.onUnknownKey({
-              key,
-              availableKeys: Object.keys(config.agents) as TKeys[],
-              ctx: ctx as Readonly<TContext>,
-            });
-          }
-          if (config.fallback) {
-            agent = config.fallback;
-          } else {
-            throw new WorkflowBranchError("select", `No agent found for key "${key}" and no fallback provided. Available keys: ${Object.keys(config.agents).join(", ")}`);
-          }
-        }
-
-        // itemIndex = the selected key.
-        await this.executeAgent(state, agent, ctx, config, key);
-      },
-    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const node = new SelectBranchStep(explicitId ?? "branch:select", config as BranchSelect<any, any, any, any>);
     return this.appendStep<TNextOutput>(node);
   }
 
@@ -2411,8 +1399,8 @@ export class Workflow<
    *   failures at indices AFTER the throwing one are neither recovered nor
    *   surfaced as warnings.
    */
-  foreach<TNextOutput>(
-    target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput>,
+  foreach<TNextOutput, TG extends Record<string, unknown> = {}>(
+    target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | (SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput, TG> & NoGates<TG>),
     options?: {
       id?: string;
       concurrency?: number;
@@ -2440,136 +1428,8 @@ export class Workflow<
       }) => MaybePromise<void>;
     },
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
-    // Validate up front: a positive integer or `Infinity` (full fan-out,
-    // clamped by item count). Rejects NaN / 0 / negatives (NaN would otherwise
-    // slip into a `Math.min(NaN, …)` worker pool that processes nothing) and
-    // fractional values (which `Array.from({length})` would silently floor) —
-    // matching the stricter `maxIterations` / `checkpointEvery` validation.
-    if (
-      options?.concurrency !== undefined &&
-      !((Number.isInteger(options.concurrency) && options.concurrency >= 1) || options.concurrency === Infinity)
-    ) {
-      throw new Error(`foreach: concurrency must be a positive integer or Infinity, got ${options.concurrency}`);
-    }
-    const concurrency = options?.concurrency ?? Infinity;
-    const onError = options?.onError;
-    const handleStream = options?.handleStream;
-    const isWorkflow = target instanceof SealedWorkflow;
-    // Agent items inherit the parent's stream mode + writer ONLY when a
-    // handleStream is supplied (otherwise they run generate — foreach never
-    // auto-merges N streams). Workflow items always inherit, so the nested
-    // pipeline streams transitively via its own steps when the parent streams.
-    const inheritStreaming = isWorkflow || handleStream !== undefined;
-    const defaultId = isWorkflow
-      ? (target.id ?? "foreach")
-      : `foreach:${(target as Agent<TContext, ElementOf<TOutput>, TNextOutput>).id}`;
-    const id = options?.id ?? defaultId;
-
-    const node: StepNode = {
-      type: "step",
-      id,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      nestedWorkflow: isWorkflow ? (target as SealedWorkflow<any, any, any, any>) : undefined,
-      category: "foreach",
-      execute: async (state) => {
-        const items = state.output;
-        if (!Array.isArray(items)) {
-          throw new Error(`foreach "${id}": expected array input, got ${typeof items}`);
-        }
-
-        const ctx = state.ctx as TContext;
-        const results: unknown[] = new Array(items.length);
-        const skipped = new Set<number>();
-        const itemStates: (RuntimeState | undefined)[] = new Array(items.length);
-        // Skip per-item timing + event allocation when no item hook is set —
-        // every item would otherwise pay it for nothing (matters at scale).
-        const wantItemHooks = this.hasItemHooks();
-
-        const executeItem = async (item: unknown, index: number) => {
-          // itemState explicitly omits runOptions — per-run config never crosses
-          // the foreach boundary. abortSignal IS propagated though, since
-          // cancellation must be transitive across the foreach barrier.
-          const itemState: RuntimeState = {
-            ctx: state.ctx,
-            output: item,
-            mode: inheritStreaming ? state.mode : "generate",
-            writer: inheritStreaming ? state.writer : undefined,
-            abortSignal: state.abortSignal,
-          };
-          itemStates[index] = itemState;
-          const itemStart = wantItemHooks ? performance.now() : 0;
-          if (wantItemHooks) {
-            await this.fireHook(state, "onItemStart", {
-              stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, input: item,
-            });
-          }
-          try {
-            if (isWorkflow) {
-              await this.executeNestedWorkflow(itemState, target as SealedWorkflow<TContext, unknown, unknown, any>);
-            } else {
-              await this.executeAgent(
-                itemState,
-                target as Agent<TContext, unknown, TNextOutput>,
-                ctx,
-                // foreach narrows handleStream's itemIndex to `number` for the
-                // caller; the internal AgentStepHooks shape is `number | string`.
-                // executeAgent always forwards the numeric `index` below, so the
-                // cast is sound.
-                handleStream ? ({ handleStream } as AgentStepHooks<TContext, unknown, TNextOutput>) : undefined,
-                index,
-              );
-            }
-            results[index] = itemState.output;
-            if (wantItemHooks) {
-              await this.fireHook(state, "onItemFinish", {
-                stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, output: itemState.output,
-                durationMs: performance.now() - itemStart,
-              });
-            }
-          } catch (error) {
-            if (wantItemHooks) {
-              await this.fireHook(state, "onItemError", {
-                stepId: id, type: "foreach", itemIndex: index, ctx: state.ctx, error,
-                durationMs: performance.now() - itemStart,
-              });
-            }
-            throw error;
-          }
-        };
-
-        // Dispatch + warning-merge + abort + gate-suspension partition is
-        // shared with `parallel`. foreach's per-item key IS its index.
-        const nonGateFailures = await runUnitsConcurrently(
-          state,
-          id,
-          items.length,
-          concurrency,
-          (i) => i,
-          itemStates,
-          (i) => executeItem(items[i], i),
-        );
-
-        // No suspension — run onError per existing semantics in index order.
-        for (const { index, error } of nonGateFailures) {
-          if (!onError) throw error;
-          const recovered = await onError({
-            error,
-            item: items[index] as ElementOf<TOutput>,
-            index,
-            ctx: state.ctx as Readonly<TContext>,
-          });
-          if (recovered === Workflow.SKIP) {
-            skipped.add(index);
-          } else {
-            results[index] = recovered;
-          }
-        }
-
-        state.output = skipped.size === 0
-          ? results
-          : results.filter((_, i) => !skipped.has(i));
-      },
-    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const node = new ForeachStep(target as any, options as any, this.observability);
     return this.appendStep<TNextOutput[]>(node);
   }
 
@@ -2578,9 +1438,9 @@ export class Workflow<
   // Same input fed to each branch. Streaming: agent branches stream only when a
   // `handleStream` is supplied (otherwise they run generate — N agent streams
   // are never auto-merged into one writer); `SealedWorkflow` branches always
-  // inherit and stream transitively via their own steps. For SealedWorkflow
-  // branches, a nested gate throws NestedGateUnsupportedError (same machinery as
-  // foreach concurrent).
+  // inherit and stream transitively via their own steps. A `SealedWorkflow`
+  // branch containing a gate is rejected at build time (a gate can't suspend one
+  // branch of a fan-out).
   //
   // Default concurrency: **unbounded** (`Infinity` — every branch runs
   // concurrently, clamped only by branch count). No rate-limit cap by default;
@@ -2592,25 +1452,25 @@ export class Workflow<
 
   /** Record-form + `onError`. Values are `BranchOutput | undefined` (SKIP-able). */
   parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
-    branches: TBranches,
+    branches: TBranches & { [K in keyof TBranches]: GatelessBranch<TBranches[K]> },
     options: ParallelOptions<TContext, TOutput> & { onError: NonNullable<ParallelOptions<TContext, TOutput>["onError"]> },
   ): Workflow<TContext, TInput, ParallelOutputRecordPartial<TBranches>, TGates>;
 
   /** Record-form overload. Returns `{ [K]: BranchOutput<T[K]> }`. */
   parallel<TBranches extends Record<string, ParallelTarget<TContext, TOutput>>>(
-    branches: TBranches,
+    branches: TBranches & { [K in keyof TBranches]: GatelessBranch<TBranches[K]> },
     options?: ParallelOptions<TContext, TOutput>,
   ): Workflow<TContext, TInput, ParallelOutputRecord<TBranches>, TGates>;
 
   /** Tuple-form + `onError`. Each slot is `BranchOutput | undefined` (SKIP-able). */
   parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
-    branches: TBranches,
+    branches: TBranches & { [K in keyof TBranches]: GatelessBranch<TBranches[K]> },
     options: ParallelOptions<TContext, TOutput> & { onError: NonNullable<ParallelOptions<TContext, TOutput>["onError"]> },
   ): Workflow<TContext, TInput, ParallelOutputTuplePartial<TBranches>, TGates>;
 
   /** Tuple-form overload. Returns `[O1, O2, ...]`. Use `as const`. */
   parallel<TBranches extends ReadonlyArray<ParallelTarget<TContext, TOutput>>>(
-    branches: TBranches,
+    branches: TBranches & { [K in keyof TBranches]: GatelessBranch<TBranches[K]> },
     options?: ParallelOptions<TContext, TOutput>,
   ): Workflow<TContext, TInput, ParallelOutputTuple<TBranches>, TGates>;
 
@@ -2620,140 +1480,16 @@ export class Workflow<
     options?: ParallelOptions<TContext, TOutput>,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Workflow<TContext, TInput, any, TGates> {
-    const isTuple = Array.isArray(branches);
-    const entries: Array<{ key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }> = isTuple
-      ? (branches as ReadonlyArray<ParallelTarget<TContext, TOutput>>).map((target, i) => ({ key: i, index: i, target }))
-      : Object.entries(branches as Record<string, ParallelTarget<TContext, TOutput>>).map(([k, t], i) => ({ key: k, index: i, target: t }));
-    const branchCount = entries.length;
-    const requestedConcurrency = options?.concurrency;
-    // Mirror foreach's guard (positive integer or Infinity). Without it `NaN`
-    // slipped past the later `Number.isFinite()` check and silently became
-    // full fan-out (the cap removed), `0` / negative were clamped to 1, and a
-    // fractional value was floored by the worker-pool `Array.from({length})`.
-    if (
-      requestedConcurrency !== undefined &&
-      !((Number.isInteger(requestedConcurrency) && requestedConcurrency >= 1) || requestedConcurrency === Infinity)
-    ) {
-      throw new Error(`parallel: concurrency must be a positive integer or Infinity, got ${requestedConcurrency}`);
-    }
-    // Default: unbounded (full fan-out, clamped only by branch count). Both
-    // `Infinity` and a finite override flow into the worker pool's
-    // `Math.min(_, count)`. No rate-limit cap by default — pass an explicit
-    // `concurrency` to throttle against provider limits.
-    const concurrency = requestedConcurrency ?? Infinity;
-    const onError = options?.onError;
-    const handleStream = options?.handleStream;
-    const id = options?.id ?? (isTuple ? "parallel:tuple" : "parallel:record");
-
-    const node: StepNode = {
-      type: "step",
-      id,
-      category: "parallel",
-      execute: async (state) => {
-        const ctx = state.ctx as TContext;
-        const input = state.output;
-        const results: Record<string | number, unknown> = (isTuple ? new Array(branchCount) : {}) as Record<string | number, unknown>;
-        const branchStates: (RuntimeState | undefined)[] = new Array(branchCount);
-        // Skip per-branch timing + event allocation when no item hook is set.
-        const wantItemHooks = this.hasItemHooks();
-
-        const executeBranch = async ({ key, index, target }: { key: string | number; index: number; target: ParallelTarget<TContext, TOutput> }) => {
-          const isWorkflowBranch = target instanceof SealedWorkflow;
-          // Agent branches inherit the parent's stream mode + writer ONLY when a
-          // handleStream is supplied (else generate — no auto-merge of N
-          // streams). Workflow branches always inherit, streaming transitively.
-          const inheritStreaming = isWorkflowBranch || handleStream !== undefined;
-          // Per-branch state — same isolation as foreach (no runOptions), but
-          // abortSignal IS forwarded so cancellation is transitive into branch
-          // agent/SDK calls and nested-workflow branches.
-          const branchState: RuntimeState = {
-            ctx: state.ctx,
-            output: input,
-            mode: inheritStreaming ? state.mode : "generate",
-            writer: inheritStreaming ? state.writer : undefined,
-            abortSignal: state.abortSignal,
-          };
-          branchStates[index] = branchState;
-          const branchStart = wantItemHooks ? performance.now() : 0;
-          // itemIndex is the key for record form, numeric index for tuple form.
-          const itemIndex: string | number = isTuple ? index : (key as string);
-          if (wantItemHooks) {
-            await this.fireHook(state, "onItemStart", {
-              stepId: id, type: "parallel", itemIndex, ctx: state.ctx, input,
-            });
-          }
-          try {
-            if (isWorkflowBranch) {
-              await this.executeNestedWorkflow(branchState, target as SealedWorkflow<TContext, unknown, unknown, any>);
-            } else {
-              await this.executeAgent(
-                branchState,
-                target as Agent<TContext, unknown, unknown>,
-                ctx,
-                handleStream ? ({ handleStream } as AgentStepHooks<TContext, unknown, unknown>) : undefined,
-                itemIndex,
-              );
-            }
-            results[key] = branchState.output;
-            if (wantItemHooks) {
-              await this.fireHook(state, "onItemFinish", {
-                stepId: id, type: "parallel", itemIndex, ctx: state.ctx, output: branchState.output,
-                durationMs: performance.now() - branchStart,
-              });
-            }
-          } catch (error) {
-            if (wantItemHooks) {
-              await this.fireHook(state, "onItemError", {
-                stepId: id, type: "parallel", itemIndex, ctx: state.ctx, error,
-                durationMs: performance.now() - branchStart,
-              });
-            }
-            throw error;
-          }
-        };
-
-        // Dispatch + warning-merge + abort + gate-suspension partition is
-        // shared with `foreach`. Per-branch key is the record key / tuple index.
-        const nonGateFailures = await runUnitsConcurrently(
-          state,
-          id,
-          branchCount,
-          concurrency,
-          (i) => entries[i].key,
-          branchStates,
-          (i) => executeBranch(entries[i]),
-        );
-
-        // No suspension — handle non-gate failures via onError or rethrow.
-        for (const { key, index, error } of nonGateFailures) {
-          if (!onError) throw error;
-          const recovered = await onError({
-            error,
-            key: isTuple ? undefined : (key as string),
-            index: isTuple ? (index) : undefined,
-            ctx: state.ctx as Readonly<TContext>,
-          });
-          if (recovered === Workflow.SKIP) {
-            // Both forms: the slot stays `undefined` in place (no index shift).
-            // Supplying `onError` widens the output type to `BranchOutput |
-            // undefined`, so this hole is reflected in the type.
-            results[key] = undefined;
-          } else {
-            results[key] = recovered;
-          }
-        }
-
-        state.output = results;
-      },
-    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const node = new ParallelStep(branches as any, options as any, this.observability);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return this.appendStep<any>(node);
   }
 
   // ── repeat: conditional loop ─────────────────────────────────
 
-  repeat(
-    target: Agent<TContext, TOutput, TOutput> | SealedWorkflow<TContext, TOutput, TOutput>,
+  repeat<TG extends Record<string, unknown> = {}>(
+    target: Agent<TContext, TOutput, TOutput> | (SealedWorkflow<TContext, TOutput, TOutput, TG> & NoGates<TG>),
     options: RepeatOptions<TContext, TOutput> & { id?: string },
   ): Workflow<TContext, TInput, TOutput, TGates> {
     if (options.maxIterations !== undefined && (!Number.isInteger(options.maxIterations) || options.maxIterations < 1)) {
@@ -2774,41 +1510,14 @@ export class Workflow<
     const predicate: LoopPredicate<TContext, TOutput> = options.until
       ?? (async (p) => !(await options.while!(p)));
 
-    const node: StepNode = {
-      type: "step",
+    const node = new RepeatStep(
       id,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      nestedWorkflow: isWorkflow ? (target as SealedWorkflow<any, any, any, any>) : undefined,
-      category: "repeat",
-      execute: async (state) => {
-        const ctx = state.ctx as TContext;
-
-        for (let i = 1; i <= maxIterations; i++) {
-          // Cancellation checkpoint between iterations. The body's executeAgent
-          // already forwards the signal so an in-flight call cancels too, but
-          // the explicit check here covers SealedWorkflow bodies and transform-
-          // only loops where the signal wouldn't otherwise propagate.
-          if (state.abortSignal?.aborted) {
-            throw state.abortSignal.reason ?? new Error("Workflow aborted");
-          }
-
-          if (isWorkflow) {
-            await this.executeNestedWorkflow(state, target as SealedWorkflow<TContext, unknown, unknown, any>);
-          } else {
-            await this.executeAgent(state, target as Agent<TContext, TOutput, TOutput>, ctx);
-          }
-
-          const done = await predicate({
-            output: state.output as TOutput,
-            ctx: ctx as Readonly<TContext>,
-            iterations: i,
-          });
-          if (done) return;
-        }
-
-        throw new WorkflowLoopError(maxIterations, maxIterations);
-      },
-    };
+      target as Agent<any, any, any> | SealedWorkflow<any, any, any, any>,
+      predicate,
+      maxIterations,
+      isWorkflow,
+    );
     return this.appendStep<TOutput>(node);
   }
 
@@ -2823,11 +1532,10 @@ export class Workflow<
     if (!this.steps.some(s => s.type === "step" || s.type === "gate")) {
       throw new Error(`Workflow: catch("${id}") requires at least one preceding step or gate.`);
     }
-    const node: StepNode = {
-      type: "catch",
+    const node = new CatchStep(
       id,
-      catchFn: fn as (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown>,
-    };
+      fn as (params: { error: unknown; ctx: unknown; lastOutput: unknown; stepId: string }) => MaybePromise<unknown>,
+    );
     return this.appendStep<TOutput>(node);
   }
 

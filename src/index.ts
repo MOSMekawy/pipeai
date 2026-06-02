@@ -11,8 +11,6 @@ export {
   Workflow,
   WorkflowBranchError,
   WorkflowLoopError,
-  NestedGateUnsupportedError,
-  CheckpointTimeoutError,
   CHECKPOINT_STEP_ID,
   ABORT_STEP_ID,
   GATE_RESUME_STEP_ID,
