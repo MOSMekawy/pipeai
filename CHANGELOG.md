@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-12
+
+### Added
+
+- **`foreach` per-item path builder: `foreach(path => path.step(a).step(b), opts)`.** A callback target form that receives a sub-builder seeded with the array's element type and returns the built per-item path. Each item runs that whole chain as one concurrent unit (item 0 can be at the last step while item 1 is at the first); the only barrier is collecting the result array at the end. Pure sugar over passing a pre-built `SealedWorkflow` — same behavior, but the element type is inferred so you skip the `Workflow.create<Ctx, Item>()` boilerplate. A gate in the per-item path is forbidden at build time, same as any `foreach` body.
+- **`gate`'s `merge` may now produce an output type distinct from the gate response (`TMerged`).** `gate<TResponse, TMerged>(...)` gains a second type param, defaulted to `TResponse` (non-breaking): the merged value becomes the gate's downstream output, while the type `loadState` validates as the resume response stays `TResponse`. Lets a `merge` fold the response into a combined shape (e.g. `{ ...priorOutput, response }`) without forcing the output type to lie. With no `merge` the output is still the (schema-validated) response.
+- **`WorkflowStreamResult.stream` is now typed over the run's UI message chunk shape.** `Workflow.stream<UI_MESSAGE>(...)` / `ResumedWorkflow` / `CheckpointResumedWorkflow` thread `UI_MESSAGE` into the result, so `stream` is `ReadableStream<InferUIMessageChunk<UI_MESSAGE>>` instead of a bare `ReadableStream`. `UI_MESSAGE` defaults to `UIMessage`, so existing `WorkflowStreamResult<TOutput>` annotations and call sites are unaffected.
+
+### Changed
+
+- **An abort flowing through a nested workflow / `repeat` / `foreach` / `parallel` step no longer reports a phantom step failure.** When the abort signal fires mid-child-run, the child rethrows `signal.reason` and the wrapping step parks it — which previously fired `onStepError` for that wrapper step (and recorded a duplicate warning), so an observer saw the abort blamed on a user step *in addition to* the run's rejection with the same reason. The run loop now recognizes a newly-parked error that **is** the abort reason as cancellation, not step-logic failure: no step-level `onStepError` / `onStepFinish` for the wrapper, and no duplicate abort-reason warning. The run still rejects with `signal.reason`, and a genuine step error that merely *precedes* an abort still reports `onStepError` normally. **Heads-up:** observers that relied on seeing an `onStepError` for the nested / looped / concurrent wrapper step on abort will no longer receive it (they still get the run's rejection and any per-item `onItemError`).
+
+### Fixed
+
+- **`foreach(path => …)` per-item paths now fire step-level observability.** The callback form built its per-item path from a fresh builder with no observability, so steps inside it never fired `onStepStart` / `onStepFinish` / `onStepError` — and unlike a pre-built `SealedWorkflow` target, the caller had no `create()` of their own to attach hooks to. The parent workflow's observability is now forwarded into the per-item path, so its inner steps are observed under the same hooks (distinct from the `foreach`'s own per-item `onItem*` events).
+- **A throwing agent `onError` on the stream path can no longer surface as an unhandled rejection.** `invokeOnError` rethrows when the user handler throws (to preserve the original model error as `cause`); on the stream path it ran inside the AI SDK's `onError` callback, which has no error channel, so that rethrow could escape as an unhandled rejection rather than reaching the consumer. It is now caught and logged on the stream path, keeping the diagnostics intent without the dangling rejection. (The generate path, which already propagates the rethrow to its caller, is unchanged.)
+- **`checkpointEvery` / `checkpointWhen` set without an `onCheckpoint` sink now warns.** Cadence options are a silent no-op without a sink, which usually means a forgotten `onCheckpoint`; `validateRunOptions` now emits a one-time warning instead of doing nothing. The mutually-exclusive and positive-integer checks for these options also run now regardless of whether a sink is present.
+
+### Internal
+
+- **Run-loop engine consolidated onto the `Step` class.** The structural `StepNode` union was removed; the run loop consumes `ReadonlyArray<Step>` and dispatches via `node.shouldSkip()` / `node.execute()` directly, so each kind's skip policy lives once on its subclass instead of being mirrored in the loop. `execute()`'s abort-promotion, checkpoint, and precedence-tail blocks were extracted into helpers, and the (previously byte-identical) `foreach` / `parallel` dispatch loop is now shared via `dispatchUnits`. Error classes and the reserved `::pipeai::` step ids moved to a leaf `errors.ts`, and `RuntimeState` / `PendingError` / `ResumeDescent` moved to `runtime.ts`, breaking the runtime↔workflow type cycle. No public API change beyond the entries above.
+- **Raw workflow-engine speed benchmarks added** (`src/__tests__/perf.test.ts`): a deep sequential variety pipeline and a wide `foreach` fan-out, measured with zero-cost agent stubs to isolate orchestration overhead from agent / model cost.
+
+## [0.8.4] - 2026-06-02
+
+### Internal
+
+- **`workflow.ts` split into focused modules** — `runtime.ts` (per-run state construction, observability dispatch, warnings, checkpoint sink), `types.ts` (public type / API surface), and a `steps/` directory of one `Step` subclass per kind — plus fixes from a multi-agent review pass. Internal reorganization only; no public API or behavior change.
+
 ## [0.8.3] - 2026-06-01
 
 ### Added
