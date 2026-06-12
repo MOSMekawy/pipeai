@@ -1,5 +1,6 @@
-import type { RuntimeState, BranchCase, BranchSelect } from "../workflow";
-import { WorkflowBranchError } from "../workflow";
+import type { RuntimeState } from "../runtime";
+import type { BranchCase, BranchSelect } from "../types";
+import { WorkflowBranchError } from "../errors";
 import { Step } from "./step";
 import { AgentStep } from "./agent-step";
 
@@ -13,7 +14,7 @@ import { AgentStep } from "./agent-step";
  */
 export class PredicateBranchStep extends Step {
   readonly type = "step" as const;
-  readonly category = "branch" as const;
+  override readonly category = "branch" as const;
   readonly id: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly cases: BranchCase<any, any, any>[];
@@ -26,7 +27,6 @@ export class PredicateBranchStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const ctx = state.ctx as any;
@@ -71,7 +71,7 @@ export class PredicateBranchStep extends Step {
  */
 export class SelectBranchStep extends Step {
   readonly type = "step" as const;
-  readonly category = "branch" as const;
+  override readonly category = "branch" as const;
   readonly id: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly config: BranchSelect<any, any, any, any>;
@@ -84,7 +84,6 @@ export class SelectBranchStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const ctx = state.ctx as any;

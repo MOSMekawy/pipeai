@@ -1,22 +1,106 @@
-// Runtime plumbing for the workflow engine: per-run state construction,
-// observability hook dispatch, warning bookkeeping, pending-error demotion, and
-// the checkpoint sink. These are free functions coupled only to `RuntimeState` /
-// `PendingError` (imported type-only from `./workflow`, so no runtime cycle) plus
-// the public types in `./types`. `workflow.ts` re-exports the subset the `Step`
-// subclasses in `./steps` consume, so their `from "../workflow"` imports are
-// unchanged.
+// Runtime plumbing for the workflow engine: the per-run `RuntimeState` (and
+// its construction), observability hook dispatch, warning bookkeeping,
+// pending-error demotion, and the checkpoint sink. Coupled only to the public
+// types in `./types` and the leaf `./errors` module — no value-level cycle
+// through `./workflow` — so the `Step` subclasses in `./steps` import from
+// here directly.
 
 import type { UIMessageStreamWriter } from "ai";
 import { deepFreeze, type MaybePromise } from "./utils";
-import type { RuntimeState, PendingError } from "./workflow";
+import { ABORT_STEP_ID } from "./errors";
 import type {
   CheckpointSnapshot,
+  GateSnapshot,
   RunOptions,
   WorkflowObservability,
   WorkflowResult,
   WorkflowStepType,
   WorkflowWarning,
 } from "./types";
+
+// ── Per-run state ────────────────────────────────────────────────────
+
+// Consumed by the run loop in ./workflow and every `Step` subclass. NOT
+// re-exported from index.ts, so it stays out of the public package API.
+export interface RuntimeState {
+  ctx: unknown;
+  output: unknown;
+  mode: "generate" | "stream";
+  writer?: UIMessageStreamWriter;
+  // Only gates set `suspension`.
+  suspension?: GateSnapshot;
+  warnings?: WorkflowWarning[];
+  checkpointFailed?: boolean;
+  // Error channel for the fat-step model and the single source of truth for the
+  // in-flight error: a `Step#execute` body parks its thrown error here instead
+  // of letting it escape, and the run loop + `catch`/`finally` steps read and
+  // clear it. (`catch`/`finally` bodies are the exception — their throws bubble
+  // straight out of `execute` rather than parking here.)
+  pendingError?: PendingError;
+  // Same RunOptions seen by execute(); reset to undefined inside nested
+  // workflows and omitted from foreach itemState so per-run config doesn't
+  // leak into nested execution.
+  runOptions?: RunOptions;
+  // Cooperative cancellation. Held on state separately from runOptions
+  // because — unlike freezeSnapshots — abortSignal SHOULD propagate into
+  // nested workflows and foreach items.
+  abortSignal?: AbortSignal;
+  // Index of the node the run loop is currently executing. Set per iteration
+  // so a `GateStep` can stamp `resumeFromIndex` into its suspension snapshot
+  // without the loop reaching into the node.
+  stepIndex?: number;
+  // Set only when resuming a NESTED gate: the descent a `NestedWorkflowStep`
+  // follows back down to the suspended child. Consumed (and cleared) one
+  // nesting level at a time. See `ResumeDescent`.
+  resumeDescent?: ResumeDescent;
+}
+
+/**
+ * Drives resume re-entry for a gate that suspended inside nested workflows.
+ * `remaining` is the list of child start-indices to descend through, one per
+ * nesting level, ending with the innermost gate's `resumeFromIndex + 1`. When a
+ * `NestedWorkflowStep` consumes the LAST entry it first seeds `state.output`
+ * with `seedOutput` (the merged gate response) before running the innermost
+ * child from that index.
+ */
+export type ResumeDescent = {
+  readonly remaining: readonly number[];
+  readonly seedOutput: unknown;
+};
+
+// Pending error tracked through a single execute() pass. The `source`
+// discriminant drives the precedence tail
+// (checkpointFailed > finally-wrap > step > suspension) and the onStepError
+// type mapping in `pendingErrorSourceToStepType`.
+export type PendingError = {
+  error: unknown;
+  stepId: string;
+  source: "step" | "gate" | "finally" | "catch" | "onCheckpoint";
+};
+
+/**
+ * The pending-error a cancellation promotes: the signal's reason under the
+ * reserved {@link ABORT_STEP_ID}, recoverable-looking to `.catch()` but sticky
+ * (the run loop re-promotes it).
+ */
+export function makeAbortError(signal: AbortSignal): PendingError {
+  return {
+    error: signal.reason ?? new Error("Workflow aborted"),
+    stepId: ABORT_STEP_ID,
+    source: "step",
+  };
+}
+
+/**
+ * Prepend a nested-workflow step index to a propagating gate suspension so
+ * resume can descend back to the gate. Returns a fresh snapshot (re-frozen when
+ * `freezeSnapshots` is on) since the original may be frozen.
+ */
+export function prependNestedPath(snapshot: GateSnapshot, index: number, state: RuntimeState): GateSnapshot {
+  const next: GateSnapshot = { ...snapshot, nestedPath: [index, ...(snapshot.nestedPath ?? [])] };
+  if (resolveFreezeSnapshots(state)) deepFreeze(next);
+  return next;
+}
 
 export function resolveFreezeSnapshots(state: RuntimeState): boolean {
   return state.runOptions?.freezeSnapshots ? true : false;
@@ -108,7 +192,7 @@ export function pushWarning(
  * and the error is returned; `onStepError` throws are returned for the caller to
  * attach as `cause`.
  *
- * Free function (not a method) so migrated `Step` subclasses — `foreach` /
+ * Free function (not a method) so the `Step` subclasses — `foreach` /
  * `parallel`, which fire per-item events — can use their captured observability.
  * `SealedWorkflow#fireHook` delegates here with `this.observability`.
  */
@@ -150,7 +234,7 @@ async function fireHookSlow<K extends keyof WorkflowObservability>(
 /**
  * True when any per-item observability hook is registered on `observability`.
  * Lets `foreach` / `parallel` skip per-item timing + event allocation on
- * hook-less runs. Free counterpart to `SealedWorkflow#hasItemHooks`.
+ * hook-less runs.
  */
 export function hasItemHooks(observability: WorkflowObservability | undefined): boolean {
   return !!observability && !!(observability.onItemStart || observability.onItemFinish || observability.onItemError);

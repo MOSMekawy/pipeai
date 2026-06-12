@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { Workflow } from "../workflow";
 import { Agent } from "../agent";
+import type { WorkflowObservability } from "../workflow";
 import { createMockModel, expectComplete, testCtx, type TestCtx } from "./helpers";
 
 describe("foreach — per-item path via builder callback", () => {
@@ -57,5 +58,35 @@ describe("foreach — per-item path via builder callback", () => {
 
     const res = await wf.generate(testCtx, ["a", "b"]);
     expect(expectComplete(res).output).toEqual(["tagged", "tagged"]);
+  });
+
+  it("forwards the parent's observability so inner-path steps fire step hooks", async () => {
+    // The callback form gives the user no `create()` call of their own to attach
+    // observability to, so the parent workflow's observability is forwarded into
+    // the per-item path. Steps INSIDE the path therefore fire onStepStart/Finish
+    // (once per item), distinct from the foreach's own per-item events.
+    const onStepStart = vi.fn();
+    const onStepFinish = vi.fn();
+    const observability: WorkflowObservability<TestCtx> = { onStepStart, onStepFinish };
+
+    const wf = Workflow.create<TestCtx, number[]>({ observability })
+      .foreach((path) =>
+        path
+          .step("double", ({ input }) => input * 2)
+          .step("inc", ({ input }) => input + 1),
+      );
+
+    const res = await wf.generate(testCtx, [1, 2]);
+    expect(expectComplete(res).output).toEqual([3, 5]);
+
+    // Both inner steps fired for both items: 2 steps × 2 items = 4 each.
+    // (The foreach step itself also brackets start/finish on the parent — hence
+    // we filter by the inner step ids rather than asserting a total count.)
+    const startedIds = onStepStart.mock.calls.map((c) => c[0].stepId);
+    expect(startedIds.filter((id) => id === "double")).toHaveLength(2);
+    expect(startedIds.filter((id) => id === "inc")).toHaveLength(2);
+    const finishedIds = onStepFinish.mock.calls.map((c) => c[0].stepId);
+    expect(finishedIds.filter((id) => id === "double")).toHaveLength(2);
+    expect(finishedIds.filter((id) => id === "inc")).toHaveLength(2);
   });
 });

@@ -1,7 +1,7 @@
 // Public type / API surface for the workflow package. Extracted from
 // workflow.ts to keep that file focused on the run-loop engine + builder.
 // Type-only module (no runtime output); the cycle with ./workflow is safe.
-import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnFinishCallback, IdGenerator, ToolSet } from "ai";
+import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnFinishCallback, IdGenerator, ToolSet, InferUIMessageChunk } from "ai";
 import type { Agent, GenerateTextResult, StreamTextResult, OutputType } from "./agent";
 import type { MaybePromise } from "./utils";
 import type { SealedWorkflow } from "./workflow";
@@ -369,8 +369,12 @@ export type WorkflowResult<TOutput> =
   | { readonly status: "complete"; readonly output: TOutput; readonly warnings: readonly WorkflowWarning[] }
   | { readonly status: "suspended"; readonly snapshot: GateSnapshot; readonly warnings: readonly WorkflowWarning[] };
 
-export interface WorkflowStreamResult<TOutput> {
-  stream: ReadableStream;
+export interface WorkflowStreamResult<TOutput, UI_MESSAGE extends UIMessage = UIMessage> {
+  // Typed over the run's UI message shape so consumers reading the stream get
+  // their narrowed chunk type. Defaults to the unparameterized `UIMessage`,
+  // keeping `WorkflowStreamResult<TOutput>` valid where the message shape isn't
+  // threaded through.
+  stream: ReadableStream<InferUIMessageChunk<UI_MESSAGE>>;
   output: Promise<WorkflowResult<TOutput>>;   // never rejects on suspension; rejects on real errors
 }
 

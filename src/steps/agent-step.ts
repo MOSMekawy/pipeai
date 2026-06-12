@@ -1,22 +1,22 @@
 import type { ToolSet } from "ai";
 import type { Agent, GenerateTextResult, StreamTextResult, OutputType } from "../agent";
 import { extractOutput, runWithWriter } from "../utils";
-import type { RuntimeState, StepOptions, AgentStepHooks, AgentResultParams } from "../workflow";
+import type { RuntimeState } from "../runtime";
+import type { StepOptions, AgentStepHooks, AgentResultParams } from "../types";
 import { Step } from "./step";
 
 /**
  * Agent step — `Workflow.step(agent, options?)`.
  *
  * Runs `agent` against the current input, applying the `mapResult` /
- * `onResult` / `handleStream` hooks. Self-contained: {@link execute} runs its
- * own skip checks and captures any thrown error onto `state.pendingError`,
- * mirroring how it writes its result to `state.output`.
+ * `onResult` / `handleStream` hooks. Self-contained: {@link execute} captures
+ * any thrown error onto `state.pendingError`, mirroring how it writes its
+ * result to `state.output`.
  *
- * The raw agent invocation lives in the static {@link runAgent} so it can be
- * shared with the still-literal foreach / parallel / branch combinators (which
- * call it via `Workflow.executeAgent`) until those migrate to `Step` subclasses
- * too. Generics live at the `Workflow.step` API boundary; an `AgentStep`
- * instance erases the agent and options to `any` (the run loop only sees
+ * The raw agent invocation lives in the static {@link runAgent} so the
+ * concurrent dispatch (`./concurrent`) and the branch steps can share it.
+ * Generics live at the `Workflow.step` API boundary; an `AgentStep` instance
+ * erases the agent and options to `any` (the run loop only sees
  * `RuntimeState`).
  */
 export class AgentStep extends Step {
@@ -41,7 +41,6 @@ export class AgentStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     try {
       // Inside the try so a throwing `when` / `otherwise` routes through
       // `.catch()` like any other body failure.

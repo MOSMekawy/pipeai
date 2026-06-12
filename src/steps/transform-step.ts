@@ -1,6 +1,7 @@
 import type { UIMessageStreamWriter } from "ai";
 import type { MaybePromise } from "../utils";
-import type { RuntimeState, ConditionalStepOptions } from "../workflow";
+import type { RuntimeState } from "../runtime";
+import type { ConditionalStepOptions } from "../types";
 import { Step } from "./step";
 
 /** The inline transform body produced by `Workflow.step(id, fn, options?)`. */
@@ -14,9 +15,9 @@ type TransformFn = (params: {
  * Inline transform step — `Workflow.step(id, fn, options?)`.
  *
  * Runs `fn` with the current `ctx` / `input` (and the stream `writer` in stream
- * mode), assigning its result to `state.output`. Self-contained: it runs its
- * own skip checks and captures any thrown error onto `state.pendingError`,
- * mirroring how it writes its result to `state.output`.
+ * mode), assigning its result to `state.output`. Self-contained: it captures
+ * any thrown error onto `state.pendingError`, mirroring how it writes its
+ * result to `state.output`.
  *
  * Generics live at the `Workflow.step` API boundary; internally the body and
  * options are erased to `unknown` (the run loop only sees `RuntimeState`).
@@ -39,7 +40,6 @@ export class TransformStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     try {
       // Inside the try so a throwing `when` / `otherwise` routes through
       // `.catch()` like any other body failure.

@@ -1,6 +1,8 @@
 import type { Agent } from "../agent";
-import type { RuntimeState, LoopPredicate, SealedWorkflow } from "../workflow";
-import { WorkflowLoopError } from "../workflow";
+import type { RuntimeState } from "../runtime";
+import type { LoopPredicate } from "../types";
+import type { SealedWorkflow } from "../workflow";
+import { WorkflowLoopError } from "../errors";
 import { AgentStep } from "./agent-step";
 import { Step } from "./step";
 
@@ -16,14 +18,14 @@ import { Step } from "./step";
  * iterations. Self-contained: any thrown error — loop-limit, abort, or a body
  * failure — is captured onto `state.pendingError`.
  *
- * `nestedWorkflow` is public (for workflow targets) so the recursive
+ * `nestedWorkflow` is set (for workflow targets) so the recursive
  * `stepShapeHash` walk can descend into the body's shape.
  */
 export class RepeatStep extends Step {
   readonly type = "step" as const;
-  readonly category = "repeat" as const;
+  override readonly category = "repeat" as const;
+  override readonly nestedWorkflow?: SealedWorkflow<any, any, any, any>;
   readonly id: string;
-  readonly nestedWorkflow?: SealedWorkflow<any, any, any, any>;
 
   private readonly target: Agent<any, any, any> | SealedWorkflow<any, any, any, any>;
   private readonly predicate: LoopPredicate<any, any>;
@@ -47,7 +49,6 @@ export class RepeatStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     try {
       // Predicate/runAgent params are erased to `any` at this boundary; the
       // generics live at the `Workflow.repeat` API surface.

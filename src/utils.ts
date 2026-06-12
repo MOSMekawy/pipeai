@@ -41,6 +41,15 @@ export function getActiveWriter(): UIMessageStreamWriter | undefined {
 export type MaybePromise<T> = T | Promise<T>;
 
 /**
+ * Sentinel returned from `foreach` / `parallel`'s `onError` handler to omit
+ * the failed item (foreach: shortens the output array; parallel: leaves the
+ * slot `undefined`). Lives here — a leaf module — so the step subclasses can
+ * reach it without a value-level cycle through ./workflow. `Workflow.SKIP`
+ * and the package-level `SKIP` export both alias this symbol.
+ */
+export const SKIP: unique symbol = Symbol("pipeai.foreach.skip");
+
+/**
  * A value that can be static or derived from context and input.
  * Used for agent config fields that may need runtime resolution.
  *
@@ -142,17 +151,16 @@ export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): 
  */
 export interface WorkflowShapeHashable {
   readonly id?: string;
-  // Returns the StepNode[] for this workflow. Structurally typed to avoid
-  // a circular import — the real type is `ReadonlyArray<StepNode>`.
+  // Returns the step nodes for this workflow. Structurally typed to avoid a
+  // circular import — the real type is `ReadonlyArray<Step>` (from ./steps/step).
   getStepsForShapeHash(): ReadonlyArray<StepNodeShape>;
 }
 
 /**
- * Structural typing for a StepNode as seen by the shape hasher. Mirrors
- * the actual `StepNode` union without importing it. Adding fields to
- * StepNode without updating this contract won't fail compilation; the
- * dispatch map in workflow.ts (typed via `Record<StepNode["type"], ...>`)
- * is the load-bearing exhaustiveness guard.
+ * Structural typing for a step node as seen by the shape hasher. Mirrors the
+ * `type` / `id` the run loop dispatches on, without importing the `Step` class.
+ * Only these two fields feed the hash; the run loop itself (workflow.ts) is the
+ * load-bearing consumer of the full `Step` shape.
  */
 export interface StepNodeShape {
   readonly type: string;
