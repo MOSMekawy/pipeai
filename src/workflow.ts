@@ -2,9 +2,8 @@ import {
   createUIMessageStream,
   type UIMessage,
   type UIMessageStreamWriter,
-  type ToolSet,
 } from "ai";
-import { type Agent, type GenerateTextResult, type StreamTextResult, type OutputType } from "./agent";
+import { type Agent, type GenerateTextResult } from "./agent";
 import { computeStepShapeHash, deepFreeze, warnOnce, type MaybePromise } from "./utils";
 import { TransformStep } from "./steps/transform-step";
 import { AgentStep } from "./steps/agent-step";
@@ -29,7 +28,7 @@ import type {
   WorkflowStreamOptions, LoopPredicate, RepeatOptions, ParallelTarget,
   ParallelOptions, ParallelOutputRecord, ParallelOutputTuple,
   ParallelOutputRecordPartial, ParallelOutputTuplePartial, SchemaWithParse,
-  SkipPassthrough, ElementOf, NoGates, GatelessBranch,
+  SkipPassthrough, ElementOf, NoGates, GatelessBranch, ForeachOptions,
 } from "./types";
 
 // Runtime plumbing (state construction, observability dispatch, warnings,
@@ -1399,37 +1398,46 @@ export class Workflow<
    *   failures at indices AFTER the throwing one are neither recovered nor
    *   surfaced as warnings.
    */
+  // Agent / sub-workflow target form.
   foreach<TNextOutput, TG extends Record<string, unknown> = {}>(
     target: Agent<TContext, ElementOf<TOutput>, TNextOutput> | (SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput, TG> & NoGates<TG>),
-    options?: {
-      id?: string;
-      concurrency?: number;
-      onError?: (params: {
-        error: unknown;
-        item: ElementOf<TOutput>;
-        index: number;
-        ctx: Readonly<TContext>;
-      }) => MaybePromise<TNextOutput | typeof Workflow.SKIP>;
-      /**
-       * **Stream-mode + agent-target only.** When the workflow is run via
-       * `.stream(...)`, each item's agent runs in stream mode and this hook
-       * decides how its stream surfaces to the writer (`itemIndex` = the item
-       * index). Without it, agent items run in generate mode (no auto-merge —
-       * unlike a single `.step(agent)`, foreach never auto-merges N streams).
-       * Not invoked for `SealedWorkflow` targets (which stream transitively via
-       * their own steps) nor in generate mode.
-       */
-      handleStream?: (params: {
-        result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
-        writer: UIMessageStreamWriter;
-        ctx: Readonly<TContext>;
-        input: ElementOf<TOutput>;
-        itemIndex: number;
-      }) => MaybePromise<void>;
-    },
+    options?: ForeachOptions<TContext, TOutput, TNextOutput>,
+  ): Workflow<TContext, TInput, TNextOutput[], TGates>;
+
+  // Per-item path-builder form: `foreach(path => path.step(a).step(b), opts)`.
+  // The callback receives a sub-builder seeded with the array's element type and
+  // returns the built per-item path. Each item runs that whole chain as one
+  // concurrent unit (item 0 can be at the last step while item 1 is at the
+  // first) — the only barrier is collecting the `TNextOutput[]` at the end. Pure
+  // sugar over passing a pre-built `SealedWorkflow`: same behavior, but the
+  // element type is inferred so you skip the `Workflow.create<Ctx, Item>()`
+  // boilerplate. A gate in the per-item path is forbidden, same as any foreach
+  // body (`NoGates`).
+  foreach<TNextOutput, TG extends Record<string, unknown> = {}>(
+    build: (path: Workflow<TContext, ElementOf<TOutput>, ElementOf<TOutput>>) => (SealedWorkflow<TContext, ElementOf<TOutput>, TNextOutput, TG> & NoGates<TG>),
+    options?: ForeachOptions<TContext, TOutput, TNextOutput>,
+  ): Workflow<TContext, TInput, TNextOutput[], TGates>;
+
+  // Implementation
+  foreach<TNextOutput>(
+    target:
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      | Agent<TContext, any, TNextOutput>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      | SealedWorkflow<TContext, any, TNextOutput, any>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      | ((path: Workflow<TContext, any, any>) => SealedWorkflow<TContext, any, TNextOutput, any>),
+    options?: ForeachOptions<TContext, TOutput, TNextOutput>,
   ): Workflow<TContext, TInput, TNextOutput[], TGates> {
+    // Callback form: build the per-item path from a fresh element-typed builder.
+    // (Agents / SealedWorkflows are objects, never functions, so `typeof` cleanly
+    // discriminates the builder callback.)
+    const body = typeof target === "function"
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ? target(Workflow.create<TContext, any>())
+      : target;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const node = new ForeachStep(target as any, options as any, this.observability);
+    const node = new ForeachStep(body as any, options as any, this.observability);
     return this.appendStep<TNextOutput[]>(node);
   }
 
