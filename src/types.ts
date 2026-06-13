@@ -1,7 +1,7 @@
 // Public type / API surface for the workflow package. Extracted from
 // workflow.ts to keep that file focused on the run-loop engine + builder.
 // Type-only module (no runtime output); the cycle with ./workflow is safe.
-import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnFinishCallback, IdGenerator, ToolSet } from "ai";
+import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnFinishCallback, IdGenerator, ToolSet, InferUIMessageChunk } from "ai";
 import type { Agent, GenerateTextResult, StreamTextResult, OutputType } from "./agent";
 import type { MaybePromise } from "./utils";
 import type { SealedWorkflow } from "./workflow";
@@ -369,8 +369,12 @@ export type WorkflowResult<TOutput> =
   | { readonly status: "complete"; readonly output: TOutput; readonly warnings: readonly WorkflowWarning[] }
   | { readonly status: "suspended"; readonly snapshot: GateSnapshot; readonly warnings: readonly WorkflowWarning[] };
 
-export interface WorkflowStreamResult<TOutput> {
-  stream: ReadableStream;
+export interface WorkflowStreamResult<TOutput, UI_MESSAGE extends UIMessage = UIMessage> {
+  // Typed over the run's UI message shape so consumers reading the stream get
+  // their narrowed chunk type. Defaults to the unparameterized `UIMessage`,
+  // keeping `WorkflowStreamResult<TOutput>` valid where the message shape isn't
+  // threaded through.
+  stream: ReadableStream<InferUIMessageChunk<UI_MESSAGE>>;
   output: Promise<WorkflowResult<TOutput>>;   // never rejects on suspension; rejects on real errors
 }
 
@@ -443,6 +447,47 @@ export type RepeatOptions<TContext, TOutput> =
 // Extracts the element type from an array type. Resolves to `never` for non-arrays,
 // making foreach uncallable at compile time when the previous step doesn't produce an array.
 export type ElementOf<T> = T extends readonly (infer E)[] ? E : never;
+
+/**
+ * Options for `Workflow.foreach` — shared by the agent / sub-workflow target
+ * form and the per-item path-builder callback form.
+ */
+export interface ForeachOptions<TContext, TOutput, TNextOutput> {
+  /** Override the default step id (`foreach:<agentId>` or the body workflow's id). */
+  id?: string;
+  /**
+   * Max items in flight at any moment. **Default: unbounded** (`Infinity` — every
+   * item runs concurrently, clamped only by item count). Pass an integer to
+   * throttle against provider rate limits. Backed by a worker pool: as soon as
+   * one item completes, the next launches — no lockstep batching.
+   */
+  concurrency?: number;
+  /**
+   * Per-iteration error handler. Return a `TNextOutput` to substitute, return
+   * `Workflow.SKIP` to omit the item, or throw to abort. Invoked sequentially in
+   * index order after all items settle. **Bypassed on the abort path.**
+   */
+  onError?: (params: {
+    error: unknown;
+    item: ElementOf<TOutput>;
+    index: number;
+    ctx: Readonly<TContext>;
+  }) => MaybePromise<TNextOutput | SkipSentinel>;
+  /**
+   * **Stream-mode + agent-target only.** When the workflow is run via
+   * `.stream(...)`, each item's agent runs in stream mode and this hook decides
+   * how its stream surfaces to the writer (`itemIndex` = the item index). Not
+   * invoked for sub-workflow bodies (which stream transitively) nor in generate
+   * mode.
+   */
+  handleStream?: (params: {
+    result: StreamTextResult<ToolSet, OutputType<TNextOutput>>;
+    writer: UIMessageStreamWriter;
+    ctx: Readonly<TContext>;
+    input: ElementOf<TOutput>;
+    itemIndex: number;
+  }) => MaybePromise<void>;
+}
 
 /**
  * Brand that makes a *gated* workflow unassignable where gates are forbidden —

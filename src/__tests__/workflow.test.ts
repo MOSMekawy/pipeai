@@ -2456,6 +2456,26 @@ describe("Workflow", () => {
       const { output } = expectComplete(await resumed2.generate(testCtx, "response-2"));
       expect(output).toBe("done: response-2");
     });
+
+    it("merge may produce an output type distinct from the gate response (TMerged)", async () => {
+      // The gate's response is a string; merge folds it with the prior numeric
+      // output into a record. The downstream step receives that record type
+      // (TMerged), while loadState still validates the response as a string.
+      const schema = { parse: (v: unknown) => { if (typeof v !== "string") throw new Error("not a string"); return v; } };
+      const pipeline = Workflow.create<TestCtx, number>()
+        .step("seed", ({ input }) => input + 1)
+        .gate("g", {
+          schema,
+          merge: ({ priorOutput, response }) => ({ count: priorOutput, note: response }),
+        })
+        .step("finalize", ({ input }) => `${input.note}:${input.count}`);
+
+      const { snapshot } = expectSuspended(await pipeline.generate(testCtx, 41));
+      expect(snapshot.output).toBe(42);
+
+      const { output } = expectComplete(await pipeline.loadState("g", snapshot).generate(testCtx, "ok"));
+      expect(output).toBe("ok:42");
+    });
   });
 
   describe("multi-step streaming", () => {
@@ -3206,11 +3226,15 @@ describe("Workflow", () => {
         // Splice a synthetic step BEFORE the failing one that sets the flag.
         // `steps` is `protected readonly` from TS's POV; `readonly` is a type-only
         // constraint — the array itself is mutable at runtime. Honest test-only hack.
+        // The run loop now dispatches every node as a `Step` (it asks
+        // `node.shouldSkip` then calls `node.execute`), so the synthetic node
+        // mirrors the base normal-step policy.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const stepsArr = (pipeline as any).steps as Array<{ type: string; id: string; execute: (s: { checkpointFailed?: boolean }) => Promise<void> }>;
+        const stepsArr = (pipeline as any).steps as Array<{ type: string; id: string; shouldSkip: (s: { suspension?: unknown; pendingError?: unknown }) => boolean; execute: (s: { checkpointFailed?: boolean }) => Promise<void> }>;
         stepsArr.unshift({
           type: "step",
           id: "set-checkpoint-failed-flag",
+          shouldSkip: (state) => !!state.suspension || !!state.pendingError,
           execute: async (state) => { state.checkpointFailed = true; },
         });
 
@@ -3428,6 +3452,58 @@ describe("Workflow", () => {
       expect(innerLateSpy).not.toHaveBeenCalled();
     });
 
+    it("abort through a nested workflow reports no phantom step failure", async () => {
+      // When the abort fires mid-child-run, the child rethrows the abort reason
+      // and the nested step parks it. That is a cancellation, not a step-logic
+      // failure — onStepError must NOT fire for the nested step (it would
+      // duplicate the abort the caller already gets as the rejection). A step
+      // AFTER the nested one forces the parent's abort-promotion path too.
+      const controller = new AbortController();
+      const onStepError = vi.fn();
+
+      const inner = Workflow.create<TestCtx>()
+        .step("inner-1", async () => {
+          queueMicrotask(() => controller.abort(new Error("inner-abort")));
+          await new Promise((r) => setTimeout(r, 5));
+          return "x";
+        })
+        .step("inner-2", () => "y");
+
+      const pipeline = Workflow.create<TestCtx>({ observability: { onStepError } })
+        .step(inner, { id: "nest" })
+        .step("after", () => "z");
+
+      await expect(
+        pipeline.generate(testCtx, undefined, { abortSignal: controller.signal })
+      ).rejects.toThrow(/inner-abort/);
+      expect(onStepError).not.toHaveBeenCalled();
+    });
+
+    it("a genuine step error before an abort still reports onStepError", async () => {
+      // The no-phantom rule is scoped to the abort reason itself — a real step
+      // failure that happens to precede the abort still surfaces normally.
+      const controller = new AbortController();
+      const onStepError = vi.fn();
+      const barrier = defer<void>();
+
+      const pipeline = Workflow.create<TestCtx>({ observability: { onStepError } })
+        .step("boom", async (): Promise<string> => {
+          queueMicrotask(() => controller.abort(new Error("late-abort")));
+          await barrier.promise;
+          throw new Error("real-failure");
+        })
+        .catch("recover", () => "recovered")
+        .step("after", () => "z");
+
+      const run = pipeline.generate(testCtx, undefined, { abortSignal: controller.signal });
+      await new Promise((r) => setTimeout(r, 5));
+      barrier.resolve();
+      await expect(run).rejects.toThrow(/late-abort/);
+      // The real failure was reported as a step error (the abort is separate).
+      expect(onStepError).toHaveBeenCalledTimes(1);
+      expect(onStepError.mock.calls[0][0].error).toMatchObject({ message: "real-failure" });
+    });
+
     it("stream-mode: output Promise rejects with abort reason", async () => {
       const controller = new AbortController();
       const barrier = defer<void>();
@@ -3616,6 +3692,21 @@ describe("Workflow", () => {
             onCheckpoint: () => {},
             checkpointEvery: bad,
           })).rejects.toThrow(/checkpointEvery must be a positive integer/);
+        }
+      });
+
+      it("warns when checkpointEvery/checkpointWhen is set without an onCheckpoint sink", async () => {
+        const { __resetWarnOnceForTests } = await import("../utils");
+        __resetWarnOnceForTests();
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const pipeline = Workflow.create<TestCtx>().step("s", () => "x");
+          // No onCheckpoint → cadence options do nothing. Likely a forgotten sink.
+          const { output } = expectComplete(await pipeline.generate(testCtx, undefined, { checkpointEvery: 2 }));
+          expect(output).toBe("x");
+          expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("without onCheckpoint"));
+        } finally {
+          warnSpy.mockRestore();
         }
       });
 

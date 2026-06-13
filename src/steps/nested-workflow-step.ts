@@ -1,5 +1,6 @@
-import type { RuntimeState, ConditionalStepOptions, SealedWorkflow } from "../workflow";
-import { prependNestedPath } from "../workflow";
+import { prependNestedPath, type RuntimeState } from "../runtime";
+import type { ConditionalStepOptions } from "../types";
+import type { SealedWorkflow } from "../workflow";
 import { Step } from "./step";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -11,22 +12,21 @@ import { Step } from "./step";
  * {@link SealedWorkflow.executeAsNested}. A gate inside the child leaves
  * `state.suspension` set; this step propagates it up — prepending its own step
  * index to the snapshot's `nestedPath` so resume can descend back here — rather
- * than treating it as an error. Self-contained: runs its own skip /
- * `when`-`otherwise` checks and captures any thrown error onto
- * `state.pendingError`.
+ * than treating it as an error. Self-contained: runs its own `when`-`otherwise`
+ * checks and captures any thrown error onto `state.pendingError`.
  *
  * On resume (`state.resumeDescent` set), it re-enters the child at the recorded
  * index instead of running it fresh; at the innermost level it seeds the merged
  * gate response before resuming the child from `resumeFromIndex + 1`.
  *
- * `nestedWorkflow` is public so the recursive `stepShapeHash` walk (and the
+ * `nestedWorkflow` is set so the recursive `stepShapeHash` walk (and the
  * resume path-walk in `loadState`) can descend into the sub-workflow.
  */
 export class NestedWorkflowStep extends Step {
   readonly type = "step" as const;
-  readonly category = "nested" as const;
+  override readonly category = "nested" as const;
+  override readonly nestedWorkflow: SealedWorkflow<any, any, any, any>;
   readonly id: string;
-  readonly nestedWorkflow: SealedWorkflow<any, any, any, any>;
 
   private readonly options?: ConditionalStepOptions<unknown, unknown, unknown>;
 
@@ -42,9 +42,9 @@ export class NestedWorkflowStep extends Step {
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    // Resume descent: re-enter the child at the recorded index. Handled before
-    // shouldSkip — on resume the parent's pre-gate steps already ran, so this
-    // step is the descent target, not a fresh run.
+    // Resume descent: re-enter the child at the recorded index. Skips the
+    // `when` / `otherwise` check — on resume the parent's pre-gate steps
+    // already ran, so this step is the descent target, not a fresh run.
     const descent = state.resumeDescent;
     if (descent) {
       state.resumeDescent = undefined;   // consume this level
@@ -65,7 +65,6 @@ export class NestedWorkflowStep extends Step {
       return;
     }
 
-    if (this.shouldSkip(state)) return;
     const myIndex = state.stepIndex ?? -1;   // capture before the child overwrites stepIndex
     try {
       // Inside the try so a throwing `when` / `otherwise` routes through

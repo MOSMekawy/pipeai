@@ -1,8 +1,7 @@
 /**
- * A counting semaphore for bounding concurrency.
- *
- * `run(fn)` acquires a permit, runs `fn`, and releases the permit afterwards
- * (even if `fn` throws). Constructing with `Infinity` permits makes it an
+ * A counting semaphore for bounding concurrency. `acquire()` resolves when a
+ * permit is available; `release()` hands the permit to the next waiter (or
+ * returns it to the pool). Constructing with `Infinity` permits makes it an
  * always-open gate (full fan-out — `acquire` never blocks).
  */
 export class Semaphore {
@@ -29,15 +28,6 @@ export class Semaphore {
       next();
     } else {
       this.available++;
-    }
-  }
-
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      this.release();
     }
   }
 }

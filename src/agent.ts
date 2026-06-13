@@ -342,7 +342,22 @@ export class Agent<
       // `undefined` explicitly suppresses some SDK versions' default
       // rethrow-on-partial-stream-error, silently swallowing stream failures.
       const onErrorOption = this.config.onError
-        ? { onError: ({ error }: { error: unknown }) => this.invokeOnError(error, ctx, input) }
+        ? {
+            onError: async ({ error }: { error: unknown }) => {
+              // `invokeOnError` rethrows when the user's handler throws, to
+              // preserve diagnostics. On the generate path that rethrow is
+              // caught by the caller; here it would reject inside the SDK's
+              // stream `onError` callback, which has no error channel and can
+              // surface as an unhandled rejection. Catch it and surface the
+              // failure (original chained as `cause`) so the intent isn't lost.
+              try {
+                await this.invokeOnError(error, ctx, input);
+              } catch (handlerError) {
+                // eslint-disable-next-line no-console
+                console.error(`Agent "${this.id}": onError handler threw on the stream path:`, handlerError);
+              }
+            },
+          }
         : {};
       return streamText({
         ...options,

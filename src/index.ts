@@ -46,6 +46,7 @@ export type {
   ParallelOutputRecord,
   ParallelOutputTuple,
   ParallelOptions,
+  ForeachOptions,
 } from "./workflow";
 
 export { defineTool, ToolProvider, isToolProvider, TOOL_PROVIDER_BRAND } from "./tool-provider";

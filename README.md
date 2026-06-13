@@ -559,6 +559,32 @@ const pipeline = Workflow.create<Ctx>()
   .foreach(processItem, { concurrency: 5 });
 ```
 
+#### Per-item pipelines: the builder-callback form
+
+Each item runs its **entire** sub-workflow as one independent unit, so item 0 can be at the
+last step while item 1 is still at the first — true per-item pipeline parallelism, with the only
+barrier at the end (collecting the `Result[]`). When the per-item path is specific to this
+`foreach`, you don't need to declare a separate named workflow: pass a **builder callback** and
+the element type is inferred for you.
+
+```ts
+const pipeline = Workflow.create<Ctx>()
+  .step("fetch-items", async ({ ctx }) => ctx.db.items.getAll())   // Item[]
+  .foreach(
+    item => item                       // `item` is a sub-builder seeded with the element type
+      .step("normalize", ({ input }) => normalize(input))
+      .step(analyzeAgent)
+      .step(enrichAgent),
+    { concurrency: 5 },                 // up to 5 items running their full path at once
+  );
+```
+
+This is exactly equivalent to passing the pre-built `processItem` workflow above — same
+concurrency, same collect-at-end semantics — it just saves the `Workflow.create<Ctx, Item>()`
+boilerplate and infers the item type from the array. All `foreach` options (`concurrency`,
+`onError`, `id`) apply unchanged. A gate inside the per-item path is forbidden, same as any
+`foreach` body.
+
 #### Streaming `foreach` / `parallel` items
 
 When the workflow is run with `.stream(...)`, pass `handleStream` to `foreach` or `parallel` to run each **agent** item/branch in stream mode and control how it surfaces to the writer — the same hook as a single `.step(agent)`, plus an `itemIndex`:

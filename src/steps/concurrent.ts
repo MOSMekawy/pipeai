@@ -1,8 +1,156 @@
-import type { RuntimeState } from "../workflow";
-import { pushWarning } from "../workflow";
+import type { UIMessageStreamWriter } from "ai";
+import type { MaybePromise } from "../utils";
+import type { Agent } from "../agent";
+import { fireHook, hasItemHooks, pushWarning, type RuntimeState } from "../runtime";
+import type { AgentStepHooks, WorkflowObservability } from "../types";
+import type { SealedWorkflow } from "../workflow";
+import { AgentStep } from "./agent-step";
+import { Semaphore } from "./semaphore";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 /** A unit (foreach item / parallel branch) that rejected. */
 export type UnitFailure = { key: string | number; index: number; error: unknown };
+
+/**
+ * One dispatchable unit of concurrent work: a foreach item or a parallel
+ * branch. `key` is the unit's identity everywhere it surfaces — hook
+ * `itemIndex`, warning namespace, `UnitFailure.key` (foreach: the item index;
+ * parallel: the record key / tuple index). `isWorkflow` is computed by the
+ * owning step (it already discriminates the target at construction) so this
+ * module never needs a value-level `instanceof SealedWorkflow`.
+ */
+export type ConcurrentUnit = {
+  readonly key: string | number;
+  readonly input: unknown;
+  readonly target: Agent<any, any, any> | SealedWorkflow<any, any, any, any>;
+  readonly isWorkflow: boolean;
+};
+
+/**
+ * Validate a `foreach` / `parallel` `concurrency` option: a positive integer
+ * or `Infinity` (full fan-out, clamped by unit count). Rejects NaN / 0 /
+ * negatives and fractional values. Returns the effective value — **default:
+ * unbounded**.
+ */
+export function validateConcurrency(kind: "foreach" | "parallel", value: number | undefined): number {
+  if (
+    value !== undefined &&
+    !((Number.isInteger(value) && value >= 1) || value === Infinity)
+  ) {
+    throw new Error(`${kind}: concurrency must be a positive integer or Infinity, got ${value}`);
+  }
+  return value ?? Infinity;
+}
+
+/**
+ * The dispatch loop shared by `foreach` and `parallel`: run every unit through
+ * a worker pool, fire per-item observability, then reconcile (warning-merge +
+ * abort precedence via {@link reconcileUnits}).
+ *
+ * Per unit: a fresh `RuntimeState` is built — `runOptions` is omitted (per-run
+ * config never crosses the concurrency boundary) while `abortSignal` IS
+ * propagated (cancellation is transitive). Agent units inherit the parent's
+ * stream mode + writer ONLY when a `handleStream` is supplied (else they run
+ * generate — N agent streams are never auto-merged into one writer); workflow
+ * units always inherit, streaming transitively via their own steps.
+ *
+ * Returns the non-gate failures, sorted by unit index, for the calling step's
+ * `onError` semantics. Throws on abort — the calling step's `execute` captures
+ * the throw onto `state.pendingError`.
+ */
+export async function dispatchUnits(params: {
+  state: RuntimeState;
+  stepId: string;
+  kind: "foreach" | "parallel";
+  units: ReadonlyArray<ConcurrentUnit>;
+  concurrency: number;
+  observability: WorkflowObservability | undefined;
+  handleStream?: (params: {
+    result: any;
+    writer: UIMessageStreamWriter;
+    ctx: any;
+    input: any;
+    itemIndex: any;
+  }) => MaybePromise<void>;
+  /** Write the unit's output into the caller's result shape (array / record). */
+  onUnitSuccess: (index: number, output: unknown) => void;
+}): Promise<UnitFailure[]> {
+  const { state, stepId, kind, units, observability, handleStream, onUnitSuccess } = params;
+  const unitStates: (RuntimeState | undefined)[] = new Array(units.length);
+  const wantItemHooks = hasItemHooks(observability);
+
+  const executeUnit = async (unit: ConcurrentUnit, index: number) => {
+    const inheritStreaming = unit.isWorkflow || handleStream !== undefined;
+    const unitState: RuntimeState = {
+      ctx: state.ctx,
+      output: unit.input,
+      mode: inheritStreaming ? state.mode : "generate",
+      writer: inheritStreaming ? state.writer : undefined,
+      abortSignal: state.abortSignal,
+    };
+    unitStates[index] = unitState;
+    const unitStart = wantItemHooks ? performance.now() : 0;
+    if (wantItemHooks) {
+      await fireHook(observability, state, "onItemStart", {
+        stepId, type: kind, itemIndex: unit.key, ctx: state.ctx, input: unit.input,
+      });
+    }
+    try {
+      if (unit.isWorkflow) {
+        await (unit.target as SealedWorkflow<any, any, any, any>).executeAsNested(unitState);
+      } else {
+        await AgentStep.runAgent(
+          unitState,
+          unit.target as Agent<any, any, any>,
+          state.ctx,
+          handleStream ? ({ handleStream } as AgentStepHooks<any, any, any>) : undefined,
+          unit.key,
+        );
+      }
+      onUnitSuccess(index, unitState.output);
+      if (wantItemHooks) {
+        await fireHook(observability, state, "onItemFinish", {
+          stepId, type: kind, itemIndex: unit.key, ctx: state.ctx, output: unitState.output,
+          durationMs: performance.now() - unitStart,
+        });
+      }
+    } catch (error) {
+      if (wantItemHooks) {
+        await fireHook(observability, state, "onItemError", {
+          stepId, type: kind, itemIndex: unit.key, ctx: state.ctx, error,
+          durationMs: performance.now() - unitStart,
+        });
+      }
+      throw error;
+    }
+  };
+
+  // Bounded dispatch: a Semaphore gates the loop, acquiring a permit BEFORE
+  // launching each unit so only K are ever in flight (`Infinity` → full
+  // fan-out). Units self-evict from `inflight` on settle, so the set retains
+  // O(K) promises, not O(N).
+  const sem = new Semaphore(params.concurrency);
+  const failures: UnitFailure[] = [];
+  const inflight = new Set<Promise<void>>();
+  for (let i = 0; i < units.length; i++) {
+    if (state.abortSignal?.aborted) break;
+    await sem.acquire();
+    if (state.abortSignal?.aborted) { sem.release(); break; }
+    const index = i;
+    const unit = (async () => {
+      try { await executeUnit(units[index], index); }
+      catch (error) { failures.push({ key: units[index].key, index, error }); }
+      finally { sem.release(); }
+    })();
+    inflight.add(unit);
+    void unit.finally(() => inflight.delete(unit));
+  }
+  await Promise.all(inflight);
+  failures.sort((a, b) => a.index - b.index);
+
+  return reconcileUnits(state, stepId, failures, units.length, (i) => units[i].key, unitStates, state.abortSignal);
+}
 
 /**
  * Post-dispatch policy shared by `foreach` and `parallel`. Merges each unit's

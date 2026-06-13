@@ -1,5 +1,5 @@
 import type { MaybePromise } from "../utils";
-import type { RuntimeState } from "../workflow";
+import type { RuntimeState } from "../runtime";
 import { Step } from "./step";
 
 /**
@@ -18,7 +18,7 @@ import { Step } from "./step";
 export class FinallyStep extends Step {
   readonly type = "finally" as const;
   readonly id: string;
-  protected readonly errorSource = "finally" as const;
+  protected override readonly errorSource = "finally" as const;
 
   private readonly fn: (params: { ctx: Readonly<unknown> }) => MaybePromise<void>;
 
@@ -29,12 +29,11 @@ export class FinallyStep extends Step {
   }
 
   // Always runs — cleanup must fire regardless of suspension / error state.
-  protected override shouldSkip(_state: RuntimeState): boolean {
+  override shouldSkip(_state: RuntimeState): boolean {
     return false;
   }
 
   override async execute(state: RuntimeState): Promise<void> {
-    if (this.shouldSkip(state)) return;
     // A throw here is intentionally NOT caught — it bubbles out of the run.
     await this.fn({ ctx: state.ctx as Readonly<unknown> });
   }
