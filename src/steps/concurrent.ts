@@ -149,7 +149,7 @@ export async function dispatchUnits(params: {
   await Promise.all(inflight);
   failures.sort((a, b) => a.index - b.index);
 
-  return reconcileUnits(state, stepId, failures, units.length, (i) => units[i].key, unitStates, state.abortSignal);
+  return reconcileUnits(state, stepId, failures, units, unitStates);
 }
 
 /**
@@ -169,10 +169,8 @@ export function reconcileUnits(
   state: RuntimeState,
   id: string,
   failures: UnitFailure[],
-  count: number,
-  keyAt: (index: number) => string | number,
+  units: ReadonlyArray<ConcurrentUnit>,
   unitStates: ReadonlyArray<RuntimeState | undefined>,
-  signal: AbortSignal | undefined,
 ): UnitFailure[] {
   // Merge per-unit warnings into the parent (every exit path, once). Also assert
   // the no-gate-in-a-concurrent-unit invariant: gated targets are forbidden at
@@ -180,27 +178,27 @@ export function reconcileUnits(
   // purely type-level. If a cast bypassed it and a unit suspended, its
   // suspension would otherwise be silently dropped (only `unitState.output` is
   // read) — so fail loud instead.
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < units.length; i++) {
     const us = unitStates[i];
     if (!us) continue;
     if (us.suspension) {
       throw new Error(
-        `internal: gate "${us.suspension.gateId}" suspended inside concurrent unit ${id}[${keyAt(i)}]. ` +
+        `internal: gate "${us.suspension.gateId}" suspended inside concurrent unit ${id}[${units[i].key}]. ` +
         `Gates are forbidden in foreach / parallel targets — a cast must have bypassed the build-time guard.`
       );
     }
     if (!us.warnings) continue;
     for (const w of us.warnings) {
-      pushWarning(state, w.source, `${id}[${keyAt(i)}]:${w.stepId}`, w.error);
+      pushWarning(state, w.source, `${id}[${units[i].key}]:${w.stepId}`, w.error);
     }
   }
 
   // Cooperative cancellation wins over onError and suspension.
-  if (signal?.aborted) {
+  if (state.abortSignal?.aborted) {
     for (const f of failures) {
       pushWarning(state, "foreach-sibling", `${id}[${f.key}]`, f.error);
     }
-    throw signal.reason ?? new Error("Workflow aborted");
+    throw state.abortSignal.reason ?? new Error("Workflow aborted");
   }
 
   // Hand the failures back for the caller's `onError` handling.
