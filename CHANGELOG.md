@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+
+- **`fromSdkAgent(agent, { mapInput, hasOutput?, validateOutput?, id? })`** — adapt a Vercel AI SDK v7 agent (`ToolLoopAgent` / any value implementing the SDK `Agent` interface) into a `Workflow.step(...)` target. Bridges pipeai's positional `(ctx, input)` call convention to the SDK agent's single `{ prompt | messages }` object. The SDK agent fixes its `runtimeContext` / tools at construction, so pipeai's per-call `ctx` only reaches `mapInput`.
+- **`AgentLike<TContext, TInput, TOutput>` interface** — the minimal surface a workflow step needs from an agent (`id`, `hasOutput`, `validateOutput?`, `generate`, `stream`). `Agent` now implements it, and `Workflow.step()` / `Workflow.from()` accept it, so native agents and `fromSdkAgent(...)` adapters are interchangeable step targets.
+
+### Docs
+
+- Documented that AI SDK v7's `toolApproval` passes through a pipeai `Agent` (auto approve/deny policy works with no new code), and the `agent → gate → agent` pattern for durable human-in-the-loop approval.
+
+## [1.0.0] - 2026-06-28
+
+### Changed
+
+- **Migrated to Vercel AI SDK v7 (`ai` peer `^6` → `^7`); dropped v6 support.** AI SDK v7 is **ESM-only** and requires **Node.js ≥ 22** — pipeai inherits both. The package is now ESM-only as well: the CommonJS build (`dist/index.cjs` and the `require` export condition) has been removed, since a CJS bundle cannot `require()` the ESM-only `ai@7`. Consumers needing AI SDK v6 should stay on the pipeai 0.9.x line.
+- **Agent config fields renamed to mirror v7's vocabulary** (the SDK renamed these; pipeai is a thin typed passthrough, so it follows):
+  - `system` → `instructions`
+  - `onFinish` → `onEnd`
+  - `onStepFinish` → `onStepEnd`
+
+  `WorkflowStreamOptions.onFinish` → `onEnd` likewise. The `WorkflowObservability` hooks (`onStepStart` / `onStepFinish` / `onStepError`) are **unchanged** — they are pipeai's own per-workflow-step lifecycle vocabulary, not SDK passthrough.
+- **zod peer narrowed to `^3.25.76 || ^4.1.8`** to match ai@7's requirement (was `>=3.0.0 || >=4.0.0`).
+
+### Migration notes (consumer-facing AI SDK v7 behavior changes pipeai relays)
+
+The raw SDK result is passed to your `onEnd` / `onStepEnd` / step `mapResult` / `onResult` / `asTool` `mapOutput` hooks, so these v7 semantics now apply:
+
+- The result's `usage` / `content` / `toolCalls` / `toolResults` / `sources` are now **cumulative across all steps** (previously final-step-only). Use `result.finalStep` for last-step-only values; `result.totalUsage` is deprecated in favor of `result.usage`.
+- System-role messages embedded in a `messages[]` array are **rejected by default**. Put system text in the agent's `instructions` field (or pass `allowSystemInMessages: true` through to the SDK).
+- A passthrough `onChunk` callback now fires for **every** stream-part type; guard on `chunk.type`.
+- Internally, the agent stream-merge moved from the deprecated `result.toUIMessageStream()` instance method to the top-level `toUIMessageStream({ stream })` helper.
+
 ## [0.9.0] - 2026-06-12
 
 ### Added

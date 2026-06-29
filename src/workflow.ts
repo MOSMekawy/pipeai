@@ -3,7 +3,7 @@ import {
   type UIMessage,
   type UIMessageStreamWriter,
 } from "ai";
-import { type Agent } from "./agent";
+import { type Agent, type AgentLike } from "./agent";
 import { computeStepShapeHash, deepFreeze, warnOnce, SKIP, type MaybePromise } from "./utils";
 import { TransformStep } from "./steps/transform-step";
 import { AgentStep } from "./steps/agent-step";
@@ -391,7 +391,7 @@ export class SealedWorkflow<
         }
       },
       ...(options?.onError ? { onError: options.onError } : {}),
-      ...(options?.onFinish ? { onFinish: options.onFinish } : {}),
+      ...(options?.onEnd ? { onEnd: options.onEnd } : {}),
       ...(options?.originalMessages ? { originalMessages: options.originalMessages } : {}),
       ...(options?.generateId ? { generateId: options.generateId } : {}),
     });
@@ -1028,15 +1028,15 @@ export class Workflow<
   // to `TInput | TOutput`, mirroring the `step` overloads. Declared first so it
   // wins when `otherwise` is absent.
   static from<TContext, TInput, TOutput>(
-    agent: Agent<TContext, TInput, TOutput>,
+    agent: AgentLike<TContext, TInput, TOutput>,
     options: StepOptions<TContext, TInput, TOutput> & SkipPassthrough<TContext, TInput, TOutput>
   ): Workflow<TContext, TInput, TInput | TOutput>;
   static from<TContext, TInput, TOutput>(
-    agent: Agent<TContext, TInput, TOutput>,
+    agent: AgentLike<TContext, TInput, TOutput>,
     options?: StepOptions<TContext, TInput, TOutput>
   ): Workflow<TContext, TInput, TOutput>;
   static from<TContext, TInput, TOutput>(
-    agent: Agent<TContext, TInput, TOutput>,
+    agent: AgentLike<TContext, TInput, TOutput>,
     options?: StepOptions<TContext, TInput, TOutput>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Workflow<TContext, TInput, any> {
@@ -1058,11 +1058,11 @@ export class Workflow<
   // when `otherwise` is absent.
 
   step<TNextOutput>(
-    agent: Agent<TContext, TOutput, TNextOutput>,
+    agent: AgentLike<TContext, TOutput, TNextOutput>,
     options: StepOptions<TContext, TOutput, TNextOutput> & SkipPassthrough<TContext, TOutput, TNextOutput>
   ): Workflow<TContext, TInput, TOutput | TNextOutput, TGates>;
   step<TNextOutput>(
-    agent: Agent<TContext, TOutput, TNextOutput>,
+    agent: AgentLike<TContext, TOutput, TNextOutput>,
     options?: StepOptions<TContext, TOutput, TNextOutput>
   ): Workflow<TContext, TInput, TNextOutput, TGates>;
 
@@ -1097,7 +1097,7 @@ export class Workflow<
   // ── step: implementation ──────────────────────────────────────
 
   step<TNextOutput>(
-    target: Agent<TContext, TOutput, TNextOutput> | SealedWorkflow<TContext, TOutput, TNextOutput> | string,
+    target: AgentLike<TContext, TOutput, TNextOutput> | SealedWorkflow<TContext, TOutput, TNextOutput> | string,
     optionsOrFn?: StepOptions<TContext, TOutput, TNextOutput> | NestedStepOptions<TContext, TOutput, TNextOutput> | ((params: { ctx: Readonly<TContext>; input: TOutput; writer?: UIMessageStreamWriter }) => MaybePromise<TNextOutput>),
     inlineOptions?: InlineStepOptions<TContext, TOutput, TNextOutput>,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1135,7 +1135,7 @@ export class Workflow<
     const node = new AgentStep(
       options?.id ?? agent.id,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      agent as Agent<any, any, any>,
+      agent as AgentLike<any, any, any>,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       options as StepOptions<any, any, any> | undefined,
     );

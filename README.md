@@ -1,6 +1,6 @@
 # pipeai
 
-A typed multi-agent workflow pipeline built on top of the [Vercel AI SDK v6](https://sdk.vercel.ai/). It provides two core primitives — **Agent** and **Workflow** — that compose into declarative, streamable AI pipelines with shared context and typed outputs.
+A typed multi-agent workflow pipeline built on top of the [Vercel AI SDK v7](https://sdk.vercel.ai/). It provides two core primitives — **Agent** and **Workflow** — that compose into declarative, streamable AI pipelines with shared context and typed outputs.
 
 Agents are pure AI SDK wrappers that return native `GenerateTextResult` / `StreamTextResult`. Workflows chain agents into pipelines with automatic stream merging, deterministic agent routing, and typed output extraction.
 
@@ -25,11 +25,13 @@ Peer dependencies:
 ```json
 {
   "peerDependencies": {
-    "ai": "^6.0.0",
-    "zod": ">=3.0.0 || >=4.0.0"
+    "ai": "^7.0.0",
+    "zod": "^3.25.76 || ^4.1.8"
   }
 }
 ```
+
+> **AI SDK v7.** pipeai 1.x targets Vercel AI SDK v7, which is **ESM-only** and requires **Node.js ≥ 22**. Provider packages (e.g. `@ai-sdk/openai`) must be on their v7-compatible (provider-spec v4) versions. For AI SDK v6, stay on pipeai 0.9.x.
 
 ## Agent
 
@@ -49,7 +51,7 @@ type Ctx = {
 const assistant = new Agent<Ctx, string>({
   id: "assistant",
   model: openai("gpt-4o"),
-  system: "You are a helpful assistant.",
+  instructions: "You are a helpful assistant.",
   prompt: (ctx, input) => input,
   tools: { search, writeFile },
 });
@@ -89,7 +91,7 @@ const classifier = new Agent<Ctx, { title: string; body: string }>({
   input: z.object({ title: z.string(), body: z.string() }),
   output: Output.object({ schema: classificationSchema }),
   model: openai("gpt-4o-mini"),
-  system: "Classify support tickets.",
+  instructions: "Classify support tickets.",
   prompt: (ctx, input) => `Title: ${input.title}\n\nBody: ${input.body}`,
 });
 
@@ -105,7 +107,7 @@ Most config fields accept a static value or a `(ctx, input) => value` function:
 const agent = new Agent<Ctx, string>({
   id: "adaptive",
   model: (ctx) => ctx.isPremium ? openai("gpt-4o") : openai("gpt-4o-mini"),
-  system: (ctx) => `You assist ${ctx.userName}. Role: ${ctx.role}.`,
+  instructions: (ctx) => `You assist ${ctx.userName}. Role: ${ctx.role}.`,
   tools: (ctx) => {
     const base = { search: searchTool };
     if (ctx.isAdmin) return { ...base, deleteUser: deleteUserTool };
@@ -117,20 +119,21 @@ const agent = new Agent<Ctx, string>({
 
 ### AI SDK callbacks
 
-Same callback names as AI SDK v6, extended with `ctx`, `input`, and `writer`. The AI SDK event payload is available as `result`. When the agent runs inside a streaming workflow, `writer` is available for writing metadata or custom stream parts:
+Mirror the AI SDK's callback names (`onEnd`, `onStepEnd`), extended with `ctx`, `input`, and `writer`. The AI SDK event payload is available as `result`. When the agent runs inside a streaming workflow, `writer` is available for writing metadata or custom stream parts:
 
 ```ts
 const agent = new Agent<Ctx, string>({
   id: "monitored",
   model: openai("gpt-4o"),
   prompt: (ctx, input) => input,
-  onStepFinish: ({ result, ctx, writer }) => {
+  onStepEnd: ({ result, ctx, writer }) => {
     console.log(`Step done, used ${result.usage.totalTokens} tokens`);
     // Stream progress metadata to the client
     writer?.write({ type: "metadata", value: { tokensUsed: result.usage.totalTokens } });
   },
-  onFinish: ({ result, ctx }) => {
-    console.log(`Total: ${result.totalUsage.totalTokens} tokens`);
+  onEnd: ({ result, ctx }) => {
+    // v7: `usage` is cumulative across all steps (was `totalUsage`)
+    console.log(`Total: ${result.usage.totalTokens} tokens`);
   },
   onError: ({ error, ctx }) => {
     ctx.logger.error("Agent failed", error);
@@ -148,15 +151,15 @@ const agent = new Agent<Ctx, string>({
 | `output`      | `Output`                  | AI SDK Output (e.g. `Output.object({ schema })`). Infers `TOutput`. |
 | `validateOutput` | `ZodType<TOutput>`     | Optional runtime guard. Validates the structured `output` after the SDK parses it (distinct from `tool.outputSchema`). Catches SDK-side parse drift. |
 | `model`       | `Resolvable`              | Language model. Static or `(ctx, input) => model`.                |
-| `system`      | `Resolvable`              | System prompt.                                                    |
+| `instructions`| `Resolvable`              | System prompt / instructions.                                     |
 | `prompt`      | `Resolvable`              | String prompt. Mutually exclusive with `messages`.                |
 | `messages`    | `Resolvable`              | Message array. Mutually exclusive with `prompt`.                  |
 | `tools`       | `Resolvable`              | Tool map. Supports `Tool`, `ToolProvider`, and `agent.asTool()`.  |
 | `activeTools` | `Resolvable`              | Subset of tool names to enable.                                   |
 | `toolChoice`  | `Resolvable`              | Tool choice strategy. Static or `(ctx, input) => toolChoice`.     |
 | `stopWhen`    | `StopCondition` &#124; `StopCondition[]` | Condition(s) for stopping the tool loop. **Static only** — not a `Resolvable`. A bare function is ambiguous with the resolver form, so dynamic stop conditions require building the agent per call. |
-| `onStepFinish`| `({ result, ctx, input, writer? })`| Called after each step. `writer` available in streaming workflows. |
-| `onFinish`    | `({ result, ctx, input, writer? })`| Called when all steps complete.                                   |
+| `onStepEnd`   | `({ result, ctx, input, writer? })`| Called after each step. `writer` available in streaming workflows. |
+| `onEnd`       | `({ result, ctx, input, writer? })`| Called when all steps complete.                                   |
 | `onError`     | `({ error, ctx, input, writer? })` | Called on error.                                                  |
 | `...`         | AI SDK options            | All other `streamText`/`generateText` options pass through (e.g. `temperature`, `maxTokens`, `maxRetries`, `headers`, `prepareStep`, `onChunk`, etc.). |
 
@@ -190,7 +193,7 @@ const qaAgent = new Agent<Ctx, { question: string }>({
 const orchestrator = new Agent<Ctx, string>({
   id: "orchestrator",
   model: openai("gpt-4o"),
-  system: "Delegate work to the right specialist.",
+  instructions: "Delegate work to the right specialist.",
   prompt: (ctx, input) => input,
   tools: (ctx) => ({
     coding: codingAgent.asTool(ctx),
@@ -225,7 +228,7 @@ codingAgent.asTool(ctx, {
 const orchestrator = new Agent<Ctx, string>({
   id: "orchestrator",
   model: openai("gpt-4o"),
-  system: "Delegate work to the right specialist.",
+  instructions: "Delegate work to the right specialist.",
   prompt: (ctx, input) => input,
   tools: {
     // Context resolved when the orchestrator's tools are resolved
@@ -277,6 +280,36 @@ const agent = new Agent<Ctx, string>({
 ```
 
 The `writer` is `undefined` when running in generate mode or standalone — `?.` handles both cases naturally.
+
+## Using a Vercel AI SDK agent as a step (`fromSdkAgent`)
+
+pipeai's `Agent` is the native primitive, but you can also drop a **Vercel AI SDK v7 agent** — a `ToolLoopAgent` (exported by `ai`, also as `Experimental_Agent`) or anything implementing the SDK `Agent` interface — into a workflow with `fromSdkAgent`:
+
+```ts
+import { ToolLoopAgent } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { Workflow, fromSdkAgent } from "pipeai";
+
+const researcher = new ToolLoopAgent({
+  id: "researcher",
+  model: openai("gpt-4o"),
+  instructions: "Research the topic and summarise it.",
+  tools: { /* ... */ },
+});
+
+const pipeline = Workflow.create<Ctx, string>()
+  .step(fromSdkAgent(researcher, {
+    // Turn pipeai's (ctx, input) into the SDK agent's prompt / messages.
+    mapInput: (ctx, input) => ({ prompt: input }),
+    // Set true if the agent was built with a structured `output`.
+    hasOutput: false,
+  }))
+  .step("format", ({ input }) => input.trim());
+```
+
+`fromSdkAgent` returns an `AgentLike` — the small interface (`id`, `hasOutput`, `validateOutput?`, `generate`, `stream`) that `Workflow.step()` accepts. pipeai's own `Agent` implements it too, so native agents and adapted SDK agents are interchangeable step targets.
+
+**Limitation — `ctx` is not threaded into the SDK agent's tools.** A `ToolLoopAgent` fixes its `runtimeContext` and tools at construction, so pipeai's per-call `ctx` is available only inside `mapInput` (to build the prompt). If you need context-driven, per-call tools, use a native pipeai `Agent` with `defineTool` / `asToolProvider` instead.
 
 ## Workflow
 
@@ -420,7 +453,7 @@ const classifier = new Agent<Ctx>({
   id: "classifier",
   output: Output.object({ schema: classifierOutput }),
   model: openai("gpt-4o-mini"),
-  system: "Classify the user's request. Pick the best agent.",
+  instructions: "Classify the user's request. Pick the best agent.",
   messages: (ctx) => ctx.chatHistory,
 });
 
@@ -497,7 +530,7 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Fine-grained stream control
 
-Override how each agent's stream is merged into the workflow stream. By default, every agent's output is merged via `writer.merge(result.toUIMessageStream())`. Use `handleStream` to take control — the callback receives `{ result, writer, ctx }`:
+Override how each agent's stream is merged into the workflow stream. By default, every agent's output is merged via `writer.merge(toUIMessageStream({ stream: result.stream }))`. Use `handleStream` to take control — the callback receives `{ result, writer, ctx }`:
 
 ```ts
 const pipeline = Workflow.create<Ctx>()
@@ -512,7 +545,7 @@ const pipeline = Workflow.create<Ctx>()
   .step(supportAgent, {
     handleStream: async ({ result, writer, ctx }) => {
       writer.write({ type: "metadata", value: { agentId: "support", userId: ctx.userId } });
-      writer.merge(result.toUIMessageStream());
+      writer.merge(toUIMessageStream({ stream: result.stream }));
     },
   });
 ```
@@ -594,14 +627,14 @@ When the workflow is run with `.stream(...)`, pass `handleStream` to `foreach` o
 .foreach(summarizer, {
   handleStream: ({ result, writer, input, itemIndex }) => {
     writer.write({ type: "data-item-start", data: { itemIndex } });
-    writer.merge(result.toUIMessageStream());
+    writer.merge(toUIMessageStream({ stream: result.stream }));
   },
 })
 
 // parallel record form: itemIndex is the branch key
 .parallel({ summary: summarizer, sentiment: classifier }, {
   handleStream: ({ result, writer, itemIndex }) => {
-    if (itemIndex === "summary") writer.merge(result.toUIMessageStream());
+    if (itemIndex === "summary") writer.merge(toUIMessageStream({ stream: result.stream }));
   },
 })
 ```
@@ -693,7 +726,7 @@ Gates inside parallel branches throw `NestedGateUnsupportedError`, same as `fore
 const refiner = new Agent<Ctx, string, string>({
   id: "refiner",
   model: openai("gpt-4o"),
-  system: "Improve the given text. Make it clearer and more concise.",
+  instructions: "Improve the given text. Make it clearer and more concise.",
   prompt: (ctx, input) => input,
 });
 
@@ -751,7 +784,7 @@ const pipeline = Workflow.create<Ctx>()
 
 ### Stream callbacks
 
-`stream()` accepts the same callbacks as AI SDK's `createUIMessageStream` — `onError` for custom error messages and `onFinish` for post-stream cleanup:
+`stream()` accepts the same callbacks as AI SDK's `createUIMessageStream` — `onError` for custom error messages and `onEnd` for post-stream cleanup:
 
 ```ts
 const { stream, output } = pipeline.stream(ctx, initialInput, {
@@ -760,7 +793,7 @@ const { stream, output } = pipeline.stream(ctx, initialInput, {
     console.error("Stream error", error);
     return "An error occurred while processing your request.";
   },
-  onFinish: async () => {
+  onEnd: async () => {
     // Called when the stream closes — useful for analytics, cleanup
     await analytics.track("workflow-stream-complete");
   },
@@ -1025,6 +1058,31 @@ type WorkflowSnapshot = GateSnapshot | CheckpointSnapshot | LegacyGateSnapshotV1
 > **Rolling-deploy hazard:** A 0.4.0 process receiving a 0.5.0-persisted v2 gate snapshot rejects via the strict `version === 1` check. Drain in-flight snapshots before cutover, ship a 0.4.x forward-compat patch ahead, or version-tag storage keys.
 
 > **Long-lived storage:** For Redis-without-TTL / S3 / Postgres, call `migrateSnapshot(legacy)` before v0.8.0+ drops v1 acceptance.
+
+### Tool approvals
+
+AI SDK v7's `toolApproval` is a plain `generateText` / `streamText` option, so it **passes straight through** a pipeai `Agent` — auto-approve / auto-deny policy works with no extra wiring:
+
+```ts
+const agent = new Agent<Ctx, string>({
+  id: "ops",
+  model: openai("gpt-4o"),
+  prompt: (ctx, input) => input,
+  tools: { deleteFile: /* ... */ },
+  toolApproval: {
+    // Auto-deny outside /tmp; everything else runs normally.
+    deleteFile: ({ path }) => (path.startsWith("/tmp/") ? undefined : "denied"),
+  },
+});
+```
+
+**Durable human-in-the-loop** (a real person approves before the tool runs) is a *suspend/resume* flow: when a tool resolves to `'user-approval'`, the SDK stops the agent's tool loop and returns a `tool-approval-request`; you resume with a second call carrying a `tool-approval-response` message. That pause happens *inside* a single agent call — **below** pipeai's step granularity, since pipeai suspends only between steps (see [`gate()`](#human-in-the-loop-via-gate)). So model the approval as a **gate boundary** rather than suspending mid-agent:
+
+1. Configure the agent (via `stopWhen`) to stop with the proposed action as its output instead of executing the sensitive tool.
+2. Follow it with a `gate(...)` whose schema is the approval decision.
+3. On resume, a second step continues the conversation (threading the messages through `ctx` / output), executing or rejecting the action.
+
+This rides pipeai's existing, snapshot-persisted gate suspend/resume. Transparent mid-agent-call approval is intentionally **not** supported — it would require parking live SDK execution state, which the gate/checkpoint model can't serialize.
 
 ## Step-level checkpointing via `onCheckpoint`
 
@@ -1381,7 +1439,7 @@ const classifier = new Agent<Ctx>({
     }),
   }),
   model: openai("gpt-4o-mini"),
-  system: "Classify the user's request. Pick the best agent.",
+  instructions: "Classify the user's request. Pick the best agent.",
   messages: (ctx) => ctx.chatHistory,
 });
 
@@ -1389,7 +1447,7 @@ const classifier = new Agent<Ctx>({
 const bugAgent = new Agent<Ctx>({
   id: "bug",
   model: openai("gpt-4o"),
-  system: "You help users debug issues.",
+  instructions: "You help users debug issues.",
   messages: (ctx) => ctx.chatHistory,
   tools: { searchLogs, createTicket },
 });
@@ -1397,14 +1455,14 @@ const bugAgent = new Agent<Ctx>({
 const featureAgent = new Agent<Ctx>({
   id: "feature",
   model: openai("gpt-4o"),
-  system: "You help with feature requests.",
+  instructions: "You help with feature requests.",
   messages: (ctx) => ctx.chatHistory,
 });
 
 const questionAgent = new Agent<Ctx>({
   id: "question",
   model: openai("gpt-4o"),
-  system: "You answer general questions.",
+  instructions: "You answer general questions.",
   messages: (ctx) => ctx.chatHistory,
 });
 

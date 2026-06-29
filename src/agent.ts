@@ -2,6 +2,7 @@ import {
   generateText,
   streamText,
   tool,
+  toUIMessageStream,
   Output,
   type GenerateTextResult as AIGenerateTextResult,
   type StreamTextResult as AIStreamTextResult,
@@ -12,8 +13,8 @@ import {
   type ToolSet,
   type StopCondition,
   type ToolChoice,
-  type OnStepFinishEvent,
-  type OnFinishEvent,
+  type GenerateTextStepEndEvent,
+  type GenerateTextEndEvent,
 } from "ai";
 
 // Extract the Output interface type from the Output.object return type
@@ -28,8 +29,14 @@ type AgentToolSet<TContext> = Record<string, Tool | IToolProvider<TContext>>;
 
 // ── Result type aliases ─────────────────────────────────────────────
 
-export type GenerateTextResult<TOOLS extends ToolSet = ToolSet, OUTPUT extends OutputType = OutputType> = AIGenerateTextResult<TOOLS, OUTPUT>;
-export type StreamTextResult<TOOLS extends ToolSet = ToolSet, OUTPUT extends OutputType = OutputType> = AIStreamTextResult<TOOLS, OUTPUT>;
+// AI SDK v7 gave GenerateTextResult/StreamTextResult/tool() a RUNTIME_CONTEXT /
+// CONTEXT type param (the SDK's `Context`, which is `Record<string, unknown>` and is
+// not exported by name). pipeai doesn't use SDK tool-context — it injects context via
+// tool-providers — so we pin that slot to the base shape.
+type SdkContext = Record<string, unknown>;
+
+export type GenerateTextResult<TOOLS extends ToolSet = ToolSet, OUTPUT extends OutputType = OutputType> = AIGenerateTextResult<TOOLS, SdkContext, OUTPUT>;
+export type StreamTextResult<TOOLS extends ToolSet = ToolSet, OUTPUT extends OutputType = OutputType> = AIStreamTextResult<TOOLS, SdkContext, OUTPUT>;
 
 /**
  * The result passed to `asTool` / `asToolProvider`'s `mapOutput`.
@@ -53,15 +60,18 @@ type StreamTextOptions = Parameters<typeof streamText>[0];
 type GenerateTextOptions = Parameters<typeof generateText>[0];
 
 // Keys we replace with resolvable or context-enriched versions
+// We omit both the v7 canonical keys (instructions/onEnd/onStepEnd) and their
+// deprecated v6 aliases (system/onFinish/onStepFinish) so neither spelling leaks
+// into the public passthrough surface and silently overrides a managed key.
 type ManagedKeys =
-  | 'model' | 'system' | 'prompt' | 'messages'
+  | 'model' | 'system' | 'instructions' | 'prompt' | 'messages'
   | 'tools' | 'activeTools' | 'toolChoice' | 'stopWhen'
-  | 'output' | 'onFinish' | 'onStepFinish' | 'onError';
+  | 'output' | 'onFinish' | 'onEnd' | 'onStepFinish' | 'onStepEnd' | 'onError';
 
 // Combine options from both streamText and generateText.
 // Each side contributes its unique props; shared props merge naturally.
 // Stream-only props (onChunk, onAbort) are ignored by generateText.
-// Generate-only props (experimental_include.responseBody) are ignored by streamText.
+// Generate-only props (include.responseBody) are ignored by streamText.
 type AIPassthroughOptions =
   Omit<StreamTextOptions, ManagedKeys> &
   Omit<GenerateTextOptions, ManagedKeys>;
@@ -71,7 +81,7 @@ type AIPassthroughOptions =
 interface ResolvedAgentConfig {
   model: LanguageModel;
   prompt: string | undefined;
-  system: string | undefined;
+  instructions: string | undefined;
   messages: ModelMessage[] | undefined;
   tools: Record<string, Tool>;
   activeTools: string[] | undefined;
@@ -101,7 +111,7 @@ export interface AgentConfig<
 
   // ── Resolvable (our versions of AI SDK properties) ──
   model: Resolvable<TContext, TInput, LanguageModel>;
-  system?: Resolvable<TContext, TInput, string>;
+  instructions?: Resolvable<TContext, TInput, string>;
   prompt?: Resolvable<TContext, TInput, string>;
   messages?: Resolvable<TContext, TInput, ModelMessage[]>;
   tools?: Resolvable<TContext, TInput, AgentToolSet<TContext>>;
@@ -121,9 +131,37 @@ export interface AgentConfig<
 
   // ── Context-enriched callbacks (replace AI SDK versions) ──
   // `writer` is available when the agent runs inside a streaming workflow.
-  onStepFinish?: (params: { result: OnStepFinishEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
-  onFinish?: (params: { result: OnFinishEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
+  onStepEnd?: (params: { result: GenerateTextStepEndEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
+  onEnd?: (params: { result: GenerateTextEndEvent; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
   onError?: (params: { error: unknown; ctx: Readonly<TContext>; input: TInput; writer?: UIMessageStreamWriter }) => MaybePromise<void>;
+}
+
+// ── AgentLike ───────────────────────────────────────────────────────
+
+/**
+ * The minimal surface a workflow step needs from an "agent": identity, whether
+ * it produces structured output, an optional output validator, and the
+ * `generate` / `stream` call methods. The {@link Agent} class implements this,
+ * and `fromSdkAgent` adapts a Vercel AI SDK v7 agent (`ToolLoopAgent` or any
+ * value implementing the SDK `Agent` interface) to it — so both can be passed
+ * to `Workflow.step(...)`.
+ */
+export interface AgentLike<TContext, TInput = void, TOutput = void> {
+  readonly id: string;
+  readonly hasOutput: boolean;
+  readonly validateOutput?: ZodType<TOutput>;
+  generate(
+    ctx: TContext,
+    ...args: TInput extends void
+      ? [input?: TInput, options?: { abortSignal?: AbortSignal }]
+      : [input: TInput, options?: { abortSignal?: AbortSignal }]
+  ): Promise<GenerateTextResult<ToolSet, OutputType<TOutput>>>;
+  stream(
+    ctx: TContext,
+    ...args: TInput extends void
+      ? [input?: TInput, options?: { abortSignal?: AbortSignal }]
+      : [input: TInput, options?: { abortSignal?: AbortSignal }]
+  ): Promise<StreamTextResult<ToolSet, OutputType<TOutput>>>;
 }
 
 // ── Agent ───────────────────────────────────────────────────────────
@@ -132,7 +170,7 @@ export class Agent<
   TContext,
   TInput = void,
   TOutput = void,
-> {
+> implements AgentLike<TContext, TInput, TOutput> {
   readonly id: string;
   readonly description: string;
   readonly hasOutput: boolean;
@@ -148,8 +186,8 @@ export class Agent<
   private readonly _hasDynamicConfig: boolean;
   private readonly _resolvedStaticTools: Record<string, Tool> | null = null;
   private readonly _passthrough: Record<string, unknown>;
-  private readonly _onStepFinish: AgentConfig<TContext, TInput, TOutput>['onStepFinish'];
-  private readonly _onFinish: AgentConfig<TContext, TInput, TOutput>['onFinish'];
+  private readonly _onStepEnd: AgentConfig<TContext, TInput, TOutput>['onStepEnd'];
+  private readonly _onEnd: AgentConfig<TContext, TInput, TOutput>['onEnd'];
 
   constructor(config: AgentConfig<TContext, TInput, TOutput>) {
     this.id = config.id;
@@ -163,9 +201,9 @@ export class Agent<
     // `(ctx, input) => ...` Resolvable and call it with the wrong shape.
     // For `stopWhen` we always treat a function value as a static
     // StopCondition; dynamic stopWhen must return an array
-    // (`(ctx, input) => [stepCountIs(5)]`), which is the unambiguous form.
+    // (`(ctx, input) => [isStepCount(5)]`), which is the unambiguous form.
     this._hasDynamicConfig = [
-      config.model, config.system, config.prompt,
+      config.model, config.instructions, config.prompt,
       config.messages, config.tools, config.activeTools,
       config.toolChoice,
     ].some(v => typeof v === "function");
@@ -184,14 +222,14 @@ export class Agent<
     // rather than destructuring on every generate()/stream() call.
     const {
       id: _id, description: _desc, input: _inputSchema, output: _output, validateOutput: _validateOutput,
-      model: _m, system: _s, prompt: _p, messages: _msg,
+      model: _m, instructions: _instr, prompt: _p, messages: _msg,
       tools: _t, activeTools: _at, toolChoice: _tc, stopWhen: _sw,
-      onStepFinish, onFinish, onError: _onError,
+      onStepEnd, onEnd, onError: _onError,
       ...passthrough
     } = config;
     this._passthrough = passthrough;
-    this._onStepFinish = onStepFinish;
-    this._onFinish = onFinish;
+    this._onStepEnd = onStepEnd;
+    this._onEnd = onEnd;
   }
 
   async generate(
@@ -242,7 +280,7 @@ export class Agent<
       throw new Error(`Agent "${this.id}": asTool() requires an input schema`);
     }
 
-    return tool<TInput, TOutput>({
+    return tool<TInput, TOutput, SdkContext>({
       description: this.description,
       inputSchema: this.config.input,
       // The AI SDK passes a `ToolExecutionOptions` argument that carries
@@ -256,7 +294,7 @@ export class Agent<
         const writer = getActiveWriter();
         if (writer) {
           const result = await this.streamWithOptions(ctx, toolInput, { abortSignal });
-          writer.merge(result.toUIMessageStream());
+          writer.merge(toUIMessageStream({ stream: result.stream }));
           // Drain the text side to release the StreamTextResult anchor — the
           // writer.merge above only consumes the UI-message side, leaving
           // `result.text` pending until awaited.
@@ -391,17 +429,17 @@ export class Agent<
         ? { messages: resolved.messages }
         : { prompt: resolved.prompt }),
       // Use `!== undefined` rather than truthy so an intentional empty
-      // `system: ""` survives instead of being silently dropped.
-      ...(resolved.system !== undefined ? { system: resolved.system } : {}),
+      // `instructions: ""` survives instead of being silently dropped.
+      ...(resolved.instructions !== undefined ? { instructions: resolved.instructions } : {}),
       ...(this.config.output ? { output: this.config.output } : {}),
       // Only attach the callback when the user supplied one. Passing
       // `undefined` explicitly can suppress default SDK rethrow behavior in
       // some versions.
-      ...(this._onStepFinish
-        ? { onStepFinish: (event: OnStepFinishEvent) => this._onStepFinish!({ result: event, ctx, input, writer: getActiveWriter() }) }
+      ...(this._onStepEnd
+        ? { onStepEnd: (event: GenerateTextStepEndEvent) => this._onStepEnd!({ result: event, ctx, input, writer: getActiveWriter() }) }
         : {}),
-      ...(this._onFinish
-        ? { onFinish: (event: OnFinishEvent) => this._onFinish!({ result: event, ctx, input, writer: getActiveWriter() }) }
+      ...(this._onEnd
+        ? { onEnd: (event: GenerateTextEndEvent) => this._onEnd!({ result: event, ctx, input, writer: getActiveWriter() }) }
         : {}),
     };
   }
@@ -411,7 +449,7 @@ export class Agent<
       return {
         model: this.config.model as LanguageModel,
         prompt: this.config.prompt as string | undefined,
-        system: this.config.system as string | undefined,
+        instructions: this.config.instructions as string | undefined,
         messages: this.config.messages as ModelMessage[] | undefined,
         tools: this._resolvedStaticTools ?? this.resolveTools(
           (this.config.tools as AgentToolSet<TContext> | undefined) ?? {}, ctx
@@ -425,10 +463,10 @@ export class Agent<
   }
 
   private async resolveConfigAsync(ctx: TContext, input: TInput): Promise<ResolvedAgentConfig> {
-    const [model, prompt, system, messages, rawTools, activeTools, toolChoice] = await Promise.all([
+    const [model, prompt, instructions, messages, rawTools, activeTools, toolChoice] = await Promise.all([
       resolveValue(this.config.model, ctx, input),
       resolveValue(this.config.prompt, ctx, input),
-      resolveValue(this.config.system, ctx, input),
+      resolveValue(this.config.instructions, ctx, input),
       resolveValue(this.config.messages, ctx, input),
       resolveValue(this.config.tools, ctx, input),
       resolveValue(this.config.activeTools, ctx, input),
@@ -438,7 +476,7 @@ export class Agent<
     return {
       model,
       prompt,
-      system,
+      instructions,
       messages,
       tools,
       activeTools,

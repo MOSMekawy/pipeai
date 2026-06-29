@@ -1,5 +1,5 @@
-import type { ToolSet } from "ai";
-import type { Agent, GenerateTextResult, StreamTextResult, OutputType } from "../agent";
+import { toUIMessageStream, type ToolSet } from "ai";
+import type { AgentLike, GenerateTextResult, StreamTextResult, OutputType } from "../agent";
 import { extractOutput, runWithWriter } from "../utils";
 import type { RuntimeState } from "../runtime";
 import type { StepOptions, AgentStepHooks, AgentResultParams } from "../types";
@@ -23,14 +23,14 @@ export class AgentStep extends Step {
   readonly type = "step" as const;
   readonly id: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private readonly agent: Agent<any, any, any>;
+  private readonly agent: AgentLike<any, any, any>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly options?: StepOptions<any, any, any>;
 
   constructor(
     id: string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: Agent<any, any, any>,
+    agent: AgentLike<any, any, any>,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     options?: StepOptions<any, any, any>,
   ) {
@@ -66,7 +66,7 @@ export class AgentStep extends Step {
   static async runAgent<TContext, TNextOutput>(
     state: RuntimeState,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    agent: Agent<TContext, any, TNextOutput>,
+    agent: AgentLike<TContext, any, TNextOutput>,
     ctx: TContext,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     options?: AgentStepHooks<TContext, any, TNextOutput>,
@@ -87,7 +87,7 @@ export class AgentStep extends Step {
         if (options?.handleStream) {
           await options.handleStream({ result, writer, ctx, input, itemIndex });
         } else {
-          writer.merge(result.toUIMessageStream());
+          writer.merge(toUIMessageStream({ stream: result.stream }));
         }
 
         const hookParams = {

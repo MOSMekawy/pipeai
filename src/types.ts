@@ -1,7 +1,7 @@
 // Public type / API surface for the workflow package. Extracted from
 // workflow.ts to keep that file focused on the run-loop engine + builder.
 // Type-only module (no runtime output); the cycle with ./workflow is safe.
-import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnFinishCallback, IdGenerator, ToolSet, InferUIMessageChunk } from "ai";
+import type { UIMessage, UIMessageStreamWriter, UIMessageStreamOnEndCallback, IdGenerator, ToolSet, InferUIMessageChunk } from "ai";
 import type { Agent, GenerateTextResult, StreamTextResult, OutputType } from "./agent";
 import type { MaybePromise } from "./utils";
 import type { SealedWorkflow } from "./workflow";
@@ -266,7 +266,7 @@ export interface AgentStepHooks<TContext, TOutput, TNextOutput> {
 
   /**
    * **Stream-mode only.** Override the workflow's default
-   * `writer.merge(result.toUIMessageStream())` call so YOU control how the
+   * `writer.merge(toUIMessageStream({ stream: result.stream }))` call so YOU control how the
    * agent's stream reaches the outer workflow's UI message stream. Useful
    * for buffering, transforming, fan-out to multiple writers, or injecting
    * custom UI messages around the agent's output.
@@ -385,12 +385,12 @@ export interface WorkflowStreamResult<TOutput, UI_MESSAGE extends UIMessage = UI
  *
  * Generic over the UI message shape so consumers with a custom
  * `UIMessage<METADATA, DATA_PARTS, TOOLS>` get their narrowed type in
- * `onFinish` / `originalMessages` instead of the unparameterized default.
+ * `onEnd` / `originalMessages` instead of the unparameterized default.
  *
- * Note: AI SDK's `createUIMessageStream` ALSO accepts an `onStepFinish`
+ * Note: AI SDK's `createUIMessageStream` ALSO accepts an `onStepEnd`
  * (per-token-step) callback. We intentionally do NOT expose it here — there
  * are already two clearer step-finish callbacks at different granularities:
- * - `Agent.onStepFinish` for per-model-call observation, and
+ * - `Agent.onStepEnd` for per-model-call observation, and
  * - `WorkflowObservability.onStepFinish` for per-workflow-step observation.
  * Adding a third one named the same thing on `WorkflowStreamOptions` would
  * be confusing. Reach for one of the two above instead.
@@ -415,7 +415,7 @@ export interface WorkflowStreamOptions<UI_MESSAGE extends UIMessage = UIMessage>
    * `finishReason`. Use this for persistence, analytics, or downstream
    * notification.
    */
-  onFinish?: UIMessageStreamOnFinishCallback<UI_MESSAGE>;
+  onEnd?: UIMessageStreamOnEndCallback<UI_MESSAGE>;
   /**
    * Override the response message-id generator. Forwarded to
    * `createUIMessageStream`'s `generateId` option. Useful for deterministic

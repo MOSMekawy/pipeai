@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { toUIMessageStream } from "ai";
 import { Agent } from "../agent";
 import { Workflow, WorkflowLoopError, migrateSnapshot, type WorkflowSnapshot, type GateSnapshot, type CheckpointSnapshot, type WorkflowObservability, type WorkflowWarning } from "../workflow";
 import { createMockModel, createReplayableMockModel, createSignalProbeModel, defer, expectComplete, expectSuspended, testCtx, type TestCtx } from "./helpers";
@@ -525,7 +526,7 @@ describe("Workflow", () => {
           concurrency: 1, // pin sequential so the handler-call order is deterministic
           handleStream: ({ result, writer, input, itemIndex }) => {
             seen.push({ itemIndex, input });
-            writer.merge(result.toUIMessageStream());
+            writer.merge(toUIMessageStream({ stream: result.stream }));
           },
         });
 
@@ -565,7 +566,7 @@ describe("Workflow", () => {
             concurrency: 1,
             handleStream: ({ result, writer, itemIndex }) => {
               seen.push(itemIndex);
-              writer.merge(result.toUIMessageStream());
+              writer.merge(toUIMessageStream({ stream: result.stream }));
             },
           },
         );
@@ -586,7 +587,7 @@ describe("Workflow", () => {
           concurrency: 1,
           handleStream: ({ result, writer, itemIndex }) => {
             seen.push(itemIndex);
-            writer.merge(result.toUIMessageStream());
+            writer.merge(toUIMessageStream({ stream: result.stream }));
           },
         });
 
@@ -607,7 +608,7 @@ describe("Workflow", () => {
           agents: { first: a, second: b },
           handleStream: ({ result, writer, itemIndex }) => {
             seenIndex = itemIndex;
-            writer.merge(result.toUIMessageStream());
+            writer.merge(toUIMessageStream({ stream: result.stream }));
           },
         });
 
@@ -630,7 +631,7 @@ describe("Workflow", () => {
             agent: b,
             handleStream: ({ result, writer, itemIndex }) => {
               seenIndex = itemIndex;
-              writer.merge(result.toUIMessageStream());
+              writer.merge(toUIMessageStream({ stream: result.stream }));
             },
           },
         ]);
@@ -2743,7 +2744,7 @@ describe("Workflow", () => {
         .step(createTextAgent("a1", "hello"));
 
       const { output, stream } = pipeline.stream(testCtx, undefined, {
-        onFinish: (event) => {
+        onEnd: (event) => {
           finishSpy(event);
         },
       });
@@ -2779,7 +2780,7 @@ describe("Workflow", () => {
           { id: "prior-1", role: "user", parts: [{ type: "text", text: "ping" }] },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         ] as any,
-        onFinish: (event) => finishSpy(event),
+        onEnd: (event) => finishSpy(event),
       });
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       originalMessages;
@@ -2805,7 +2806,7 @@ describe("Workflow", () => {
 
       const { output, stream } = pipeline.stream(testCtx, undefined, {
         generateId,
-        onFinish: (event) => finishSpy(event),
+        onEnd: (event) => finishSpy(event),
       });
       const reader = stream.getReader();
       while (!(await reader.read()).done) { /* drain */ }

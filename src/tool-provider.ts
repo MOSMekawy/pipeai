@@ -3,7 +3,12 @@ import { getActiveWriter } from "./utils";
 
 export const TOOL_PROVIDER_BRAND = Symbol.for("agent-workflow.ToolProvider");
 
-export type ToolExecuteOptions = ToolExecutionOptions & {
+// AI SDK v7 made tool()/ToolExecutionOptions generic over the SDK's tool
+// `Context` (`Record<string, unknown>`, not exported by name). pipeai injects
+// context via the closure below, not the SDK tool-context, so we pin the base shape.
+type SdkContext = Record<string, unknown>;
+
+export type ToolExecuteOptions = ToolExecutionOptions<SdkContext> & {
   writer?: UIMessageStreamWriter;
 };
 
@@ -40,10 +45,10 @@ export class ToolProvider<
     // `NeverOptional<TOutput, ...>` conditional in a generic context, so the literal
     // is not assignable directly. Cast through `unknown` rather than `any` so the
     // return type and call sites still get type-checked.
-    return tool<TInput, TOutput>({
+    return tool<TInput, TOutput, SdkContext>({
       ...toolDef,
       inputSchema,
-      execute: (input: TInput, options: ToolExecutionOptions) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
+      execute: (input: TInput, options: ToolExecutionOptions<SdkContext>) => execute(input, context, { ...options, writer: getActiveWriter() } as ToolExecuteOptions),
     } as unknown as Tool<TInput, TOutput>);
   }
 }

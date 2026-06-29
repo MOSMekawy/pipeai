@@ -1,11 +1,15 @@
 export { Agent } from "./agent";
 export type {
   AgentConfig,
+  AgentLike,
   GenerateTextResult,
   StreamTextResult,
   OutputType,
   AsToolMapOutput,
 } from "./agent";
+
+export { fromSdkAgent } from "./sdk-agent";
+export type { SdkAgentLike, SdkAgentInput, FromSdkAgentOptions } from "./sdk-agent";
 
 export {
   Workflow,
