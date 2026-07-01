@@ -6,16 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-01
+
 ### Added
 
 - **`fromSdkAgent(agent, { mapInput, hasOutput?, validateOutput?, id? })`** — adapt a Vercel AI SDK v7 agent (`ToolLoopAgent` / any value implementing the SDK `Agent` interface) into a `Workflow.step(...)` target. Bridges pipeai's positional `(ctx, input)` call convention to the SDK agent's single `{ prompt | messages }` object. The SDK agent fixes its `runtimeContext` / tools at construction, so pipeai's per-call `ctx` only reaches `mapInput`.
 - **`AgentLike<TContext, TInput, TOutput>` interface** — the minimal surface a workflow step needs from an agent (`id`, `hasOutput`, `validateOutput?`, `generate`, `stream`). `Agent` now implements it, and `Workflow.step()` / `Workflow.from()` accept it, so native agents and `fromSdkAgent(...)` adapters are interchangeable step targets.
-
-### Docs
-
-- Documented that AI SDK v7's `toolApproval` passes through a pipeai `Agent` (auto approve/deny policy works with no new code), and the `agent → gate → agent` pattern for durable human-in-the-loop approval.
-
-## [1.0.0] - 2026-06-28
 
 ### Changed
 
@@ -36,6 +32,10 @@ The raw SDK result is passed to your `onEnd` / `onStepEnd` / step `mapResult` / 
 - System-role messages embedded in a `messages[]` array are **rejected by default**. Put system text in the agent's `instructions` field (or pass `allowSystemInMessages: true` through to the SDK).
 - A passthrough `onChunk` callback now fires for **every** stream-part type; guard on `chunk.type`.
 - Internally, the agent stream-merge moved from the deprecated `result.toUIMessageStream()` instance method to the top-level `toUIMessageStream({ stream })` helper.
+
+### Docs
+
+- Documented that AI SDK v7's `toolApproval` passes through a pipeai `Agent` (auto approve/deny policy works with no new code), and the `agent → gate → agent` pattern for durable human-in-the-loop approval.
 
 ## [0.9.0] - 2026-06-12
 
