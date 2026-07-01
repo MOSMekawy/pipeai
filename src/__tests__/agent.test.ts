@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { Output, generateText, stepCountIs } from "ai";
+import { Output, generateText, isStepCount } from "ai";
 import { Agent } from "../agent";
 import { defineTool } from "../tool-provider";
 import { extractOutput } from "../utils";
@@ -19,12 +19,12 @@ describe("Agent", () => {
       expect(result.text).toBe("Hello world");
     });
 
-    it("resolves dynamic system and prompt", async () => {
+    it("resolves dynamic instructions and prompt", async () => {
       const model = createMockModel("response");
       const agent = new Agent<TestCtx, string>({
         id: "test",
         model: (_ctx) => model,
-        system: (ctx) => `User: ${ctx.userId}`,
+        instructions: (ctx) => `User: ${ctx.userId}`,
         prompt: (_ctx, input) => input,
       });
 
@@ -41,7 +41,7 @@ describe("Agent", () => {
       const agent = new Agent<TestCtx, void>({
         id: "test",
         model: createMockModel("ok"),
-        system: async () => {
+        instructions: async () => {
           order.push("system-start");
           await new Promise((r) => setTimeout(r, 10));
           order.push("system-end");
@@ -64,7 +64,7 @@ describe("Agent", () => {
       expect(order.indexOf("prompt-start")).toBeLessThan(order.indexOf("system-end"));
     });
 
-    it("calls onStepFinish and onFinish callbacks with result key", async () => {
+    it("calls onStepEnd and onEnd callbacks with result key", async () => {
       const stepFinishSpy = vi.fn();
       const finishSpy = vi.fn();
 
@@ -72,8 +72,8 @@ describe("Agent", () => {
         id: "test",
         model: createMockModel("done"),
         prompt: (_ctx, input) => input,
-        onStepFinish: stepFinishSpy,
-        onFinish: finishSpy,
+        onStepEnd: stepFinishSpy,
+        onEnd: finishSpy,
       });
 
       await agent.generate(testCtx, "go");
@@ -195,9 +195,9 @@ describe("Agent", () => {
       expect(toolResult).toEqual({ processed: "raw output" });
     });
 
-    it("accepts a real ai SDK stopWhen helper (stepCountIs) alongside dynamic messages", async () => {
+    it("accepts a real ai SDK stopWhen helper (isStepCount) alongside dynamic messages", async () => {
       // Mirrors the user-reported repro:
-      //   stopWhen: stepCountIs(5)   ← a StopCondition function
+      //   stopWhen: isStepCount(5)   ← a StopCondition function
       //   messages: () => [...]      ← dynamic, forces the async config path
       // Previously this crashed inside resolveValue because the StopCondition
       // function was invoked as `(ctx, input) => ...`.
@@ -205,7 +205,7 @@ describe("Agent", () => {
         id: "demo",
         model: createMockModel("hi"),
         messages: () => [{ role: "user", content: "hi" }],
-        stopWhen: stepCountIs(5),
+        stopWhen: isStepCount(5),
       });
       // Should NOT throw "Cannot read properties of undefined (reading 'length')"
       const result = await agent.generate(testCtx, {});
@@ -215,7 +215,7 @@ describe("Agent", () => {
     it("does not invoke a bare-function stopWhen as if it were a Resolvable", async () => {
       // Regression: `StopCondition` is itself a function (`(opts) => boolean`).
       // The Resolvable resolver heuristic `typeof === 'function'` would call
-      // a static `stopWhen: stepCountIs(5)` as a `(ctx, input) => ...` resolver,
+      // a static `stopWhen: isStepCount(5)` as a `(ctx, input) => ...` resolver,
       // which is wrong. The agent must treat any bare-function stopWhen as a
       // static value, not as a resolver — even when other config fields are
       // dynamic and force the async resolution path.
@@ -338,7 +338,7 @@ describe("Agent", () => {
       const agent = new Agent<TestCtx, void>({
         id: "empty-system",
         model,
-        system: "",
+        instructions: "",
         prompt: () => "hi",
       });
       await agent.generate(testCtx);
@@ -650,7 +650,7 @@ describe("Agent", () => {
   });
 
   describe("tool-call finish reason", () => {
-    it("flows through onFinish when the model returns finishReason 'tool-calls'", async () => {
+    it("flows through onEnd when the model returns finishReason 'tool-calls'", async () => {
       const finishSpy = vi.fn();
       const define = defineTool<TestCtx>();
       const echoTool = define({
@@ -667,7 +667,7 @@ describe("Agent", () => {
         }),
         prompt: () => "go",
         tools: { echoTool },
-        onFinish: finishSpy,
+        onEnd: finishSpy,
       });
 
       await agent.generate(testCtx);
